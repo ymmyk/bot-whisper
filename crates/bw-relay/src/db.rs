@@ -63,7 +63,8 @@ pub struct RoomRow {
     pub created_at: u64,
     pub expires_at: Option<u64>,
     pub max_members: u32,
-    pub turn_mode: TurnMode,
+    /// `None` means "auto": alternate for two members, queue for groups.
+    pub turn_mode: Option<TurnMode>,
     pub next_member_n: u32,
 }
 
@@ -332,7 +333,12 @@ impl Db {
 
     // ----- doorbells -----
 
-    pub fn set_doorbell(&self, room_id: &str, member_id: &str, cfg: Option<&DoorbellConfig>) -> Result<()> {
+    pub fn set_doorbell(
+        &self,
+        room_id: &str,
+        member_id: &str,
+        cfg: Option<&DoorbellConfig>,
+    ) -> Result<()> {
         self.with(|c| {
             match cfg {
                 None => {
@@ -389,23 +395,25 @@ impl Db {
     }
 }
 
-fn mode_str(m: TurnMode) -> &'static str {
+fn mode_str(m: Option<TurnMode>) -> &'static str {
     match m {
-        TurnMode::Alternate => "alternate",
-        TurnMode::RoundRobin => "round_robin",
-        TurnMode::Queue => "queue",
-        TurnMode::Moderated => "moderated",
-        TurnMode::Free => "free",
+        None => "auto",
+        Some(TurnMode::Alternate) => "alternate",
+        Some(TurnMode::RoundRobin) => "round_robin",
+        Some(TurnMode::Queue) => "queue",
+        Some(TurnMode::Moderated) => "moderated",
+        Some(TurnMode::Free) => "free",
     }
 }
 
-fn parse_mode(s: &str) -> TurnMode {
+fn parse_mode(s: &str) -> Option<TurnMode> {
     match s {
-        "round_robin" => TurnMode::RoundRobin,
-        "queue" => TurnMode::Queue,
-        "moderated" => TurnMode::Moderated,
-        "free" => TurnMode::Free,
-        _ => TurnMode::Alternate,
+        "alternate" => Some(TurnMode::Alternate),
+        "round_robin" => Some(TurnMode::RoundRobin),
+        "queue" => Some(TurnMode::Queue),
+        "moderated" => Some(TurnMode::Moderated),
+        "free" => Some(TurnMode::Free),
+        _ => None,
     }
 }
 
@@ -423,7 +431,7 @@ mod tests {
             created_at: 1,
             expires_at: None,
             max_members: 8,
-            turn_mode: TurnMode::Queue,
+            turn_mode: Some(TurnMode::Queue),
             next_member_n: 2,
         })
         .unwrap();
@@ -451,7 +459,10 @@ mod tests {
         assert!(db.redeem_invite("i1", 5).unwrap());
         assert!(!db.redeem_invite("i1", 6).unwrap(), "second redeem loses");
         assert_eq!(db.rooms_for_agent("a").unwrap().len(), 1);
-        assert_eq!(db.get_room("r1").unwrap().unwrap().turn_mode, TurnMode::Queue);
+        assert_eq!(
+            db.get_room("r1").unwrap().unwrap().turn_mode,
+            Some(TurnMode::Queue)
+        );
         db.delete_room("r1").unwrap();
         assert!(db.get_room("r1").unwrap().is_none());
         assert!(db.members("r1").unwrap().is_empty());

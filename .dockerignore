@@ -1,0 +1,6 @@
+target
+data
+*.sqlite3*
+.git
+claude-phase0.log
+claude-phase0.pid

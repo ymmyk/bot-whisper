@@ -21,7 +21,7 @@ pub const DEFAULT_TURN_CAP: u32 = 40;
 pub const MAX_INTERRUPT_CHARS: usize = 280;
 
 /// Turn modes, per thread.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum TurnMode {
     /// Whoever holds the floor. Yield passes it to the other member.
@@ -48,7 +48,9 @@ impl TurnMode {
 }
 
 /// Turn signals a sender attaches to a message or sets without content.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default, schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum TurnSignal {
     /// "Done for now." The floor moves to the next speaker.
@@ -248,9 +250,7 @@ impl ThreadState {
                     Some(h) => vec![h.clone()],
                     None => roster.members.clone(),
                 },
-                TurnMode::Alternate | TurnMode::RoundRobin => {
-                    self.holder.iter().cloned().collect()
-                }
+                TurnMode::Alternate | TurnMode::RoundRobin => self.holder.iter().cloned().collect(),
             },
         }
     }
@@ -366,10 +366,7 @@ impl ThreadState {
         // Lazy lease expiry.
         self.expire_lease(roster, intent.now);
 
-        let may_speak = self
-            .now_speaking(roster)
-            .iter()
-            .any(|m| m == intent.from);
+        let may_speak = self.now_speaking(roster).iter().any(|m| m == intent.from);
 
         if !may_speak {
             // One short interrupt per thread, in every mode except free
@@ -497,7 +494,11 @@ impl ThreadState {
 
     /// Join the floor queue (queue mode). Returns the holder if granted
     /// immediately, otherwise the member's 1-based position in the queue.
-    pub fn request_floor(&mut self, roster: &Roster, member: &str) -> Result<FloorGrant, TurnError> {
+    pub fn request_floor(
+        &mut self,
+        roster: &Roster,
+        member: &str,
+    ) -> Result<FloorGrant, TurnError> {
         if !roster.contains(member) {
             return Err(TurnError::NotAMember);
         }
@@ -541,9 +542,7 @@ impl ThreadState {
                 TurnMode::Free => None,
                 TurnMode::Queue => self.queue.pop_front(),
                 TurnMode::Moderated => Some(roster.owner.clone()),
-                TurnMode::Alternate | TurnMode::RoundRobin => {
-                    roster.members.first().cloned()
-                }
+                TurnMode::Alternate | TurnMode::RoundRobin => roster.members.first().cloned(),
             };
         }
     }
@@ -554,7 +553,10 @@ impl ThreadState {
     pub fn raise_cap(&mut self, roster: &Roster, new_cap: u32) {
         self.turn_cap = new_cap.max(1).max(self.turns_used);
         if self.turns_used >= self.turn_cap
-            && matches!(self.status, ThreadStatus::Floor | ThreadStatus::Held | ThreadStatus::Stalled)
+            && matches!(
+                self.status,
+                ThreadStatus::Floor | ThreadStatus::Held | ThreadStatus::Stalled
+            )
         {
             self.status = ThreadStatus::Capped;
             self.holder = None;
@@ -691,7 +693,11 @@ mod tests {
         let mut directed = send("m2", TurnSignal::Yield);
         directed.to = &to;
         t.apply(&r, &directed).unwrap();
-        assert_eq!(t.holder.as_deref(), Some("m4"), "directed yield jumps the queue");
+        assert_eq!(
+            t.holder.as_deref(),
+            Some("m4"),
+            "directed yield jumps the queue"
+        );
         t.apply(&r, &send("m4", TurnSignal::Yield)).unwrap();
         assert_eq!(t.holder.as_deref(), Some("m3"));
         t.apply(&r, &send("m3", TurnSignal::Yield)).unwrap();

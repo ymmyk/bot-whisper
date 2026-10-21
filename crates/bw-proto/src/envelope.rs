@@ -151,7 +151,9 @@ impl Envelope {
         match self.enc {
             Enc::None => {
                 let body = self.body.as_ref().ok_or(EnvelopeError::MissingBody)?;
-                let size = serde_json::to_vec(body).map(|b| b.len()).unwrap_or(usize::MAX);
+                let size = serde_json::to_vec(body)
+                    .map(|b| b.len())
+                    .unwrap_or(usize::MAX);
                 if size > MAX_BODY_BYTES {
                     return Err(EnvelopeError::BodyTooLarge(size));
                 }
@@ -204,7 +206,10 @@ mod tests {
     fn rejects_unknown_version() {
         let mut env = Envelope::plaintext("r", "m", Body::text("x"));
         env.v = 2;
-        assert_eq!(env.validate(false), Err(EnvelopeError::UnsupportedVersion(2)));
+        assert_eq!(
+            env.validate(false),
+            Err(EnvelopeError::UnsupportedVersion(2))
+        );
     }
 
     #[test]

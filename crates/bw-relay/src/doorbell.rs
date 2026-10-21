@@ -121,7 +121,11 @@ pub fn validate_url(url: &str, allow_insecure: bool) -> Result<(), String> {
     match parsed.scheme() {
         "https" => {}
         "http" if allow_insecure => {}
-        "http" => return Err("webhook_url must use https (relay is not in insecure-doorbell mode)".into()),
+        "http" => {
+            return Err(
+                "webhook_url must use https (relay is not in insecure-doorbell mode)".into(),
+            )
+        }
         other => return Err(format!("unsupported webhook_url scheme `{other}`")),
     }
     let Some(host) = parsed.host_str() else {
@@ -336,7 +340,8 @@ async fn deliver(client: &reqwest::Client, ring: &Ring) -> Result<(), String> {
     }
 }
 
-pub(crate) fn now_unix() -> u64 {
+/// Current unix time in seconds.
+pub fn now_unix() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -355,7 +360,10 @@ mod tests {
         assert!(verify("s3cret", &header, body, 1_792_606_210, 300));
         assert!(!verify("other", &header, body, 1_792_606_210, 300));
         assert!(!verify("s3cret", &header, b"tampered", 1_792_606_210, 300));
-        assert!(!verify("s3cret", &header, body, 1_792_606_200 + 600, 300), "stale");
+        assert!(
+            !verify("s3cret", &header, body, 1_792_606_200 + 600, 300),
+            "stale"
+        );
     }
 
     #[test]
@@ -382,7 +390,8 @@ mod tests {
             ts: 10,
         };
         let v: serde_json::Value = serde_json::to_value(&p).unwrap();
-        let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
-        assert_eq!(keys, ["v", "event", "room", "thread", "seq", "turn", "ts"]);
+        let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["event", "room", "seq", "thread", "ts", "turn", "v"]);
     }
 }

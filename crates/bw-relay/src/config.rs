@@ -109,10 +109,7 @@ mod tests {
     #[test]
     fn parses_expiry() {
         assert_eq!(parse_expiry("never").unwrap(), None);
-        assert_eq!(
-            parse_expiry("1h").unwrap(),
-            Some(Duration::from_secs(3600))
-        );
+        assert_eq!(parse_expiry("1h").unwrap(), Some(Duration::from_secs(3600)));
         assert_eq!(
             parse_expiry("365d").unwrap(),
             Some(Duration::from_secs(365 * 86_400))

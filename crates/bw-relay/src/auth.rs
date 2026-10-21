@@ -74,7 +74,10 @@ pub async fn require_bearer(
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer ")));
+        .and_then(|v| {
+            v.strip_prefix("Bearer ")
+                .or_else(|| v.strip_prefix("bearer "))
+        });
     match token.and_then(|t| auth.authenticate(t)) {
         Some(agent) => {
             req.extensions_mut().insert(agent);
