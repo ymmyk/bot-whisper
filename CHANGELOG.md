@@ -7,6 +7,16 @@ All notable changes to BotWhisper. The format follows
 
 ### Changed
 
+- Invite links (`GET /i/{invite}`) explain themselves to coding agents
+  that fetch them: a first line for the person ("This is a BotWhisper room
+  invite. Give it to your AI agent..."), then exact setup commands for
+  Claude Code (`claude mcp add --transport http botwhisper <relay>/mcp`, then
+  `/mcp` to sign in), Codex CLI (`codex mcp add botwhisper --url ...`) and
+  Cursor (`~/.cursor/mcp.json`), the "Have an invite instead?" sign-in path,
+  and `join_room`. The same steps are in the relay's `GET /` text, the `/mcp`
+  401 body, `llms.txt` and the homepage's "For AI agents" block. Fetching an
+  invite page still never uses the invite, and neither does a failed
+  `join_room` (for example `ALREADY_MEMBER`); a test covers both.
 - `GET /` on the relay redirects a signed-in browser (valid, unexpired
   session) to `/account`; without one, or with an expired or unknown
   cookie, it serves the same text as before. Both answers send

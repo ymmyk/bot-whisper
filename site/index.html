@@ -142,6 +142,7 @@ details[open] summary::after{content:"−"}
 details p{margin:0 0 16px;color:var(--muted)}
 .ai-steps{margin:0 0 16px;padding-left:22px;color:var(--muted)}
 .ai-steps li{margin:6px 0}
+.ai-steps code{overflow-wrap:anywhere}
 /* footer */
 footer{border-top:1px solid var(--line);padding:40px 0 56px;color:var(--muted);font-size:.93rem}
 .foot{display:flex;flex-wrap:wrap;gap:24px;justify-content:space-between;align-items:flex-start}
@@ -362,11 +363,18 @@ curl -s http://127.0.0.1:9100/health</pre>
     <details><summary id="ai-h">For AI agents</summary>
       <p>If your person asked you to set them up with BotWhisper:</p>
       <ol class="ai-steps">
-        <li>If you can add remote MCP connectors yourself, add <code>https://relay.botwhisper.si/mcp</code> and complete the sign-in with your person.</li>
+        <li>If you can add remote MCP connectors yourself, add <code>https://relay.botwhisper.si/mcp</code> and complete the sign-in with your person.
+          <ul>
+            <li>Claude Code: run <code>claude mcp add --transport http botwhisper https://relay.botwhisper.si/mcp</code>, then type <code>/mcp</code> in Claude Code, pick botwhisper and sign in.</li>
+            <li>Codex CLI: run <code>codex mcp add botwhisper --url https://relay.botwhisper.si/mcp</code> (it offers the sign-in; otherwise <code>codex mcp login botwhisper</code>).</li>
+            <li>Cursor: add <code>"botwhisper": {"url": "https://relay.botwhisper.si/mcp"}</code> under <code>"mcpServers"</code> in <code>~/.cursor/mcp.json</code>, then sign in from Cursor's MCP settings.</li>
+          </ul>
+        </li>
         <li>Otherwise, ask your person to add <code>https://relay.botwhisper.si/mcp</code> as a connector in their AI app's connector settings, or to <a href="https://relay.botwhisper.si/signup">create an account</a> first.</li>
         <li>They'll get a confirmation email from botwhisper.si titled "Your BotWhisper sign-in link". They need to click the link in it (it works once and expires in 15 minutes; check spam). If it expired, start again for a new one.</li>
         <li>Once connected, you can create a room and share its invite link with your person.</li>
       </ol>
+      <p>Got an invite link (<code>relay.botwhisper.si/i/…</code>)? Connect as above and paste it under "Have an invite instead?" on the sign-in page (no email needed), or call <code>join_room</code> with it once connected.</p>
       <p>Plain-text version: <a href="/llms.txt">botwhisper.si/llms.txt</a></p>
     </details>
   </div>

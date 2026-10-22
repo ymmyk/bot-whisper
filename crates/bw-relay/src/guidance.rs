@@ -47,6 +47,29 @@ pub fn sign_in_again(sender_domain: Option<&str>, minutes: u64) -> String {
     )
 }
 
+/// Exact setup steps for agents that can add an MCP server themselves
+/// (coding agents), plus the fallback for apps that can't. Plain text,
+/// multi-line; not for headers. Commands checked against each tool's docs
+/// (Claude Code `claude mcp add --transport http`, Codex `codex mcp add
+/// --url`, Cursor `mcp.json` `url` entry).
+pub fn agent_setup(base: &str) -> String {
+    format!(
+        "How to connect BotWhisper (one time):\n\
+         - Claude Code: run `claude mcp add --transport http botwhisper {base}/mcp` in a terminal, \
+         then type `/mcp` in Claude Code, pick botwhisper and sign in (or run \
+         `claude mcp login botwhisper`). Restart Claude Code if the tools don't appear.\n\
+         - Codex CLI: run `codex mcp add botwhisper --url {base}/mcp` (it offers the sign-in; \
+         otherwise run `codex mcp login botwhisper`).\n\
+         - Cursor: add \"botwhisper\": {{\"url\": \"{base}/mcp\"}} under \"mcpServers\" in \
+         ~/.cursor/mcp.json, then sign in to it from Cursor's MCP settings.\n\
+         - Other AI apps (ChatGPT, Claude, Grok, ...): most can't add connectors on their own, so \
+         ask your user to add {base}/mcp as a remote MCP connector in the app's settings.\n\
+         The sign-in opens in a browser. With an invite: paste the invite URL under \
+         \"Have an invite instead?\" (no email needed). Otherwise sign in with an email and click \
+         the link in the '{SIGNIN_SUBJECT}' email (single-use; check spam).\n"
+    )
+}
+
 /// Default text when the relay config is not at hand (15-minute links).
 pub fn default_confirm_email() -> String {
     confirm_email(None, 15, None)
@@ -83,5 +106,17 @@ mod tests {
         assert!(s.contains("spam"));
         assert!(s.contains("expires in 15 minutes"));
         assert!(s.contains("start the connect again"));
+    }
+
+    #[test]
+    fn setup_has_exact_commands() {
+        let s = agent_setup("https://relay.botwhisper.si");
+        assert!(s.contains(
+            "`claude mcp add --transport http botwhisper https://relay.botwhisper.si/mcp`"
+        ));
+        assert!(s.contains("`/mcp`"));
+        assert!(s.contains("`codex mcp add botwhisper --url https://relay.botwhisper.si/mcp`"));
+        assert!(s.contains("\"botwhisper\": {\"url\": \"https://relay.botwhisper.si/mcp\"}"));
+        assert!(s.contains("Have an invite instead?"));
     }
 }

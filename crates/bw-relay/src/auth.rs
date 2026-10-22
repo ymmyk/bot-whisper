@@ -92,6 +92,8 @@ pub struct TokenAuth {
     resource_metadata: Arc<str>,
     /// What a 401 tells the agent: ask its person to confirm the email.
     signin_help: Arc<str>,
+    /// Exact connector setup steps, appended to the 401 body.
+    setup: Arc<str>,
 }
 
 impl TokenAuth {
@@ -106,6 +108,7 @@ impl TokenAuth {
             db,
             resource_metadata: format!("{public_url}/.well-known/oauth-protected-resource").into(),
             signin_help: crate::guidance::default_confirm_email().into(),
+            setup: crate::guidance::agent_setup(public_url).into(),
         }
     }
 
@@ -167,14 +170,14 @@ pub async fn require_bearer(
             req.extensions_mut().insert(agent);
             next.run(req).await
         }
-        None => unauthorized(&auth.resource_metadata, &auth.signin_help),
+        None => unauthorized(&auth.resource_metadata, &auth.signin_help, &auth.setup),
     }
 }
 
 /// 401 for `/mcp`. The `error_description` and the body both carry the
 /// bot-addressed guidance (confirm the email, then retry or reconnect), since
 /// clients surface one or the other to the agent.
-fn unauthorized(resource_metadata: &str, help: &str) -> Response {
+fn unauthorized(resource_metadata: &str, help: &str, setup: &str) -> Response {
     let www = format!(
         "Bearer realm=\"botwhisper\", error=\"invalid_token\", error_description=\"{help}\", resource_metadata=\"{resource_metadata}\""
     );
@@ -188,7 +191,7 @@ fn unauthorized(resource_metadata: &str, help: &str) -> Response {
         StatusCode::UNAUTHORIZED,
         [(header::WWW_AUTHENTICATE, www)],
         format!(
-            "unauthorized: {help}\n\n\
+            "unauthorized: {help}\n\n{setup}\n\
              Technical: send `Authorization: Bearer <token>` from the OAuth sign-in; see {resource_metadata}\n"
         ),
     )

@@ -582,3 +582,43 @@ async fn wait_without_room_covers_all_rooms_and_health_works() {
     assert!(resp.headers().get("www-authenticate").is_some());
     relay.shutdown().await;
 }
+
+/// A failed join (ALREADY_MEMBER, e.g. the owner's own connector) and
+/// fetching the invite page must not burn the invite: another agent can
+/// still redeem it afterwards.
+#[tokio::test]
+async fn already_member_and_invite_page_do_not_consume_the_invite() {
+    let relay = TestRelay::start().await;
+    let owner = relay.bot(TOKENS[0]).await;
+    let room = owner
+        .ok("create_room", json!({ "title": "keep the invite" }))
+        .await["room_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let inv = owner.ok("create_invite", json!({ "room_id": room })).await;
+    let url = inv["invite_url"].as_str().unwrap().to_string();
+    for _ in 0..2 {
+        assert_eq!(
+            owner.err("join_room", json!({ "invite_url": url })).await,
+            "ALREADY_MEMBER"
+        );
+        let page = reqwest::get(&url).await.unwrap();
+        assert_eq!(page.status(), 200);
+        assert!(page
+            .text()
+            .await
+            .unwrap()
+            .starts_with("This is a BotWhisper room invite."));
+    }
+    let guest = relay.bot(TOKENS[1]).await;
+    let joined = guest.ok("join_room", json!({ "invite_url": url })).await;
+    assert_eq!(joined["you"]["member"], "m2");
+    // Now it is used.
+    let third = relay.bot(TOKENS[2]).await;
+    assert_eq!(
+        third.err("join_room", json!({ "invite_url": url })).await,
+        "INVITE_USED"
+    );
+    relay.shutdown().await;
+}

@@ -750,6 +750,9 @@ async fn unconfirmed_clients_are_told_to_confirm_the_email() {
         says_confirm(&body);
         assert!(body.contains("from this BotWhisper relay"));
         assert!(body.contains(&format!("create an account first at {base}/signup")));
+        assert!(body.contains(&format!(
+            "`claude mcp add --transport http botwhisper {base}/mcp`"
+        )));
         no_secrets(&body.replace("bwa_not-a-real-token", ""));
     }
 
@@ -797,10 +800,22 @@ async fn unconfirmed_clients_are_told_to_confirm_the_email() {
         .await
         .unwrap();
     assert!(page.contains(&format!("{base}/i/abc.def")));
+    assert!(page.starts_with("This is a BotWhisper room invite. Give it to your AI agent"));
+    assert!(page.contains("Opening this page does not use the invite"));
     assert!(page.contains("AI agent without the connector"));
-    assert!(page.contains(&format!("Add {base}/mcp as a remote MCP connector")));
+    assert!(page.contains(&format!(
+        "`claude mcp add --transport http botwhisper {base}/mcp`"
+    )));
+    assert!(page.contains("type `/mcp` in Claude Code"));
+    assert!(page.contains(&format!("`codex mcp add botwhisper --url {base}/mcp`")));
+    assert!(page.contains("~/.cursor/mcp.json"));
+    assert!(page.contains(&format!("add {base}/mcp as a remote MCP connector")));
     assert!(page.contains("Have an invite instead?"));
     assert!(page.contains("call `join_room` with this invite URL"));
+    // The index carries the same setup commands.
+    assert!(idx.contains(&format!(
+        "`claude mcp add --transport http botwhisper {base}/mcp`"
+    )));
 
     // No mail was sent beyond the one pending sign-in, and the pending
     // address never shows up anywhere above.
