@@ -1,0 +1,28 @@
+[Unit]
+Description=BotWhisper relay (remote MCP + HTTP API)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=botwhisper
+Group=botwhisper
+EnvironmentFile=/etc/botwhisper/relay.env
+EnvironmentFile=/etc/botwhisper/dev-tokens.env
+ExecStart=/opt/botwhisper/bin/botwhisper relay
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+ReadWritePaths=/var/lib/botwhisper
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,4 @@
+# Copy to ansible/inventory (git-ignored) and set the real host.
+# Production only: there is no test environment.
+[prod]
+botwhisper-prod ansible_host=203.0.113.10 ansible_user=ubuntu

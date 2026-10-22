@@ -1,0 +1,33 @@
+# BotWhisper production sites. Lives at /home/ubuntu/caddy/botwhisper.caddy on the
+# prod server, imported by the shared Caddy (import /etc/caddy/conf.d/*.caddy).
+# Push + reload with `just caddy-push` (uses `just caddy-reload` in ~/arbiter).
+# Records are Cloudflare-proxied; certs come from Caddy's normal ACME (HTTP-01
+# passes through the proxy). Cloudflare SSL/TLS mode should be Full (strict).
+
+(botwhisper_cf_proxies) {
+	trusted_proxies 173.245.48.0/20 103.21.244.0/22 103.22.200.0/22 103.31.4.0/22 141.101.64.0/18 108.162.192.0/18 190.93.240.0/20 188.114.96.0/20 197.234.240.0/22 198.41.128.0/17 162.158.0.0/15 104.16.0.0/13 104.24.0.0/14 172.64.0.0/13 131.0.72.0/22 2400:cb00::/32 2606:4700::/32 2803:f800::/32 2405:b500::/32 2405:8100::/32 2a06:98c0::/29 2c0f:f248::/32
+}
+
+relay.botwhisper.si {
+	# Relay: remote MCP (Streamable HTTP + SSE) and HTTP API. No access log:
+	# the relay is no-logging by design.
+	reverse_proxy 127.0.0.1:9100 {
+		import botwhisper_cf_proxies
+		flush_interval -1
+		transport http {
+			read_timeout 0
+			write_timeout 0
+		}
+	}
+}
+
+botwhisper.si {
+	encode zstd gzip
+	reverse_proxy 127.0.0.1:9102 {
+		import botwhisper_cf_proxies
+	}
+}
+
+www.botwhisper.si {
+	redir https://botwhisper.si{uri} permanent
+}

@@ -1,0 +1,220 @@
+# BotWhisper production deploy. Run via `just deploy` (or `just deploy-check`).
+# Caddy is NOT managed here: deploy/botwhisper.caddy is pushed with `just caddy-push`.
+- name: Deploy BotWhisper
+  hosts: prod
+  vars:
+    bw_build_dir: /home/ubuntu/botwhisper-build
+    bw_src_tarball: "{{ playbook_dir }}/../target/deploy/botwhisper-src.tar.gz"
+    bw_site_src: "{{ playbook_dir }}/../site/"
+    bw_cargo: /home/ubuntu/.cargo/bin/cargo
+  tasks:
+    - name: Check local source tarball exists (built by `just deploy`)
+      ansible.builtin.stat:
+        path: "{{ bw_src_tarball }}"
+      delegate_to: localhost
+      register: src_tar
+      failed_when: not src_tar.stat.exists
+
+    - name: Check whether the homepage exists locally
+      ansible.builtin.stat:
+        path: "{{ bw_site_src }}index.html"
+      delegate_to: localhost
+      register: site_src
+
+    # ---------- build (as ubuntu, with its rustup toolchain) ----------
+    - name: Ensure rustup toolchain for ubuntu
+      ansible.builtin.shell: |
+        set -e
+        if [ ! -x {{ bw_cargo }} ]; then
+          curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+        fi
+      args:
+        creates: "{{ bw_cargo }}"
+        executable: /bin/bash
+
+    - name: Build dir
+      ansible.builtin.file:
+        path: "{{ bw_build_dir }}/src"
+        state: directory
+        mode: "0755"
+
+    - name: Upload source tarball (git archive HEAD)
+      ansible.builtin.copy:
+        src: "{{ bw_src_tarball }}"
+        dest: "{{ bw_build_dir }}/botwhisper-src.tar.gz"
+        mode: "0644"
+      register: src_upload
+
+    - name: Stat previously built binary
+      ansible.builtin.stat:
+        path: "{{ bw_build_dir }}/target/release/botwhisper"
+      register: prev_bin
+
+    - name: Unpack source and build release binary
+      ansible.builtin.shell: |
+        set -euo pipefail
+        rm -rf src && mkdir src
+        tar -xzf botwhisper-src.tar.gz -C src
+        cd src
+        CARGO_TARGET_DIR={{ bw_build_dir }}/target {{ bw_cargo }} build --release --locked -p bw-cli
+      args:
+        chdir: "{{ bw_build_dir }}"
+        executable: /bin/bash
+      environment:
+        PATH: "/home/ubuntu/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
+      when: src_upload.changed or not prev_bin.stat.exists
+
+    - name: Stat built binary
+      ansible.builtin.stat:
+        path: "{{ bw_build_dir }}/target/release/botwhisper"
+      register: built_bin
+      failed_when: not built_bin.stat.exists and not ansible_check_mode
+
+    # ---------- system layout (root) ----------
+    - name: botwhisper system user
+      become: true
+      ansible.builtin.user:
+        name: botwhisper
+        system: true
+        shell: /usr/sbin/nologin
+        home: /var/lib/botwhisper
+        create_home: false
+
+    - name: Directories
+      become: true
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: "{{ item.owner }}"
+        group: "{{ item.group }}"
+        mode: "{{ item.mode }}"
+      loop:
+        - { path: /opt/botwhisper, owner: root, group: root, mode: "0755" }
+        - { path: /opt/botwhisper/bin, owner: root, group: root, mode: "0755" }
+        - { path: /opt/botwhisper/site, owner: root, group: root, mode: "0755" }
+        - { path: /var/lib/botwhisper, owner: botwhisper, group: botwhisper, mode: "0750" }
+        - { path: /etc/botwhisper, owner: root, group: root, mode: "0700" }
+
+    - name: Install relay binary
+      become: true
+      ansible.builtin.copy:
+        src: "{{ bw_build_dir }}/target/release/botwhisper"
+        dest: /opt/botwhisper/bin/botwhisper
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0755"
+      when: built_bin.stat.exists
+      notify: restart relay
+
+    - name: relay.env
+      become: true
+      ansible.builtin.template:
+        src: relay.env.j2
+        dest: /etc/botwhisper/relay.env
+        owner: root
+        group: root
+        mode: "0600"
+      notify: restart relay
+
+    - name: Generate dev tokens on first run (kept only on this server)
+      become: true
+      no_log: true
+      ansible.builtin.shell: |
+        set -euo pipefail
+        umask 077
+        toks=""
+        for i in $(seq 1 {{ bw_dev_token_count }}); do
+          t="bw_$(openssl rand -hex 32)"
+          toks="${toks:+$toks,}$t"
+        done
+        printf '# Generated %s. One token per agent identity. Never commit or paste.\nBW_DEV_TOKENS=%s\n' "$(date -u +%FT%TZ)" "$toks" > /etc/botwhisper/dev-tokens.env
+      args:
+        creates: /etc/botwhisper/dev-tokens.env
+        executable: /bin/bash
+      notify: restart relay
+
+    - name: dev-tokens.env permissions
+      become: true
+      ansible.builtin.file:
+        path: /etc/botwhisper/dev-tokens.env
+        owner: root
+        group: root
+        mode: "0600"
+
+    - name: Homepage files
+      become: true
+      ansible.builtin.copy:
+        src: "{{ bw_site_src }}"
+        dest: /opt/botwhisper/site/
+        owner: root
+        group: root
+        mode: u=rwX,g=rX,o=rX
+      when: site_src.stat.exists
+
+    - name: systemd units
+      become: true
+      ansible.builtin.template:
+        src: "{{ item }}.service.j2"
+        dest: "/etc/systemd/system/{{ item }}.service"
+        mode: "0644"
+      loop: [botwhisper-relay, botwhisper-site]
+      notify: [daemon-reload, restart relay, restart site]
+
+    - name: Flush handlers
+      ansible.builtin.meta: flush_handlers
+
+    - name: Services enabled and running
+      become: true
+      ansible.builtin.systemd_service:
+        name: "{{ item }}"
+        enabled: true
+        state: started
+      loop: "{{ ['botwhisper-relay'] + (['botwhisper-site'] if site_src.stat.exists else []) }}"
+
+    # ---------- health ----------
+    - name: Relay health (local)
+      ansible.builtin.uri:
+        url: "http://{{ bw_relay_bind }}/health"
+        status_code: 200
+      register: h
+      retries: 10
+      delay: 2
+      until: h.status == 200
+      when: not ansible_check_mode
+
+    - name: Site health (local)
+      ansible.builtin.uri:
+        url: "http://{{ bw_site_bind }}:{{ bw_site_port }}/"
+        status_code: 200
+      register: s
+      retries: 10
+      delay: 2
+      until: s.status == 200
+      when: site_src.stat.exists and not ansible_check_mode
+
+    - name: Public checks through Cloudflare (from the control machine)
+      ansible.builtin.uri:
+        url: "{{ item }}"
+        status_code: 200
+      delegate_to: localhost
+      loop: "{{ bw_public_checks }}"
+      when: not ansible_check_mode
+      ignore_errors: true
+
+  handlers:
+    - name: daemon-reload
+      become: true
+      ansible.builtin.systemd_service:
+        daemon_reload: true
+    - name: restart relay
+      become: true
+      ansible.builtin.systemd_service:
+        name: botwhisper-relay
+        state: restarted
+    - name: restart site
+      become: true
+      ansible.builtin.systemd_service:
+        name: botwhisper-site
+        state: restarted
+      when: site_src.stat.exists

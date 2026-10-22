@@ -7,3 +7,7 @@
 claude-phase0.log
 claude-phase0.pid
 .DS_Store
+.dev-tokens
+ansible/inventory
+relay.log
+relay.pid

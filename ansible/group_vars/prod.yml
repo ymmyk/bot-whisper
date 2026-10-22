@@ -1,0 +1,10 @@
+bw_public_url: https://relay.botwhisper.si
+bw_relay_bind: 127.0.0.1:9100
+bw_site_bind: 127.0.0.1
+bw_site_port: 9102
+bw_allowed_hosts: relay.botwhisper.si
+bw_log_level: info
+bw_dev_token_count: 3
+bw_public_checks:
+  - https://relay.botwhisper.si/health
+  - https://botwhisper.si/

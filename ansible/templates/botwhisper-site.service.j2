@@ -1,0 +1,22 @@
+[Unit]
+Description=BotWhisper homepage (static files, behind Caddy)
+After=network-online.target
+
+[Service]
+Type=simple
+User=botwhisper
+Group=botwhisper
+ExecStart=/usr/bin/python3 -m http.server {{ bw_site_port }} --bind {{ bw_site_bind }} --directory /opt/botwhisper/site
+# No request logging.
+StandardOutput=null
+StandardError=null
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -525,3 +525,22 @@ docker run -p 443:443 -v bw:/data ghcr.io/<org>/botwhisper relay --domain relay.
 5. **Durable queue:** offer `--durable-queue` in v1 at all, given that it puts plaintext on disk?
 6. **v2 launch channels:** npm and curl/PowerShell only, or also Homebrew, winget, Scoop and crates.io on day one?
 7. **Pricing:** free with rate limits, or a paid tier for `never`-expiring rooms or more members?
+
+## Phase 1 addendum: account signup with email confirmation (Will, 2026-10-21)
+
+- Signup happens inside the OAuth 2.1 browser sign-in flow that MCP clients already open. A new user enters an email, the relay sends a single-use, time-limited (15 min) confirmation link/code, and the account is only created and the OAuth grant only issued after confirmation. Tokens are stored hashed; addresses are never logged.
+- Email is sent with `lettre` (MIT/Apache-2.0, async tokio SMTP, rustls). Every provider is configured from `.env`, so self-hosters can plug in any provider:
+  - `BW_MAIL_TRANSPORT=smtp|log` (`log` prints links to stdout for local dev only)
+  - `BW_SMTP_HOST`, `BW_SMTP_PORT`, `BW_SMTP_USERNAME`, `BW_SMTP_PASSWORD`, `BW_SMTP_TLS=starttls|tls`
+  - `BW_MAIL_FROM`
+- Resend (`smtp.resend.com`) and AWS SES (`email-smtp.<region>.amazonaws.com`) both work over SMTP, so no vendor SDK is needed. `.env` is loaded with `dotenvy`, and a `.env.example` ships with commented Resend and SES presets.
+- Rate limits on signup and resend, per email and per IP.
+
+## Phase 1 addendum: deployment and dev tooling (Will, 2026-10-21; revised 2026-10-22)
+
+- **Production only, no test environment.** `ansible/site.yml` deploys to the single `prod` group. The real `ansible/inventory` (ubuntu@100.76.139.125 over Tailscale) is git-ignored; `ansible/inventory.example` is committed with a placeholder host.
+- Production uses the same ports as dev: relay on `127.0.0.1:9100`, homepage on `127.0.0.1:9102`. Only Caddy is public.
+- The playbook creates the `botwhisper` system user, `/opt/botwhisper` and `/var/lib/botwhisper`, builds the Linux binary on the server from a `git archive HEAD` tarball (ubuntu's rustup cargo, `--locked`), installs it to `/opt/botwhisper/bin/botwhisper`, renders `/etc/botwhisper/relay.env` (0600), generates dev tokens on first run into `/etc/botwhisper/dev-tokens.env` (0600, server only, never printed), installs the `botwhisper-relay` and `botwhisper-site` systemd units, copies `site/` to `/opt/botwhisper/site`, and finishes with local and public health checks. It is idempotent.
+- **Caddy is not managed by Ansible.** The server's shared Caddy (docker `arbiter-caddy`) imports `~/caddy/*.caddy`. `deploy/botwhisper.caddy` is the reference copy; `just caddy-push` validates it, copies it to `/home/ubuntu/caddy/botwhisper.caddy`, validates the full config, and reloads with `just caddy-reload` in `~/arbiter`. Sites: `botwhisper.si` → 9102, `www.botwhisper.si` → redirect to apex, `relay.botwhisper.si` → 9100 with `flush_interval -1` for SSE and Cloudflare `trusted_proxies`.
+- DNS: Cloudflare-proxied A records for the apex, `www` and `relay` → 15.204.106.12; CAA for letsencrypt.org and pki.goog; no AAAA. Caddy gets origin certs by ACME HTTP-01 through the proxy; Cloudflare SSL/TLS mode should be Full (strict).
+- A root `justfile` runs every everyday command: `just build`, `just test`, `just lint` (fmt check + clippy -D warnings), `just fmt`, `just run` (relay on 0.0.0.0:9100), `just site` (homepage on 9102), `just check` (lint + test), `just deploy` (prod, asks for confirmation), `just deploy-check` (`--check --diff`), and `just caddy-push`. `just` with no args lists recipes.
