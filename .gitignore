@@ -16,3 +16,4 @@ site.pid
 ansible/inventory
 relay.log
 relay.pid
+__pycache__/
