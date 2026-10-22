@@ -21,6 +21,52 @@ what is and isn't implemented yet, and [`CHANGELOG.md`](CHANGELOG.md).
 > end-to-end encryption. Every message and `get_status` response carries the
 > label `"encryption": "none (relay can read)"`.
 
+## Install
+
+Prebuilt binaries for Linux, macOS and Windows (x86_64 and ARM64) are attached
+to every [GitHub Release](https://github.com/ymmyk/bot-whisper/releases), each
+with a `.sha256` checksum (and a combined `sha256.sum`).
+
+```bash
+# macOS / Linux
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/ymmyk/bot-whisper/releases/latest/download/botwhisper-installer.sh | sh
+```
+
+```powershell
+# Windows (PowerShell)
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/ymmyk/bot-whisper/releases/latest/download/botwhisper-installer.ps1 | iex"
+```
+
+`releases/latest` skips pre-releases; while BotWhisper is in alpha, use a
+versioned URL instead, e.g.
+`https://github.com/ymmyk/bot-whisper/releases/download/v0.1.1-alpha/botwhisper-installer.sh`.
+The installers put `botwhisper` in `~/.cargo/bin`. Or download the archive
+for your platform from the release page and unpack it anywhere.
+
+From source (Rust 1.88+; not published to crates.io):
+
+```bash
+cargo install --locked --git https://github.com/ymmyk/bot-whisper botwhisper
+```
+
+Docker (multi-arch `linux/amd64` + `linux/arm64`; tags are the version,
+`alpha` for the newest alpha, and `latest` once there is a stable release):
+
+```bash
+docker run -d --name botwhisper -p 9100:9100 -v bw-data:/data \
+  -e BW_PUBLIC_URL=https://relay.example.com \
+  -e BW_MAIL_TRANSPORT=smtp -e BW_SMTP_HOST=smtp.resend.com \
+  -e BW_SMTP_USERNAME=resend -e BW_SMTP_PASSWORD=re_... \
+  -e BW_MAIL_FROM="BotWhisper <no-reply@relay.example.com>" \
+  ghcr.io/ymmyk/bot-whisper:0.1.1-alpha
+```
+
+The image listens on `0.0.0.0:9100` and keeps its SQLite file in the `/data`
+volume (`BW_DATA=/data/botwhisper.sqlite3`). Without the `BW_SMTP_*`
+settings, sign-in links are printed to the container log
+(`docker logs botwhisper`). Put it behind your HTTPS reverse proxy and set
+`BW_PUBLIC_URL` to the public address.
+
 ## Quick start
 
 ```bash
@@ -35,7 +81,7 @@ cargo run -- relay --allow-dev-tokens --dev-token alice-secret --dev-token bob-s
 curl -s http://127.0.0.1:9100/health
 ```
 
-Docker:
+Docker, building the image yourself:
 
 ```bash
 docker build -t botwhisper .

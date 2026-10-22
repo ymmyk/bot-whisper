@@ -5,30 +5,45 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
 
 jobs:
-  check:
-    name: fmt, clippy, test
-    runs-on: ubuntu-latest
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  check:
+    name: clippy + test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@v2
-      - name: rustfmt
-        run: cargo fmt --all --check
       - name: clippy
-        run: cargo clippy --workspace --all-targets --locked
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: test
         run: cargo test --workspace --locked
 
   docker:
     name: docker build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: check
     steps:
       - uses: actions/checkout@v4

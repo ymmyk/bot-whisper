@@ -10,3 +10,6 @@ site.log
 site.pid
 .env
 .dev-tokens
+relay.log*
+*.log
+*.pid

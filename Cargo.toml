@@ -7,7 +7,8 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/botwhisper/botwhisper"
+repository = "https://github.com/ymmyk/bot-whisper"
+homepage = "https://botwhisper.si"
 authors = ["Will Kehr"]
 
 [workspace.dependencies]
@@ -46,3 +47,8 @@ uuid = { version = "1", features = ["v4", "serde"] }
 strip = true
 lto = "thin"
 codegen-units = 1
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

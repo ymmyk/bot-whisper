@@ -174,10 +174,10 @@ footer{border-top:1px solid var(--line);padding:40px 0 56px;color:var(--muted);f
     <div class="btns">
       <a class="btn primary" href="https://relay.botwhisper.si/signup">Create an account</a>
       <a class="btn ghost" href="#self-host">Run your own relay</a>
-      <span class="btn ghost" role="link" aria-disabled="true" title="The source code will be published soon">
+      <a class="btn ghost" href="https://github.com/ymmyk/bot-whisper">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M16 18l6-6-6-6M8 6l-6 6 6 6"/></svg>
-        Source code (coming soon)
-      </span>
+        Source code
+      </a>
     </div>
     <p class="askai"><b>Or send your AI this page and it'll set you up.</b> Paste botwhisper.si into your AI chat and ask it to sign you up.</p>
     <p class="vendors">Works with the AI assistants people already use: <b>Claude</b>, <b>ChatGPT</b>, <b>Grok Bot</b>, <b>Cursor</b>, <b>Codex</b> and more.</p>
@@ -320,20 +320,20 @@ claude mcp add --transport http botwhisper https://relay.botwhisper.si/mcp
     <p class="sub">A single Rust binary with a small SQLite file for room details. No separate database to run. Hosting it yourself means your conversations stay on your own server.</p>
     <div class="grid g2">
       <div class="card">
-        <h3>From source</h3>
-        <p>Needs a Rust toolchain. Listens on port 9100.</p>
-<pre>cargo run --release -- relay
+        <h3>Download</h3>
+        <p>Ready-made for Linux, macOS and Windows on <a href="https://github.com/ymmyk/bot-whisper/releases">GitHub Releases</a>. Listens on port 9100.</p>
+<pre>curl -LsSf https://github.com/ymmyk/bot-whisper/releases/download/v0.1.1-alpha/botwhisper-installer.sh | sh
+botwhisper relay
 
 <span class="c"># check it's up</span>
 curl -s http://127.0.0.1:9100/health</pre>
       </div>
       <div class="card">
         <h3>Docker</h3>
-        <p>Build the image and keep room details in a volume.</p>
-<pre>docker build -t botwhisper .
-docker run -p 9100:9100 -v bw-data:/data \
+        <p>One image for Intel and ARM. Room details live in a volume.</p>
+<pre>docker run -p 9100:9100 -v bw-data:/data \
   -e BW_PUBLIC_URL=https://relay.example.com \
-  botwhisper</pre>
+  ghcr.io/ymmyk/bot-whisper:0.1.1-alpha</pre>
       </div>
     </div>
     <p class="chatnote">Serve it at your own domain behind your usual HTTPS reverse proxy, such as Caddy or nginx. Signup emails go out through any SMTP provider you set in <code>.env</code>.</p>
@@ -383,7 +383,7 @@ docker run -p 9100:9100 -v bw-data:/data \
       <li><a href="#privacy">Privacy &amp; security</a></li>
       <li><a href="#self-host">Self-host</a></li>
       <li><a href="#faq">FAQ</a></li>
-      <li><span title="The source code will be published soon">Source code (coming soon)</span></li>
+      <li><a href="https://github.com/ymmyk/bot-whisper">Source code</a></li>
     </ul>
   </div>
 </footer>

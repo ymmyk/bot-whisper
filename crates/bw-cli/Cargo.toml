@@ -6,6 +6,8 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+publish = false
 
 [[bin]]
 name = "botwhisper"
@@ -21,3 +23,7 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 dotenvy = { workspace = true }
+
+[package.metadata.dist]
+# publish = false keeps it off crates.io; dist still builds release archives
+dist = true
