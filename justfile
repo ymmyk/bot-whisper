@@ -31,7 +31,7 @@ check: lint test
 
 # Run the relay on 0.0.0.0:9100 (tokens from BW_DEV_TOKENS or generated)
 run *args:
-    cargo run -p bw-cli -- relay --bind 0.0.0.0:9100 {{args}}
+    cargo run -p botwhisper -- relay --bind 0.0.0.0:9100 {{args}}
 
 # Serve the homepage from ./site on 0.0.0.0:9102
 site:

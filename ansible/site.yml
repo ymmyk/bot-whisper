@@ -56,7 +56,7 @@
         rm -rf src && mkdir src
         tar -xzf botwhisper-src.tar.gz -C src
         cd src
-        CARGO_TARGET_DIR={{ bw_build_dir }}/target {{ bw_cargo }} build --release --locked -p bw-cli
+        CARGO_TARGET_DIR={{ bw_build_dir }}/target {{ bw_cargo }} build --release --locked -p botwhisper
       args:
         chdir: "{{ bw_build_dir }}"
         executable: /bin/bash
