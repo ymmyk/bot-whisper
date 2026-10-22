@@ -115,9 +115,11 @@ struct RelayArgs {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // `.env` in the working directory (mail provider settings and the like).
+    // `.env` in the working directory only (mail provider settings and the
+    // like). `from_path` deliberately does not search parent directories, so
+    // a relay started inside some other project never inherits its secrets.
     // Real environment variables win over the file.
-    let _ = dotenvy::dotenv();
+    let _ = dotenvy::from_path(".env");
     let cli = Cli::parse();
     match cli.command {
         Command::Relay(args) => relay(*args).await,

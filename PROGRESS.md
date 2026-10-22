@@ -1,207 +1,183 @@
-# Phase 0 progress
+# Phase 1 progress (v0.1.0-alpha)
 
-Status as of 2026-10-21. `cargo test`, `cargo clippy --all-targets` and
-`cargo fmt --check` are clean. `cargo run -- relay` serves MCP on
-`0.0.0.0:9100` (verified with a raw `initialize` over Streamable HTTP and the
-`/health` endpoint).
+Status as of 2026-10-22. `just check` (fmt, clippy `-D warnings`, tests) is
+clean: 65 tests. Not deployed, not pushed, not tagged (per the task rules);
+everything is committed locally on `main`.
 
-## What is implemented
+Phase 0 notes are in git history (`PROGRESS.md` at `840e548`).
 
-**Workspace** (`Cargo.toml`, dual MIT/Apache-2.0)
+## What is done
 
-- `crates/bw-proto`: wire types and the pure turn state machine. No I/O.
-- `crates/bw-relay`: axum + tokio relay library (room actors, SQLite
-  metadata, remote MCP via `rmcp` 3.6, doorbells, auth).
-- `crates/bw-cli`: the single `botwhisper` binary with the `relay` subcommand
-  (clap, flags + env vars).
-- `Dockerfile` (multi-stage, Debian slim runtime, `/data` volume),
-  `.github/workflows/ci.yml` (fmt, clippy with `-D warnings`, test, docker
-  build), `README.md` with quick start, client snippets, tool table and the
-  "operator can read" notice.
+**1. OAuth 2.1 for remote MCP** (`crates/bw-relay/src/oauth.rs`, `auth.rs`)
 
-**Protocol (`bw-proto`)**
+- RFC 8414 authorization-server metadata, RFC 9728 protected-resource
+  metadata (at `/.well-known/oauth-protected-resource` and `/…/mcp`), and a
+  `401` from `/mcp` with `resource_metadata` in `WWW-Authenticate`.
+- RFC 7591 dynamic client registration: public (`none`) and confidential
+  (`client_secret_post` / `client_secret_basic`) clients, redirect URI rules
+  (https, loopback http, private app schemes; never `javascript:` etc.),
+  grant/response type validation, per-IP limit.
+- Authorization endpoint with mandatory PKCE `S256`, exact redirect-URI
+  match, errors shown as a page until the redirect URI is trusted and as
+  redirect parameters afterwards. Consent page with the "operator can read"
+  notice; one-click consent for a browser that already has a session.
+- Token endpoint: `authorization_code` (single-use 10-minute codes bound to
+  client, redirect URI and PKCE challenge) and `refresh_token` (rotating,
+  90 d); access tokens 1 h; `Cache-Control: no-store`; RFC 7009 `/oauth/revoke`.
+- All secrets stored as SHA-256 only. Expired rows swept every 10 minutes.
+- Dev tokens kept for local dev behind `--allow-dev-tokens` /
+  `BW_ALLOW_DEV_TOKENS`; the relay no longer generates one. Phase 0 agent
+  ids are unchanged so existing databases keep their memberships.
 
-- `Envelope` with `v`, `enc`, `room`, `thread`, `msg_id`, `seq`, `from`, `to`,
-  `turn`, `lease_s`, `ts`, `body`, `ct`. `v != 1` is rejected, unknown fields
-  are ignored, `enc: mls` parses but is refused on a v1 relay, bodies over
-  48 KiB are rejected, `ts` rounds to 10 s.
-- `ThreadState`: all five turn modes (`alternate`, `round_robin`, `queue`,
-  `moderated`, `free`), `yield` / `hold` (lease, default 120 s, max 600 s,
-  lazy expiry acts as an implicit yield) / `pass` / `done` (owner only,
-  absorbing), directed yields via `to`, FIFO floor queue with
-  `request_floor`, moderated addressing, per-thread turn cap with `capped`
-  status and `raise_cap`, one short interrupt per member per thread, member
-  removal cleanup.
-- Property test (proptest, 400 cases of up to 60 random ops over 2–5 members
-  in every mode) checking: at most one speaker outside queue-open state,
-  `turns_used <= turn_cap`, holder is never queued, refused ops never mutate
-  (modulo time-driven lease expiry), `done` only ever succeeds for the owner,
-  complete is absorbing. It caught three real bugs while writing it
-  (queueing in non-queue modes, cap lowering below `turns_used`, and an
-  oracle mistake around lease expiry).
+**2. Account signup with email confirmation** (`mail.rs`, `oauth.rs`)
 
-**Relay (`bw-relay`)**
+- Email on the consent page → single-use, hashed, 15-minute link (the
+  pending authorization request is stored with it) → account created on
+  first confirmation → code redirect + `bw_session` cookie (30 d, HttpOnly,
+  SameSite=Lax, `Secure` on https).
+- `lettre` over SMTP (rustls, STARTTLS or implicit TLS) from `.env` via
+  `dotenvy` (`BW_MAIL_TRANSPORT=smtp|log`, `BW_SMTP_HOST/PORT/USERNAME/
+  PASSWORD/TLS`, `BW_MAIL_FROM`). `.env.example` has Resend and SES presets.
+  Only the working directory's `.env` is read (`dotenvy::from_path`, never
+  parent directories), so a relay started inside another project's tree
+  cannot inherit its secrets. The repo's git-ignored `.env` (Will's Resend
+  settings) was picked up by the smoke run: the SMTP path connected,
+  authenticated and got Resend's 550 for `example.com`, logged redacted.
+- Addresses, links and tokens never reach the tracing log; SMTP errors are
+  redacted; the "check your email" page does not echo the address; a test
+  mailer captures messages in memory. The `log` transport prints links to
+  stdout for local dev only.
 
-- One tokio task per room (`RoomHandle::with(closure)`), so every room
-  operation is serialized with no locks on the hot path. Actors are created
-  on demand and rehydrated from SQLite after a restart or eviction.
-- Messages live only in actor memory with a recipient set fixed at send time.
-  Deleted once every recipient acks (`wait_for_message` auto-acks unless
-  `auto_ack: false`; explicit `ack_messages` exists). Unacked TTL sweep
-  (default 72 h, max 14 d) drops stragglers and tells the sender
-  `expired_for: [...]`. Removed members leave every recipient set. Idempotent
-  resend via `msg_id`.
-- Owner-only rules: `create_invite`, `remove_member`, `start_thread`,
-  `raise_turn_cap`, `close_room`, and the `done` signal. A member's `done`
-  returns `OWNER_ONLY`. Owner `leave_room` closes and wipes the room (SQLite
-  rows deleted, actor exits, waiters get `ROOM_CLOSED`).
-- Invites: single-use, labelled, expiring (default 7 d), stored as SHA-256 of
-  the secret; URL `<public_url>/i/<id>.<secret>`; first redeemer wins
-  atomically in SQLite. `GET /i/<token>` is an informational page only.
-- Remote MCP over Streamable HTTP (`rmcp` `StreamableHttpService` with the
-  local session manager). 16 tools: `create_room`, `create_invite`,
-  `join_room`, `remove_member`, `leave_room`, `start_thread`, `send_message`,
-  `wait_for_message`, `ack_messages`, `request_floor`, `set_turn`,
-  `raise_turn_cap`, `get_status`, `list_rooms`, `set_doorbell`, `close_room`.
-  Tool-level errors are structured `{"error": CODE, "message", ...}`.
-  Delivered messages carry `untrusted: true`, the notice, sender
-  `{member, claimed_name, role}`, `to`, the turn view with `now: "you" |
-  "you (addressed)" | "<member>" | "open"`, and `encryption: "none (relay can
-  read)"`.
-- `wait_for_message`: watch-channel long-poll (default 45 s, max 55 s), one
-  room or all of the agent's rooms, returns content-free events too
-  (`thread_started`, `thread_done`, `thread_capped`, `members_changed`,
-  `lease_expired`, `expired`).
-- Auth: bearer dev tokens (`--dev-token`, repeatable / `BW_DEV_TOKENS`), each
-  token is one agent identity (hash-derived; raw token never stored). 401
-  with `WWW-Authenticate: Bearer` otherwise. A token is generated and printed
-  if none is configured.
-- Doorbells: HMAC-SHA256 `BotWhisper-Signature: t=..,v1=..` over
-  `t + "." + body`, `BotWhisper-Delivery` id, optional static `Authorization`
-  header, payload `{v, event, room, thread, seq, turn, ts}` and nothing else.
-  Exponential backoff with jitter (1 s … 5 min, 10 attempts), coalesced per
-  (room, member) so a newer ring replaces one in retry. HTTPS-only, no
-  redirects, 5 s timeout, loopback/private/CGNAT literal IPs blocked unless
-  `--allow-insecure-doorbells`. Config persisted in SQLite.
-- Logging: relay code never logs content, names, labels or room ids.
-  `logging::filter_directives` caps third-party crates at `warn` (rmcp logs
-  raw JSON-RPC frames at `trace`). `GET /health` returns aggregate counters.
-- Config via flags and env vars; bind defaults to `0.0.0.0:9100`.
+**3. Invite-scoped guest join**: done, it was cheap. "Have an invite instead?"
+on the consent page takes the invite URL and an optional bot name, redeems
+the invite into a `guest` account, and issues a token with scope
+`room:<id>`. A guest cannot `create_room` or `join_room` elsewhere
+(`UNAUTHORIZED`) and resolves only its room.
 
-**Tests** (36 total)
+**4. Guards**
 
-- `bw-proto`: 17 unit tests + the property test.
-- `bw-relay` unit: auth, config, db cascade, doorbell signing/URL rules/payload
-  shape, logging filter, thread-id slugs.
-- `tests/exchange.rs` (through a real `rmcp` MCP client over HTTP):
-  2-bot 10-turn alternate exchange ending in owner `done`; 3-bot moderated
-  "game night" with `expires: never`, addressing, a second thread with reset
-  turn count, zero messages held after `done`; round-robin, cap, raise-cap,
-  queue mode with `request_floor`, interrupt; owner-only enforcement and
-  stranger rejection; single-use invites and re-invite after removal; owner
-  leave closes and wipes; delete-on-ack with explicit acks, idempotent resend,
-  TTL expiry notice; restart survival of rooms (and loss of undelivered
-  messages); any-room wait; `/health`; 401 on bad token.
-- `tests/doorbell.rs`: payload shape and absence of content, HMAC
-  verification, static auth header, removal stops rings; retry after two 500s
-  then success.
-- `tests/no_content_logging.rs`: full exchange at `trace` level with
-  sentinel text, display name, invite label and room id; asserts none appear.
-- Integration tests bind only ports 9101–9199, handed out once per test
-  binary.
+- Rate limits (`ratelimit.rs`, fixed windows keyed by hashed key): per
+  member and per room messages/minute, doorbells/hour per member, rooms per
+  account, invites per room, sign-in mails per address and per IP,
+  registrations and token requests per IP. `RATE_LIMITED` carries
+  `retry_after_s`; HTTP endpoints answer 429 with `Retry-After`. Per-IP
+  limits honour `X-Forwarded-For` only with `--behind-proxy`.
+- Turn timeout (`bw-proto` `check_timeout`, driven by the room sweep):
+  warn and ring once, then skip and mark `absent` in groups or stall with
+  two parties. `turn_timeout` and `thread_stalled` events, `stalled`
+  doorbell. Free rooms never time out.
+- Loop guard: minimum interval between one member's messages (2 s) and
+  near-duplicate detection in the pure turn machine (fingerprint of short
+  messages, 3 consecutive hits within the last 8 → `stalled_by: loop_guard`,
+  owner-only resume). Exercised by the property test.
 
-## Decisions made without asking
+**5. Fixes from UtherDev's testing**: (a) `DELETE /mcp` → 204; (b) capped
+threads report `now: "nobody"` and nobody may send; (c) `thread_start:
+owner | anyone` room setting, default owner-only after `done`; (d)
+`room_closed { reason }` event delivered once to each former member (the
+actor lingers up to 60 s), also through any-room waits, before `ROOM_CLOSED`.
 
-- **Identity = bearer token.** Several tokens can be configured; each is a
-  distinct agent. Two bots sharing one token are the same member. This is
-  the Phase 0 stand-in for OAuth accounts and invite-scoped guest tokens.
-- **Sending into an idle room opens an implicit thread** (`adhoc-N`) with
-  the sender holding the floor, using the room's default mode (auto:
-  alternate for 2, queue for 3+). This makes the "two bots for ten minutes"
-  case work with no `start_thread` call. `start_thread` while a thread is
-  open returns `THREAD_ACTIVE`.
-- **`request_floor` outside queue mode is a probe**, not a queue: it returns
-  `granted: true` if you may speak, else `NOT_YOUR_TURN` with the holder.
-- **Queue mode with an empty queue leaves the floor open**; the first sender
-  takes it.
-- **Interrupts count toward the cap** (they are content) and are limited to
-  280 characters.
-- **`pass` does not count toward the cap**; `hold`, `yield` and `done` with
-  text do.
-- **Lowering the cap below `turns_used`** caps the thread at once; the cap is
-  clamped so `turns_used <= turn_cap` always holds.
-- **`set_doorbell` without `room_id`** applies to every current membership
-  (there is no account-level doorbell yet).
-- **Removed members can be re-invited** with a fresh invite (they get a new
-  member id).
-- **Restart drops undelivered messages and open threads** (memory-only), as
-  the design says. Rooms, members, invites and doorbells survive.
-- **Doorbell secrets are stored in plaintext in SQLite** for now (the design
-  wants them encrypted with a relay key held outside the DB).
-- **Server-side `Host` validation is off by default** (`--allowed-host` to
-  enable) because the relay lives on a Tailscale address.
-- `ack` is exposed as `ack_messages` with `up_to_seq`; `wait_for_message`
-  gained `auto_ack` so at-least-once clients can opt out of auto-ack.
+**6. Docs**: README rewritten for OAuth, mail, optional turns and the new
+flags; DESIGN.md gained two Phase 1 addenda (turn control opt-in; decisions
+made while building) and small edits to the goals and defaults; homepage
+copy was already reworded by Will for optional turns and sign-in and needed
+no further change; CHANGELOG.md added with the v0.1.0-alpha entry.
 
-## What is stubbed or missing (Phase 1+)
+**7. Turn control is opt-in.** `TurnMode::Free` is the default for rooms
+(`create_room.turn_mode`), stored per room; `start_thread.turn_mode` may
+override per thread. In free mode there is no holder, `now` reads
+`anyone`, `hold`/`yield`/`pass` are accepted and ignored, `request_floor`
+is always granted, and doorbells carry `turn: open`. Cap, loop guard, rate
+limits, owner-only `done`, `thread_start` and expiry are identical in every
+mode. Phase 0 rooms stored as `auto` load as `free`.
 
-- **OAuth 2.1** (PKCE, dynamic client registration, protected-resource
-  metadata, consent page that accepts an invite URL, refreshable room-scoped
-  guest tokens) and **accounts** (magic link). `auth.rs` has the TODO.
-- **TLS** (`rustls-acme`), `--domain`, `--behind-proxy`.
-- **Turn timeout** (30 min, `absent` / `stalled`), **loop guard** (2 s minimum
-  interval, near-duplicate detection). `ThreadStatus::Stalled` exists but is
-  never entered.
-- **Rate limits** (messages/min, doorbells/hour, rooms per account). Only the
-  50-outstanding-invites cap exists.
-- **Email doorbells**, `closing_soon` for `never` rooms (180-day inactivity),
-  **SSRF DNS-resolution check** (only literal IPs are blocked).
-- **Idle actor unloading** (actors stay loaded until the room closes; they
-  are cheap).
-- `--durable-queue`, status page, A2A mapping, musl/distroless image, release
-  pipeline, `mcp-remote` bridge acceptance test (documented, not automated).
+**Deploy bits** (not deployed): `relay.env.j2` now also sets
+`BW_BEHIND_PROXY=true` (per-IP limits behind Caddy/Cloudflare) and
+`BW_ALLOW_DEV_TOKENS` from `bw_allow_dev_tokens` (true for now so UtherDev's
+tokens keep working), next to Will's Resend SMTP settings (password read back
+from the server's `relay.env` at deploy time). The systemd unit gets a
+`WorkingDirectory`. Note: my first commit (`64a6575`, `git add -A`) swept in
+Will's uncommitted Ansible mail changes and `TASK-phase1.md`; they are intact.
+
+## Tests (65)
+
+- `bw-proto` (20): unit tests for every mode including free, loop guard,
+  turn timeout (warn/stall/skip/absent), capped=nobody; the property test now
+  also drives fingerprints and timeouts and checks the free-mode invariants
+  (never a holder, only cap/complete/loop-guard refusals), stalled
+  consistency and absent membership.
+- `bw-relay` unit (20): db migrations from a Phase 0 schema, single-use codes
+  / links / tokens, auth from the DB, mail config and redaction, limiter
+  windows, redirect-URI rules, PKCE vector from RFC 7636, cookies and proxy
+  IPs, HTML escaping.
+- `tests/oauth.rs` (5): metadata and 401 hints; registration validation and
+  confidential clients; the full email sign-in (page, link from the captured
+  mail, single-use link, PKCE, wrong verifier / wrong client / reuse, session
+  consent, same account across clients, refresh rotation, revocation,
+  re-sign-in); guest invite flow and scoping; signup rate limit, dev tokens
+  refused without the flag.
+- `tests/free_mode.rs` (6): three bots sending concurrently in a free room
+  with ignored signals, reopen policy both ways, cap in free mode, loop guard
+  stall and owner resume, message / room / interval limits, rooms per account.
+- `tests/guards.rs` (4): two-party timeout stall and resume, group skip with
+  `absent`, `room_closed` to a live waiter and through an any-room wait,
+  `DELETE /mcp` → 204 against a raw session.
+- `tests/exchange.rs`, `doorbell.rs`, `no_content_logging.rs` (10): Phase 0
+  suites, with the turn-mode tests now opting into `alternate`.
+
+Smoke-tested the real binary on port 9150/9151: health, metadata, 401,
+registration, consent page (escaped client name), email submission with the
+`log` transport.
+
+## Deferred
+
+- TLS (`rustls-acme`, `--domain`), `--behind-proxy` ACME skip: the hosted
+  relay terminates TLS in Caddy.
+- Email doorbells, `closing_soon` for `never` rooms, SSRF DNS-resolution
+  check, idle actor unloading, `--durable-queue`, status page, A2A mapping,
+  musl/distroless image, release pipeline, `mcp-remote` acceptance test.
 - Doorbell secrets at rest encryption.
+- Limiters are per process (fine for one relay; not shared across
+  instances).
+- Account deletion / "forget me" and listing an account's clients.
+- A device-code flow for stdio bridges without a browser.
 
-## Suggested spec changes
+## Spec questions for Will
 
-1. **Specify who holds the floor in an implicit thread.** Section 6.2 says
-   ad-hoc rooms "just use one implicit thread" but not how it starts. I made
-   the first sender the holder. Alternatives: always the owner, or require
-   `start_thread`.
-2. **`request_floor` semantics outside queue mode** are unspecified; treating
-   it as a probe avoids a stale queue. Worth stating.
-3. **Add `ack_messages` (or `ack`) to the tool table** and an `auto_ack`
-   flag on `wait_for_message`. "Acks automatically on return" is
-   at-most-once: if the client dies after the relay returns, the message is
-   gone.
-4. **Interrupt needs an argument.** Section 7 mentions one `interrupt` per
-   thread but `send_message` has no field for it. I added `interrupt: bool`
-   and a 280-character limit.
-5. **Content-free events.** Doorbells only wake agents; once awake they need
-   to learn *what* changed (thread started, members changed, a message
-   expired). I added an `events` list to `wait_for_message` results. The spec
-   could define this as the `state` control frame delivered on poll.
-6. **`turn` in the doorbell payload** is only `yours | theirs | none` here.
-   The spec example says `yours`; worth listing the vocabulary.
-7. **Identity for invitees before OAuth exists.** Since invitees have no
-   account, the design relies on the OAuth consent page issuing a
-   room-scoped token. Until then, every bot needs a dev token from the
-   operator; the README says so. A cheap bridge for Phase 1 could be
-   `join_room` returning a room-scoped bearer token for stdio bridges.
-8. **Moderated hold.** "The owner's hold also pauses the floor queue" is
-   implemented as: a hold by anyone blocks everyone else (including addressed
-   members) until yield or lease expiry. If addressed members should still be
-   able to answer during an owner hold, say so.
-9. **Default `max_members` check and room count caps** need the account
-   concept; until accounts exist, per-agent caps are the natural anchor.
-10. **Clarify `done` with content vs. `set_turn done`.** Both work; a `done`
-    with text counts as a turn, which can push a thread to `capped` and
-    `complete` in the same message. Harmless, but worth a sentence.
+1. **Identity per client vs per account.** I made every connected MCP
+   client its own agent (member) so one person can run several bots. The
+   cost: a client that re-registers (lost config) becomes a new agent and
+   loses its rooms. Alternative: identity = account, with an explicit
+   "agent name" picked on the consent page to split bots. Which do you want
+   for 1.0? (Section 18, question 3 is the same question from the other side.)
+2. **Reopen policy and the first thread.** Before any `done`, members may
+   open the first implicit thread so "two bots for ten minutes" still works
+   when the invitee speaks first. Should `thread_start: owner` be stricter
+   and apply from room creation?
+3. **Loop guard knobs.** 3 hits in the last 8 messages, 120-character
+   "short" threshold, 2 s per-member spacing. Free mode made me apply the
+   spacing per member rather than per thread (so three bots answering at
+   once are not penalised). OK?
+4. **Turn timeout in moderated mode.** If the owner itself goes silent the
+   thread stalls (nobody to skip to). Fine, or should addressed members be
+   allowed to continue?
+5. **Guest tokens and `display_name`.** Guests set a bot name on the consent
+   page; there is still no `set_display_name` tool for anyone. Add one?
+6. **Session cookie lifetime** (30 d) and refresh token lifetime (90 d,
+   sliding): confirm for the hosted relay.
+7. **Production dev tokens.** `bw_allow_dev_tokens: true` keeps the
+   server-generated tokens working after the next deploy. Flip it off once
+   UtherDev has switched to OAuth?
+8. **Mail on prod.** The playbook asserts `BW_SMTP_PASSWORD` already exists
+   in the server's `relay.env`, so the first deploy after this needs the
+   password added there by hand once. Worth a one-line note in the deploy
+   recipe?
 
 ## How to run
 
 ```bash
-cargo run -- relay --dev-token alice --dev-token bob     # 0.0.0.0:9100
+just run                                   # 0.0.0.0:9100, log mail transport
+cargo run -- relay --allow-dev-tokens --dev-token alice --dev-token bob
 curl -s http://127.0.0.1:9100/health
-cargo test && cargo clippy --all-targets && cargo fmt --check
+just check
 ```

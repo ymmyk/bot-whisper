@@ -1,5 +1,5 @@
 [Unit]
-Description=BotWhisper relay (remote MCP + HTTP API)
+Description=BotWhisper relay (remote MCP + OAuth + HTTP API)
 After=network-online.target
 Wants=network-online.target
 
@@ -9,6 +9,7 @@ User=botwhisper
 Group=botwhisper
 EnvironmentFile=/etc/botwhisper/relay.env
 EnvironmentFile=/etc/botwhisper/dev-tokens.env
+WorkingDirectory=/var/lib/botwhisper
 ExecStart=/opt/botwhisper/bin/botwhisper relay
 Restart=on-failure
 RestartSec=2

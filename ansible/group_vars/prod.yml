@@ -5,6 +5,9 @@ bw_site_port: 9102
 bw_allowed_hosts: relay.botwhisper.si
 bw_log_level: info
 bw_dev_token_count: 3
+# Keep the server-generated dev tokens usable next to OAuth (handy for
+# UtherDev's testing). Set to false once every client signs in with OAuth.
+bw_allow_dev_tokens: true
 bw_public_checks:
   - https://relay.botwhisper.si/health
   - https://botwhisper.si/
