@@ -4,7 +4,10 @@
 
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
@@ -334,6 +337,14 @@ impl Room {
 
     pub fn is_closed(&self) -> bool {
         self.closed
+    }
+
+    /// After close: the member id of `agent_id` if it still has a
+    /// `room_closed` event to collect.
+    pub fn pending_close_for(&self, agent_id: &str) -> Option<MemberId> {
+        self.member_for_agent(agent_id)
+            .filter(|m| self.closed_pending.contains(&m.member))
+            .map(|m| m.member.clone())
     }
 
     /// True once every former member collected `room_closed`, or the grace
@@ -1344,6 +1355,9 @@ pub struct RoomHandle {
     pub id: String,
     tx: mpsc::UnboundedSender<Job>,
     version: watch::Receiver<u64>,
+    /// Set once the room closed (the actor lingers briefly so waiters can
+    /// collect `room_closed`).
+    closed: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for RoomHandle {
@@ -1359,6 +1373,8 @@ impl RoomHandle {
         let version = room.subscribe();
         let id = room.id.clone();
         let sweep_every = room.cfg.sweep_interval;
+        let closed = Arc::new(AtomicBool::new(false));
+        let closed_flag = closed.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(sweep_every);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1367,6 +1383,7 @@ impl RoomHandle {
                     job = rx.recv() => {
                         let Some(job) = job else { break };
                         job(&mut room);
+                        closed_flag.store(room.is_closed(), Ordering::Release);
                         if room.is_drained() {
                             // Drain anything already queued so callers get an answer.
                             while let Ok(job) = rx.try_recv() {
@@ -1377,6 +1394,7 @@ impl RoomHandle {
                     }
                     _ = tick.tick() => {
                         room.sweep(doorbell::now_unix());
+                        closed_flag.store(room.is_closed(), Ordering::Release);
                         if room.is_drained() {
                             break;
                         }
@@ -1386,7 +1404,17 @@ impl RoomHandle {
             // Dropping `room` drops the queue and the version sender, which
             // wakes every waiter so they observe the closed room.
         });
-        RoomHandle { id, tx, version }
+        RoomHandle {
+            id,
+            tx,
+            version,
+            closed,
+        }
+    }
+
+    /// True once the room closed (actor may still be answering).
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
     }
 
     /// Run `f` on the actor and return its result. Fails if the actor is gone.

@@ -714,7 +714,7 @@ async fn start_email_signin(
         return no_store(signin_page(
             req,
             client,
-            Some("That doesn't look like an email address."),
+            Some("That is not a valid email address."),
         ));
     }
     let email = normalize_email(email);

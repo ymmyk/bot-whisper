@@ -33,6 +33,7 @@ url = { workspace = true }
 base64 = { workspace = true }
 
 [dev-dependencies]
-reqwest = { workspace = true }
+reqwest = { workspace = true, features = ["cookies"] }
+url = { workspace = true }
 rmcp = { workspace = true, features = ["client", "transport-streamable-http-client-reqwest", "reqwest"] }
 tracing-subscriber = { workspace = true }

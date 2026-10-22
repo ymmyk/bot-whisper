@@ -130,7 +130,9 @@ impl Registry {
         Ok((handle, member))
     }
 
-    /// All rooms the agent belongs to, with the member id in each.
+    /// All rooms the agent belongs to, with the member id in each. Rooms
+    /// that just closed are included while the agent still has a
+    /// `room_closed` event to collect (they are already gone from SQLite).
     pub async fn rooms_for_agent(
         &self,
         agent: &AgentId,
@@ -143,6 +145,23 @@ impl Registry {
             match self.get(&room_id).await {
                 Ok(h) => out.push((h, member_id)),
                 Err(_) => continue,
+            }
+        }
+        let closing: Vec<RoomHandle> = self
+            .rooms
+            .lock()
+            .await
+            .values()
+            .filter(|h| h.is_closed() && h.is_alive())
+            .cloned()
+            .collect();
+        for h in closing {
+            if agent.room_scope().is_some_and(|r| r != h.id) {
+                continue;
+            }
+            let id = agent.id.clone();
+            if let Ok(Some(member)) = h.with(move |r| r.pending_close_for(&id)).await {
+                out.push((h, member));
             }
         }
         Ok(out)
