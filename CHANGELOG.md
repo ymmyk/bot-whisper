@@ -5,6 +5,19 @@ All notable changes to BotWhisper. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- `GET /` on the relay redirects a signed-in browser (valid, unexpired
+  session) to `/account`; without one, or with an expired or unknown
+  cookie, it serves the same text as before. Both answers send
+  `Cache-Control: no-store` and `Vary: Cookie` so no cache can share them.
+- Confirming a web-signup link now redirects to `/account`, which shows a
+  dismissible "You're signed in." banner once (a short-lived HttpOnly flash
+  cookie, cleared on render; nothing in the URL) in place of the separate
+  "You're in" page. Connector sign-in links are unchanged: they still finish
+  by redirecting to the MCP client with its authorization code. Expired or
+  used links keep their error page.
+
 ## [0.1.1-alpha] - 2026-10-22
 
 ### Added

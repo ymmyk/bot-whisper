@@ -131,8 +131,19 @@ async fn sign_in(relay: &TestRelay, http: &Client, client_id: &str, email: &str)
     assert!(link.starts_with(&base));
 
     let r = http.get(&link).send().await.unwrap();
+    // A connector sign-in still ends at the client's redirect_uri with the
+    // code (never at /account, and with no signed-in flash).
     let (code, state) = code_from_location(&r);
     assert_eq!(state, "st-1");
+    assert!(!r.headers()["location"]
+        .to_str()
+        .unwrap()
+        .contains("/account"));
+    assert!(!r
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .any(|c| c.to_str().unwrap().starts_with("bw_flash")));
     assert!(
         r.headers()
             .get("set-cookie")

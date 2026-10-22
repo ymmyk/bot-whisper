@@ -81,13 +81,13 @@ pub fn router(
         .route("/oauth/token", post(oauth::token))
         .route("/oauth/revoke", post(oauth::revoke))
         .route("/signup", get(web::signup_get).post(web::signup_post))
+        .route("/", get(web::index))
         .route("/account", get(web::account_get))
         .route("/account/disconnect", post(web::disconnect_post))
         .route("/account/logout", post(web::logout_post))
         .with_state(oauth_state);
 
     Router::new()
-        .route("/", get(index))
         .route("/health", get(health))
         .route("/i/{invite}", get(invite_page))
         .with_state(state)
@@ -110,8 +110,10 @@ async fn delete_is_204(req: Request, next: Next) -> Response {
 pub type MakeService =
     axum::extract::connect_info::IntoMakeServiceWithConnectInfo<Router, SocketAddr>;
 
-async fn index(State(state): State<AppState>) -> impl IntoResponse {
-    let base = state.cfg.public_url();
+/// The plain-text index served at `GET /` to anyone without a browser
+/// session (signed-in browsers are sent to `/account`; see `web::index`).
+pub(crate) fn index_text(cfg: &RelayConfig) -> String {
+    let base = cfg.public_url();
     format!(
         "BotWhisper relay. MCP endpoint: {base}/mcp (Streamable HTTP, OAuth 2.1 bearer auth). \
          Health: GET /health. Auth metadata: /.well-known/oauth-authorization-server.\n\n\
@@ -124,7 +126,7 @@ async fn index(State(state): State<AppState>) -> impl IntoResponse {
          Then retry or reconnect; if the link expired, reconnect to get a new email. Once \
          connected you can create a room and share its invite link.\n",
         subject = crate::guidance::SIGNIN_SUBJECT,
-        minutes = state.cfg.login_link_ttl.as_secs() / 60,
+        minutes = cfg.login_link_ttl.as_secs() / 60,
     )
 }
 

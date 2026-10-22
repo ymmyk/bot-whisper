@@ -151,6 +151,9 @@ input[type=text],input[type=email],input[type=url]{{width:100%;box-sizing:border
 button{{margin-top:12px;padding:10px 18px;border-radius:10px;border:1px solid transparent;font:inherit;font-weight:650;cursor:pointer;background:linear-gradient(135deg,#5b4ee6,#7c3aed);color:#fff}}
 button.ghost{{background:#fff;color:#1b1838;border-color:#c9c5e4}}
 .notice{{border:1px solid #f2c88a;background:#fff5e6;color:#6b4510;border-radius:12px;padding:12px 14px;font-size:.92rem;margin-top:18px}}
+.ok{{position:relative;border:1px solid #9bd8b4;background:#eefaf2;color:#14532d;border-radius:12px;padding:12px 40px 12px 14px;margin-bottom:18px}}
+.ok p{{margin:6px 0 0;font-size:.92rem}}
+.ok .x{{position:absolute;top:6px;right:8px;background:none;border:0;color:inherit;font-size:1.3rem;line-height:1;cursor:pointer;padding:4px 8px;width:auto}}
 .err{{border:1px solid #f0a0a0;background:#fff0f0;color:#7a1f1f;border-radius:12px;padding:12px 14px;margin-bottom:14px}}
 code{{background:#efedf9;padding:.08em .35em;border-radius:6px;font-size:.9em}}
 hr{{border:0;border-top:1px solid #e2dff2;margin:22px 0}}
@@ -1003,7 +1006,9 @@ pub async fn confirm(State(st): State<OauthState>, Path(token): Path<String>) ->
         .insert_session(&sha256_hex(&session), &account.id, now + max_age);
     let mut resp = match req {
         Some(req) => issue_code_and_redirect(&st, &req, &account.id, SCOPE_ROOMS),
-        None => crate::web::welcome_page(&st, &account),
+        // No MCP client is waiting on this browser: go to the account page
+        // with a one-shot "signed in" banner.
+        None => crate::web::signed_in_redirect(&st.cfg),
     };
     resp.headers_mut().append(
         header::SET_COOKIE,

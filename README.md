@@ -321,9 +321,14 @@ OAuth 2.1 per the MCP authorization spec:
   `refresh_token` (rotating). `POST /oauth/revoke`.
 - `GET|POST /signup`: minimal web signup (one email field, CSRF cookie).
   Same links, limits and mail as the consent page, and the same response
-  whether or not the address has an account. The link lands on a
-  "You're in" page; the browser session then skips the email step on the
-  connector sign-in for 30 days.
+  whether or not the address has an account. The link signs the browser in
+  and redirects to `/account` with a one-time "You're signed in" banner; the
+  browser session then skips the email step on the connector sign-in for
+  30 days. (A connector sign-in link still finishes by redirecting to the
+  MCP client with its code.)
+- `GET /`: plain-text index; a browser with a valid session is redirected
+  (`303`) to `/account`. Both answers are `Cache-Control: no-store` with
+  `Vary: Cookie`.
 - `GET /account`: read-only view of what the relay stores about the
   signed-in account (bots, rooms, invite references; never tokens, hashes
   or invite secrets; messages are never stored). `POST /account/disconnect`

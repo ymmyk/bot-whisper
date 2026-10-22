@@ -2,9 +2,12 @@
 //!
 //! Signup reuses the connector sign-in machinery (`oauth::send_signin_email`):
 //! the same single-use links, mail, rate limits and session cookie. A
-//! confirmed signup lands on a "You're in" page that says how to add the
-//! connector; because the browser is signed in, the connector sign-in then
-//! skips the email step for the life of the session.
+//! confirmed signup is sent to `/account` with a one-shot "You're signed in"
+//! banner (an HttpOnly flash cookie, cleared when the page renders) that says
+//! how to add the connector; because the browser is signed in, the connector
+//! sign-in then skips the email step for the life of the session. A
+//! connector sign-in still finishes by redirecting to the MCP client with
+//! its authorization code, unchanged.
 //!
 //! `/account` is read-only and shows what the relay stores about the
 //! signed-in account and nothing else. Its one write is "Disconnect", which
@@ -79,6 +82,23 @@ fn forbidden() -> Response {
 
 fn to_signup() -> Response {
     no_store(Redirect::to("/signup"))
+}
+
+// ----- index -----
+
+/// `GET /`: a browser with a valid session (exactly the check `/account`
+/// makes, so this never loops with `/account` -> `/signup`) goes to
+/// `/account`; everyone else gets the plain-text index. Both variants depend
+/// on the cookie, so neither may be cached or shared.
+pub async fn index(State(st): State<OauthState>, headers: HeaderMap) -> Response {
+    let mut resp = if signed_in(&st, &headers).is_some() {
+        no_store(Redirect::to("/account"))
+    } else {
+        no_store(crate::http::index_text(&st.cfg))
+    };
+    resp.headers_mut()
+        .insert(header::VARY, header::HeaderValue::from_static("Cookie"));
+    resp
 }
 
 fn session_days(st: &OauthState) -> u64 {
@@ -177,25 +197,41 @@ pub async fn signup_post(
 }
 
 /// Landing page after a web signup's confirmation link.
-pub fn welcome_page(st: &OauthState, account: &AccountRow) -> Response {
-    no_store(page(
-        "You're in",
-        &format!(
-            r#"<h1>You're in</h1>
-<p>Signed in as <strong>{email}</strong>.</p>
-<h2>Connect your AI</h2>
-<p>In your AI app's connector settings (often called Connectors, Integrations or MCP servers), add a remote MCP connector with this address:</p>
-<p><code>{base}/mcp</code></p>
-<p class="muted">Because you're signed in on this browser, the connector's sign-in skips the email step for {days} days: just click Allow.</p>
-<p>Then ask your AI to create a BotWhisper room and give you an invite link for a friend's bot.</p>
-<p><a href="/account">See your account</a></p>
-{notice}"#,
-            email = esc(account.email.as_deref().unwrap_or("")),
-            base = esc(&st.cfg.public_url()),
-            days = session_days(st),
-            notice = OPERATOR_NOTICE,
-        ),
-    ))
+/// One-shot flash cookie set by a successful web-signup confirmation and
+/// cleared by the `/account` render that shows the banner. It carries no
+/// secret, only the fixed value `signed_in`.
+pub(crate) const FLASH_COOKIE: &str = "bw_flash";
+const FLASH_SIGNED_IN: &str = "signed_in";
+
+fn flash_cookie(cfg: &crate::config::RelayConfig, value: &str, max_age: u64) -> String {
+    format!(
+        "{FLASH_COOKIE}={value}; Path=/account; HttpOnly; SameSite=Lax; Max-Age={max_age}{}",
+        if cfg.is_https() { "; Secure" } else { "" }
+    )
+}
+
+/// After a web signup's link is confirmed: 303 to `/account` with the
+/// "signed in" flash. The caller adds the session cookie.
+pub fn signed_in_redirect(cfg: &crate::config::RelayConfig) -> Response {
+    let mut resp = no_store(Redirect::to("/account"));
+    resp.headers_mut().append(
+        header::SET_COOKIE,
+        flash_cookie(cfg, FLASH_SIGNED_IN, 120)
+            .parse()
+            .expect("header"),
+    );
+    resp
+}
+
+fn signed_in_banner(st: &OauthState) -> String {
+    format!(
+        r#"<div class="ok" role="status" id="flash"><button type="button" class="x" aria-label="Dismiss" onclick="this.parentElement.remove()">×</button>
+<strong>You're signed in.</strong>
+<p>To connect your AI, add <code>{base}/mcp</code> as a remote MCP connector in your AI app's connector settings (often called Connectors, Integrations or MCP servers). Because this browser is signed in, the connector's sign-in skips the email step for {days} days: just click Allow. Then ask your AI to create a BotWhisper room and give you an invite link for a friend's bot.</p></div>
+"#,
+        base = esc(&st.cfg.public_url()),
+        days = session_days(st),
+    )
 }
 
 // ----- account -----
@@ -357,7 +393,24 @@ pub async fn account_get(State(st): State<OauthState>, headers: HeaderMap) -> Re
     let Some((acct, csrf)) = signed_in(&st, &headers) else {
         return to_signup();
     };
-    no_store(page("Your account", &account_html(&st, &acct, &csrf)))
+    let flash = cookie_value(&headers, FLASH_COOKIE).as_deref() == Some(FLASH_SIGNED_IN);
+    let banner = if flash {
+        signed_in_banner(&st)
+    } else {
+        String::new()
+    };
+    let mut resp = no_store(page(
+        "Your account",
+        &format!("{banner}{}", account_html(&st, &acct, &csrf)),
+    ));
+    if cookie_value(&headers, FLASH_COOKIE).is_some() {
+        // One shot: a reload shows the plain page.
+        resp.headers_mut().append(
+            header::SET_COOKIE,
+            flash_cookie(&st.cfg, "", 0).parse().expect("header"),
+        );
+    }
+    resp
 }
 
 #[derive(Debug, Deserialize, Default)]

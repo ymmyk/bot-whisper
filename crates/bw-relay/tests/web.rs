@@ -62,7 +62,7 @@ async fn web_sign_up(relay: &TestRelay, http: &Client, email: &str) -> String {
     let r = post_signup(http, &relay.base(), email).await;
     assert_eq!(r.status(), StatusCode::OK);
     let r = http.get(last_link(relay)).send().await.unwrap();
-    assert_eq!(r.status(), StatusCode::OK);
+    assert_eq!(r.status(), StatusCode::SEE_OTHER);
     relay
         .db
         .account_by_email(email)
@@ -187,13 +187,54 @@ async fn confirm_link_signs_in_once_and_expired_links_fail() {
     assert_eq!(r.status(), StatusCode::OK);
     let link = last_link(&relay);
     let r = http.get(&link).send().await.unwrap();
-    assert_eq!(r.status(), StatusCode::OK);
-    let cookie = r.headers()["set-cookie"].to_str().unwrap().to_string();
-    assert!(cookie.starts_with("bw_session=") && cookie.contains("Path=/;"));
-    let page = r.text().await.unwrap();
-    assert!(page.contains("You're in"));
+    assert_eq!(r.status(), StatusCode::SEE_OTHER);
+    assert_eq!(r.headers()["location"], "/account");
+    let cookies: Vec<String> = r
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .map(|v| v.to_str().unwrap().to_string())
+        .collect();
+    assert!(cookies
+        .iter()
+        .any(|c| c.starts_with("bw_session=") && c.contains("Path=/;")));
+    assert!(cookies
+        .iter()
+        .any(|c| c.starts_with("bw_flash=signed_in;") && c.contains("HttpOnly")));
+    assert!(!r.headers()["location"].to_str().unwrap().contains('?'));
+
+    // The account page shows the banner once...
+    let page = http
+        .get(format!("{base}/account"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(page.contains("You're signed in."));
     assert!(page.contains(&format!("{base}/mcp")));
     assert!(page.contains("skips the email step for 30 days"));
+    assert!(page.contains("Dismiss"));
+    // ...and not on reload.
+    let page = http
+        .get(format!("{base}/account"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(!page.contains("You're signed in."));
+    assert!(page.contains("Your account"));
+    // A flash cookie without a session shows nothing (it's just /signup).
+    let r = browser()
+        .get(format!("{base}/account"))
+        .header("cookie", "bw_flash=signed_in")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.headers()["location"], "/signup");
 
     // Signed in now: /signup forwards to /account, which shows the address.
     let r = http.get(format!("{base}/signup")).send().await.unwrap();
@@ -418,5 +459,67 @@ async fn account_page_shows_only_own_data_and_disconnect_needs_csrf() {
         .unwrap();
     assert!(page.contains("No connected bots"));
     b.close().await;
+    relay.shutdown().await;
+}
+
+#[tokio::test]
+async fn index_redirects_only_a_valid_session_to_account() {
+    let relay = TestRelay::start().await;
+    let base = relay.base();
+
+    fn check_headers(r: &reqwest::Response) {
+        let h = r.headers();
+        assert_eq!(h["cache-control"], "no-store");
+        assert_eq!(h["vary"], "Cookie");
+    }
+
+    // No cookie: the text index.
+    let anon = browser();
+    let r = anon.get(format!("{base}/")).send().await.unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    check_headers(&r);
+    assert!(r.text().await.unwrap().starts_with("BotWhisper relay."));
+
+    // Garbage cookie: the text index, no redirect.
+    let r = anon
+        .get(format!("{base}/"))
+        .header("cookie", "bw_session=garbage-not-a-session")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    check_headers(&r);
+
+    // Valid session: 303 to /account, which renders.
+    let alice = browser();
+    let alice_id = web_sign_up(&relay, &alice, "alice@example.com").await;
+    let r = alice.get(format!("{base}/")).send().await.unwrap();
+    assert_eq!(r.status(), StatusCode::SEE_OTHER);
+    assert_eq!(r.headers()["location"], "/account");
+    check_headers(&r);
+    let r = alice.get(format!("{base}/account")).send().await.unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+
+    // Expired session: the text index (and /account goes to /signup, which
+    // renders, so nothing loops).
+    relay
+        .db
+        .insert_session(&sha256_hex("expired-session"), &alice_id, now_unix() - 1)
+        .unwrap();
+    let expired = || {
+        browser()
+            .get(format!("{base}/"))
+            .header("cookie", "bw_session=expired-session")
+    };
+    let r = expired().send().await.unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    check_headers(&r);
+    let r = browser()
+        .get(format!("{base}/account"))
+        .header("cookie", "bw_session=expired-session")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.headers()["location"], "/signup");
     relay.shutdown().await;
 }
