@@ -5,6 +5,7 @@
 //! they sit in memory; nothing is logged and messages are deleted once every
 //! recipient acks.
 
+pub mod api;
 pub mod auth;
 pub mod config;
 pub mod db;
@@ -89,7 +90,8 @@ impl Relay {
             registry: registry.clone(),
             limits: Arc::new(oauth::AuthLimiters::new(&cfg)),
         };
-        let app = http::router(state, auth, oauth_state, shutdown.clone());
+        let api_state = api::ApiState::new(registry.clone(), auth.clone(), db.clone(), cfg.clone());
+        let app = http::router(state, auth, oauth_state, api_state, shutdown.clone());
         let listener = tokio::net::TcpListener::bind(cfg.bind)
             .await
             .with_context(|| format!("binding {}", cfg.bind))?;

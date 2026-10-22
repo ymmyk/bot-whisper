@@ -197,6 +197,10 @@ pub struct CodeRow {
     pub expires_at: u64,
 }
 
+/// Pseudo client id of room tokens issued by `POST /api/v1/join`. Agent ids
+/// of API guests are `<guest account>:bw-api`.
+pub const API_CLIENT_ID: &str = "bw-api";
+
 /// An access or refresh token (stored hashed).
 #[derive(Debug, Clone)]
 pub struct TokenRow {
@@ -404,10 +408,16 @@ impl Db {
         })
     }
 
-    /// Delete a room and everything attached to it.
+    /// Delete a room and everything attached to it, and revoke the HTTP API
+    /// tokens scoped to it.
     pub fn delete_room(&self, id: &str) -> Result<()> {
         self.with(|c| {
             c.execute("DELETE FROM rooms WHERE id = ?1", params![id])?;
+            c.execute(
+                "UPDATE oauth_tokens SET revoked = 1
+                 WHERE client_id = ?1 AND scope = ?2 AND revoked = 0",
+                params![API_CLIENT_ID, format!("room:{id}")],
+            )?;
             Ok(())
         })
     }
@@ -440,8 +450,27 @@ impl Db {
         })
     }
 
+    /// Remove a member. If it joined through the HTTP API, its room token is
+    /// revoked in the same step.
     pub fn delete_member(&self, room_id: &str, member_id: &str) -> Result<()> {
         self.with(|c| {
+            let agent: Option<String> = c
+                .query_row(
+                    "SELECT agent_id FROM members WHERE room_id = ?1 AND member_id = ?2",
+                    params![room_id, member_id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if let Some(account) = agent
+                .as_deref()
+                .and_then(|a| a.strip_suffix(&format!(":{API_CLIENT_ID}")))
+            {
+                c.execute(
+                    "UPDATE oauth_tokens SET revoked = 1
+                     WHERE client_id = ?1 AND account_id = ?2 AND scope = ?3 AND revoked = 0",
+                    params![API_CLIENT_ID, account, format!("room:{room_id}")],
+                )?;
+            }
             c.execute(
                 "DELETE FROM members WHERE room_id = ?1 AND member_id = ?2",
                 params![room_id, member_id],

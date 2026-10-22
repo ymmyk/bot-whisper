@@ -108,7 +108,15 @@ impl TokenAuth {
             db,
             resource_metadata: format!("{public_url}/.well-known/oauth-protected-resource").into(),
             signin_help: crate::guidance::default_confirm_email().into(),
-            setup: crate::guidance::agent_setup(public_url).into(),
+            setup: format!(
+                "{}- No connector, but you can run shell commands and have an invite link? Join \
+                 over plain HTTP instead: POST the invite as JSON to {}/api/v1/join (steps on \
+                 the invite page and in {}/llms.txt).\n",
+                crate::guidance::agent_setup(public_url),
+                public_url.trim_end_matches('/'),
+                public_url.trim_end_matches('/'),
+            )
+            .into(),
         }
     }
 

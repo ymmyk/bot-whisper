@@ -308,17 +308,7 @@ impl BotWhisperServer {
         Parameters(a): Parameters<JoinRoomArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let agent = agent(&parts)?;
-        respond(
-            async {
-                let (room, me) = self
-                    .registry
-                    .join(&agent, &a.invite_url, a.display_name)
-                    .await?;
-                let id = me.member.clone();
-                room.with(move |r| r.status(&id)).await?
-            }
-            .await,
-        )
+        respond(self.op_join(agent, a).await)
     }
 
     #[tool(
@@ -354,19 +344,7 @@ impl BotWhisperServer {
         Parameters(a): Parameters<RoomArg>,
     ) -> Result<CallToolResult, ErrorData> {
         let agent = agent(&parts)?;
-        respond(
-            async {
-                let (room, me) = self.registry.resolve(&agent, &a.room_id).await?;
-                let outcome = room
-                    .with(move |r| r.leave(&me.member, doorbell::now_unix()))
-                    .await??;
-                Ok(json!({
-                    "left": true,
-                    "room_closed": outcome == LeaveOutcome::RoomClosed,
-                }))
-            }
-            .await,
-        )
+        respond(self.op_leave(agent, a).await)
     }
 
     #[tool(
@@ -410,23 +388,7 @@ impl BotWhisperServer {
         Parameters(a): Parameters<SendMessageArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let agent = agent(&parts)?;
-        respond(
-            async {
-                let (room, me) = self.registry.resolve(&agent, &a.room_id).await?;
-                let args = SendArgs {
-                    text: Some(a.text),
-                    signal: a.turn.unwrap_or_default(),
-                    to: a.to.unwrap_or_default(),
-                    lease_s: a.lease_s,
-                    reply_to: a.reply_to,
-                    interrupt: a.interrupt.unwrap_or(false),
-                    msg_id: a.msg_id,
-                };
-                room.with(move |r| r.send(&me.member, args, doorbell::now_unix()))
-                    .await?
-            }
-            .await,
-        )
+        respond(self.op_send(agent, a).await)
     }
 
     #[tool(
@@ -452,14 +414,7 @@ impl BotWhisperServer {
         Parameters(a): Parameters<AckArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let agent = agent(&parts)?;
-        respond(
-            async {
-                let (room, me) = self.registry.resolve(&agent, &a.room_id).await?;
-                let n = room.with(move |r| r.ack(&me.member, a.up_to_seq)).await??;
-                Ok(json!({ "acked": n }))
-            }
-            .await,
-        )
+        respond(self.op_ack(agent, a).await)
     }
 
     #[tool(
@@ -492,23 +447,7 @@ impl BotWhisperServer {
         Parameters(a): Parameters<SetTurnArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let agent = agent(&parts)?;
-        respond(
-            async {
-                let (room, me) = self.registry.resolve(&agent, &a.room_id).await?;
-                let args = SendArgs {
-                    text: None,
-                    signal: a.signal,
-                    to: a.to.unwrap_or_default(),
-                    lease_s: a.lease_s,
-                    reply_to: None,
-                    interrupt: false,
-                    msg_id: None,
-                };
-                room.with(move |r| r.send(&me.member, args, doorbell::now_unix()))
-                    .await?
-            }
-            .await,
-        )
+        respond(self.op_set_turn(agent, a).await)
     }
 
     #[tool(
@@ -543,26 +482,7 @@ impl BotWhisperServer {
         Parameters(a): Parameters<StatusArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let agent = agent(&parts)?;
-        respond(
-            async {
-                match a.room_id {
-                    Some(id) => {
-                        let (room, me) = self.registry.resolve(&agent, &id).await?;
-                        room.with(move |r| r.status(&me.member)).await?
-                    }
-                    None => {
-                        let mut out = Vec::new();
-                        for (room, member) in self.registry.rooms_for_agent(&agent).await? {
-                            if let Ok(Ok(s)) = room.with(move |r| r.status(&member)).await {
-                                out.push(s);
-                            }
-                        }
-                        Ok(json!({ "rooms": out }))
-                    }
-                }
-            }
-            .await,
-        )
+        respond(self.op_status(agent, a.room_id).await)
     }
 
     #[tool(
@@ -634,7 +554,100 @@ impl BotWhisperServer {
     }
 }
 
+/// Core operations shared by the MCP tools and the plain HTTP API
+/// (`api.rs`), so both surfaces run exactly the same room, turn, cap,
+/// loop-guard and rate-limit code.
 impl BotWhisperServer {
+    pub(crate) async fn op_join(
+        &self,
+        agent: AgentId,
+        a: JoinRoomArgs,
+    ) -> Result<Value, RelayError> {
+        let (room, me) = self
+            .registry
+            .join(&agent, &a.invite_url, a.display_name)
+            .await?;
+        let id = me.member.clone();
+        room.with(move |r| r.status(&id)).await?
+    }
+
+    pub(crate) async fn op_ack(&self, agent: AgentId, a: AckArgs) -> Result<Value, RelayError> {
+        let (room, me) = self.registry.resolve(&agent, &a.room_id).await?;
+        let n = room.with(move |r| r.ack(&me.member, a.up_to_seq)).await??;
+        Ok(json!({ "acked": n }))
+    }
+
+    pub(crate) async fn op_leave(&self, agent: AgentId, a: RoomArg) -> Result<Value, RelayError> {
+        let (room, me) = self.registry.resolve(&agent, &a.room_id).await?;
+        let outcome = room
+            .with(move |r| r.leave(&me.member, doorbell::now_unix()))
+            .await??;
+        Ok(json!({
+            "left": true,
+            "room_closed": outcome == LeaveOutcome::RoomClosed,
+        }))
+    }
+
+    pub(crate) async fn op_send(
+        &self,
+        agent: AgentId,
+        a: SendMessageArgs,
+    ) -> Result<Value, RelayError> {
+        let (room, me) = self.registry.resolve(&agent, &a.room_id).await?;
+        let args = SendArgs {
+            text: Some(a.text),
+            signal: a.turn.unwrap_or_default(),
+            to: a.to.unwrap_or_default(),
+            lease_s: a.lease_s,
+            reply_to: a.reply_to,
+            interrupt: a.interrupt.unwrap_or(false),
+            msg_id: a.msg_id,
+        };
+        room.with(move |r| r.send(&me.member, args, doorbell::now_unix()))
+            .await?
+    }
+
+    pub(crate) async fn op_set_turn(
+        &self,
+        agent: AgentId,
+        a: SetTurnArgs,
+    ) -> Result<Value, RelayError> {
+        let (room, me) = self.registry.resolve(&agent, &a.room_id).await?;
+        let args = SendArgs {
+            text: None,
+            signal: a.signal,
+            to: a.to.unwrap_or_default(),
+            lease_s: a.lease_s,
+            reply_to: None,
+            interrupt: false,
+            msg_id: None,
+        };
+        room.with(move |r| r.send(&me.member, args, doorbell::now_unix()))
+            .await?
+    }
+
+    pub(crate) async fn op_status(
+        &self,
+        agent: AgentId,
+        room_id: Option<String>,
+    ) -> Result<Value, RelayError> {
+        match room_id {
+            Some(id) => {
+                let (room, me) = self.registry.resolve(&agent, &id).await?;
+                room.with(move |r| r.status(&me.member)).await?
+            }
+            None => {
+                let mut out = Vec::new();
+                for (room, member) in self.registry.rooms_for_agent(&agent).await? {
+                    if let Ok(Ok(s)) = room.with(move |r| r.status(&member)).await {
+                        out.push(s);
+                    }
+                }
+                Ok(json!({ "rooms": out }))
+            }
+        }
+    }
+
     async fn do_create_room(&self, agent: AgentId, a: CreateRoomArgs) -> Result<Value, RelayError> {
         let title = a.title.trim().to_string();
         if title.is_empty() {
@@ -691,7 +704,7 @@ impl BotWhisperServer {
         }))
     }
 
-    async fn do_wait(&self, agent: AgentId, a: WaitArgs) -> Result<Value, RelayError> {
+    pub(crate) async fn do_wait(&self, agent: AgentId, a: WaitArgs) -> Result<Value, RelayError> {
         let timeout = Duration::from_secs(a.timeout_s.unwrap_or(DEFAULT_WAIT_S).min(MAX_WAIT_S));
         let after_seq = a.after_seq.unwrap_or(0);
         let auto_ack = a.auto_ack.unwrap_or(true);

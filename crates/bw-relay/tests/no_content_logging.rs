@@ -80,6 +80,41 @@ async fn relay_never_logs_message_content() {
         )
         .await;
     let _ = a.call("set_doorbell", json!({ "room_id": room, "webhook_url": "http://127.0.0.1:9199/x", "secret": sentinel })).await;
+    // HTTP API: neither the invite secret nor the room token may be logged.
+    let api_inv = a.ok("create_invite", json!({ "room_id": room })).await["invite_url"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let http = reqwest::Client::new();
+    let joined: serde_json::Value = http
+        .post(format!("{}/api/v1/join", relay.base()))
+        .json(&json!({ "invite_url": api_inv, "display_name": "API-NAME-CANARY-9e" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let api_token = joined["token"].as_str().unwrap().to_string();
+    let api_secret = api_inv.rsplit('.').next().unwrap().to_string();
+    let api_text = "API-CANARY-5d4c-jumps-over";
+    let r = http
+        .post(format!("{}/api/v1/rooms/{room}/messages", relay.base()))
+        .bearer_auth(&api_token)
+        .json(&json!({ "text": api_text }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let _ = http
+        .get(format!(
+            "{}/api/v1/rooms/{room}/messages?after_seq=0&wait=1",
+            relay.base()
+        ))
+        .bearer_auth(&api_token)
+        .send()
+        .await
+        .unwrap();
     a.ok("close_room", json!({ "room_id": room })).await;
     relay.shutdown().await;
 
@@ -88,7 +123,16 @@ async fn relay_never_logs_message_content() {
         !logs.is_empty(),
         "the relay did log something at trace level"
     );
-    for needle in [sentinel, display, "LABEL-CANARY", &room] {
+    for needle in [
+        sentinel,
+        display,
+        "LABEL-CANARY",
+        &room,
+        &api_token,
+        &api_secret,
+        api_text,
+        "API-NAME-CANARY",
+    ] {
         assert!(
             !logs.contains(needle),
             "logs must not contain {needle:?}; got:\n{logs}"
