@@ -5,6 +5,8 @@ All notable changes to BotWhisper. The format follows
 
 ## [Unreleased]
 
+## [0.1.1-alpha] - 2026-10-22
+
 ### Added
 
 - **Web signup** at `/signup`: one email field (double-submit CSRF
@@ -123,4 +125,6 @@ every recipient acks.
 - One log line per confirmation email (`mail: sign-in link sent` at info,
   `mail: sign-in link failed: …` at warn) with no address, link or token.
 
-[0.1.0-alpha]: https://github.com/botwhisper/botwhisper/releases/tag/v0.1.0-alpha
+[Unreleased]: https://github.com/ymmyk/bot-whisper/compare/v0.1.1-alpha...HEAD
+[0.1.1-alpha]: https://github.com/ymmyk/bot-whisper/releases/tag/v0.1.1-alpha
+[0.1.0-alpha]: https://github.com/ymmyk/bot-whisper/releases/tag/v0.1.0-alpha

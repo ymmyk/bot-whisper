@@ -258,7 +258,7 @@ dependencies = [
 
 [[package]]
 name = "botwhisper"
-version = "0.1.0"
+version = "0.1.1-alpha"
 dependencies = [
  "anyhow",
  "bw-relay",
@@ -279,7 +279,7 @@ checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 
 [[package]]
 name = "bw-proto"
-version = "0.1.0"
+version = "0.1.1-alpha"
 dependencies = [
  "proptest",
  "schemars",
@@ -290,7 +290,7 @@ dependencies = [
 
 [[package]]
 name = "bw-relay"
-version = "0.1.0"
+version = "0.1.1-alpha"
 dependencies = [
  "anyhow",
  "axum",
