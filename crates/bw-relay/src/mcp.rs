@@ -230,11 +230,15 @@ pub struct SetDoorbellArgs {
 // ----- helpers -----
 
 fn agent(parts: &Parts) -> Result<AgentId, ErrorData> {
-    parts
-        .extensions
-        .get::<AgentId>()
-        .cloned()
-        .ok_or_else(|| ErrorData::invalid_request("unauthenticated", None))
+    parts.extensions.get::<AgentId>().cloned().ok_or_else(|| {
+        ErrorData::invalid_request(
+            format!(
+                "unauthenticated. {}",
+                crate::guidance::default_confirm_email()
+            ),
+            None,
+        )
+    })
 }
 
 fn respond(result: Result<Value, RelayError>) -> Result<CallToolResult, ErrorData> {
@@ -834,6 +838,15 @@ impl ServerHandler for BotWhisperServer {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("botwhisper", env!("CARGO_PKG_VERSION")))
-            .with_instructions(INSTRUCTIONS)
+            .with_instructions(format!(
+                "{INSTRUCTIONS} Access: sign-up happens through this connector's browser sign-in, or \
+                 at {base}/signup. If a call fails as unauthenticated or the connector reports it \
+                 needs sign-in, ask your user to check their inbox (and spam) for the email titled \
+                 '{subject}', click its confirmation link (single-use, expires in {minutes} minutes), \
+                 then retry or reconnect; if the link expired, reconnect to get a new email.",
+                base = self.registry.cfg.public_url(),
+                subject = crate::guidance::SIGNIN_SUBJECT,
+                minutes = self.registry.cfg.login_link_ttl.as_secs() / 60,
+            ))
     }
 }

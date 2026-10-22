@@ -90,6 +90,8 @@ pub struct TokenAuth {
     dev_hashes: Arc<HashSet<String>>,
     db: Db,
     resource_metadata: Arc<str>,
+    /// What a 401 tells the agent: ask its person to confirm the email.
+    signin_help: Arc<str>,
 }
 
 impl TokenAuth {
@@ -103,7 +105,15 @@ impl TokenAuth {
             dev_hashes: Arc::new(dev_hashes),
             db,
             resource_metadata: format!("{public_url}/.well-known/oauth-protected-resource").into(),
+            signin_help: crate::guidance::default_confirm_email().into(),
         }
+    }
+
+    /// Replace the 401 guidance (see `guidance::confirm_email`). Must be an
+    /// RFC 6750 `error_description`: printable ASCII without `"` or `\`.
+    pub fn with_signin_help(mut self, help: String) -> Self {
+        self.signin_help = help.into();
+        self
     }
 
     pub fn has_dev_tokens(&self) -> bool {
@@ -157,20 +167,30 @@ pub async fn require_bearer(
             req.extensions_mut().insert(agent);
             next.run(req).await
         }
-        None => unauthorized(&auth.resource_metadata),
+        None => unauthorized(&auth.resource_metadata, &auth.signin_help),
     }
 }
 
-fn unauthorized(resource_metadata: &str) -> Response {
+/// 401 for `/mcp`. The `error_description` and the body both carry the
+/// bot-addressed guidance (confirm the email, then retry or reconnect), since
+/// clients surface one or the other to the agent.
+fn unauthorized(resource_metadata: &str, help: &str) -> Response {
+    let www = format!(
+        "Bearer realm=\"botwhisper\", error=\"invalid_token\", error_description=\"{help}\", resource_metadata=\"{resource_metadata}\""
+    );
+    let www = header::HeaderValue::from_str(&www).unwrap_or_else(|_| {
+        header::HeaderValue::from_str(&format!(
+            "Bearer realm=\"botwhisper\", error=\"invalid_token\", resource_metadata=\"{resource_metadata}\""
+        ))
+        .expect("header")
+    });
     (
         StatusCode::UNAUTHORIZED,
-        [(
-            header::WWW_AUTHENTICATE,
-            format!(
-                "Bearer realm=\"botwhisper\", error=\"invalid_token\", resource_metadata=\"{resource_metadata}\""
-            ),
-        )],
-        "unauthorized: send `Authorization: Bearer <token>` (sign in with OAuth; see /.well-known/oauth-protected-resource)",
+        [(header::WWW_AUTHENTICATE, www)],
+        format!(
+            "unauthorized: {help}\n\n\
+             Technical: send `Authorization: Bearer <token>` from the OAuth sign-in; see {resource_metadata}\n"
+        ),
     )
         .into_response()
 }

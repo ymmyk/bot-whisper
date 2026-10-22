@@ -238,6 +238,53 @@ pub struct InviteRow {
     pub redeemed_at: Option<u64>,
 }
 
+/// One OAuth client (bot) connected to an account, for the account page.
+#[derive(Debug, Clone)]
+pub struct AccountClient {
+    pub client_id: String,
+    pub client_name: Option<String>,
+    pub registered_at: u64,
+    /// Latest expiry of a live (unrevoked, unexpired) refresh token.
+    pub refresh_expires_at: Option<u64>,
+    /// Latest expiry of a live access token.
+    pub access_expires_at: Option<u64>,
+}
+
+/// A room an account owns or has a bot in, for the account page.
+#[derive(Debug, Clone)]
+pub struct AccountRoom {
+    pub id: String,
+    pub title: String,
+    pub created_at: u64,
+    pub expires_at: Option<u64>,
+    pub turn_mode: String,
+    pub owned: bool,
+    pub member_count: u32,
+    pub max_members: u32,
+}
+
+/// One of the account's bots seated in a room.
+#[derive(Debug, Clone)]
+pub struct AccountSeat {
+    pub room_id: String,
+    pub client_id: String,
+    pub member_id: String,
+    pub display_name: Option<String>,
+    pub role: String,
+    pub joined_at: u64,
+}
+
+/// An invite in a room the account owns. No secret, not even hashed.
+#[derive(Debug, Clone)]
+pub struct AccountInvite {
+    pub id: String,
+    pub room_id: String,
+    pub room_title: String,
+    pub label: Option<String>,
+    pub expires_at: u64,
+    pub redeemed_at: Option<u64>,
+}
+
 /// Thread-safe handle to the metadata database.
 #[derive(Clone)]
 pub struct Db {
@@ -876,6 +923,113 @@ impl Db {
                 |r| r.get(0),
             )
             .optional()
+        })
+    }
+
+    // ----- account page (read-only, scoped to one account) -----
+
+    /// Clients that hold a live (unrevoked, unexpired) token for the account.
+    pub fn account_clients(&self, account_id: &str, now: u64) -> Result<Vec<AccountClient>> {
+        self.with(|c| {
+            let mut st = c.prepare(
+                "SELECT t.client_id, cl.name, COALESCE(cl.created_at, 0),
+                        MAX(CASE WHEN t.kind = 'refresh' THEN t.expires_at END),
+                        MAX(CASE WHEN t.kind = 'access' THEN t.expires_at END)
+                 FROM oauth_tokens t LEFT JOIN oauth_clients cl ON cl.id = t.client_id
+                 WHERE t.account_id = ?1 AND t.revoked = 0 AND t.expires_at > ?2
+                 GROUP BY t.client_id ORDER BY 3, 1",
+            )?;
+            let rows = st.query_map(params![account_id, now as i64], |r| {
+                Ok(AccountClient {
+                    client_id: r.get(0)?,
+                    client_name: r.get(1)?,
+                    registered_at: r.get::<_, i64>(2)? as u64,
+                    refresh_expires_at: r.get::<_, Option<i64>>(3)?.map(|v| v as u64),
+                    access_expires_at: r.get::<_, Option<i64>>(4)?.map(|v| v as u64),
+                })
+            })?;
+            rows.collect()
+        })
+    }
+
+    /// Rooms the account owns or has a bot seated in.
+    pub fn account_rooms(&self, account_id: &str) -> Result<Vec<AccountRoom>> {
+        self.with(|c| {
+            let mut st = c.prepare(
+                "SELECT r.id, r.title, r.created_at, r.expires_at, r.turn_mode,
+                        (r.owner_account IS NOT NULL AND r.owner_account = ?1)
+                          OR EXISTS (SELECT 1 FROM members m WHERE m.room_id = r.id
+                                     AND m.member_id = r.owner
+                                     AND substr(m.agent_id, 1, length(?1) + 1) = ?1 || ':'),
+                        (SELECT COUNT(*) FROM members m WHERE m.room_id = r.id),
+                        r.max_members
+                 FROM rooms r
+                 WHERE r.owner_account = ?1
+                    OR EXISTS (SELECT 1 FROM members m WHERE m.room_id = r.id
+                               AND substr(m.agent_id, 1, length(?1) + 1) = ?1 || ':')
+                 ORDER BY r.created_at, r.id",
+            )?;
+            let rows = st.query_map(params![account_id], |r| {
+                Ok(AccountRoom {
+                    id: r.get(0)?,
+                    title: r.get(1)?,
+                    created_at: r.get::<_, i64>(2)? as u64,
+                    expires_at: r.get::<_, Option<i64>>(3)?.map(|v| v as u64),
+                    turn_mode: r.get(4)?,
+                    owned: r.get::<_, i64>(5)? != 0,
+                    member_count: r.get::<_, i64>(6)? as u32,
+                    max_members: r.get::<_, i64>(7)? as u32,
+                })
+            })?;
+            rows.collect()
+        })
+    }
+
+    /// The account's bots (agent ids `<account>:<client>`) seated in rooms.
+    pub fn account_seats(&self, account_id: &str) -> Result<Vec<AccountSeat>> {
+        self.with(|c| {
+            let mut st = c.prepare(
+                "SELECT room_id, substr(agent_id, length(?1) + 2), member_id, display_name, role, joined_at
+                 FROM members WHERE substr(agent_id, 1, length(?1) + 1) = ?1 || ':'
+                 ORDER BY joined_at, room_id",
+            )?;
+            let rows = st.query_map(params![account_id], |r| {
+                Ok(AccountSeat {
+                    room_id: r.get(0)?,
+                    client_id: r.get(1)?,
+                    member_id: r.get(2)?,
+                    display_name: r.get(3)?,
+                    role: r.get(4)?,
+                    joined_at: r.get::<_, i64>(5)? as u64,
+                })
+            })?;
+            rows.collect()
+        })
+    }
+
+    /// Invites in rooms the account owns (only owners can invite).
+    pub fn account_invites(&self, account_id: &str) -> Result<Vec<AccountInvite>> {
+        self.with(|c| {
+            let mut st = c.prepare(
+                "SELECT i.id, i.room_id, r.title, i.label, i.expires_at, i.redeemed_at
+                 FROM invites i JOIN rooms r ON r.id = i.room_id
+                 WHERE r.owner_account = ?1
+                    OR EXISTS (SELECT 1 FROM members m WHERE m.room_id = r.id
+                               AND m.member_id = r.owner
+                               AND substr(m.agent_id, 1, length(?1) + 1) = ?1 || ':')
+                 ORDER BY i.expires_at, i.id",
+            )?;
+            let rows = st.query_map(params![account_id], |r| {
+                Ok(AccountInvite {
+                    id: r.get(0)?,
+                    room_id: r.get(1)?,
+                    room_title: r.get(2)?,
+                    label: r.get(3)?,
+                    expires_at: r.get::<_, i64>(4)? as u64,
+                    redeemed_at: r.get::<_, Option<i64>>(5)?.map(|v| v as u64),
+                })
+            })?;
+            rows.collect()
         })
     }
 

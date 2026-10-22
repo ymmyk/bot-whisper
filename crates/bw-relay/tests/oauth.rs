@@ -107,6 +107,14 @@ async fn sign_in(relay: &TestRelay, http: &Client, client_id: &str, email: &str)
     let body = r.text().await.unwrap();
     assert!(body.contains("Check your email"));
     assert!(
+        body.contains("AI agent reading this page")
+            && body.contains("check their inbox (and spam)")
+            && body.contains("Your BotWhisper sign-in link")
+            && body.contains("within 15 minutes")
+            && body.contains("start the connect again"),
+        "waiting page tells the agent to ask its person to confirm: {body}"
+    );
+    assert!(
         !body.contains(email),
         "the page never echoes the address back"
     );
@@ -138,6 +146,11 @@ async fn sign_in(relay: &TestRelay, http: &Client, client_id: &str, email: &str)
     // The link is single use.
     let again = http.get(&link).send().await.unwrap();
     assert_eq!(again.status(), StatusCode::BAD_REQUEST);
+    let again = again.text().await.unwrap();
+    assert!(
+        again.contains("connect BotWhisper again") && again.contains("get a new email"),
+        "expired-link page says how to get a new email: {again}"
+    );
 
     let r = exchange(http, &base, client_id, &code, VERIFIER).await;
     assert_eq!(r.status(), StatusCode::OK);
@@ -655,5 +668,148 @@ async fn signup_is_rate_limited_and_dev_tokens_need_the_flag() {
         .unwrap()
         .contains("not a valid email address"));
     assert_eq!(relay.mail.lock().unwrap().len(), 2);
+    relay.shutdown().await;
+}
+
+/// Signup is MCP-only, so a client whose person hasn't clicked the email
+/// link yet must be told (in the 401, the token errors, the index and the
+/// MCP instructions) to ask its person to confirm the email.
+#[tokio::test]
+async fn unconfirmed_clients_are_told_to_confirm_the_email() {
+    let relay = TestRelay::start().await;
+    let base = relay.base();
+    let http = client();
+    let client_id = register(&http, &base).await;
+
+    let no_secrets = |s: &str| {
+        assert!(!s.contains('@'), "no email address: {s}");
+        assert!(!s.contains("/oauth/confirm/"), "no link: {s}");
+        assert!(!s.contains("bwa_") && !s.contains("bwr_"), "no token: {s}");
+    };
+    let says_confirm = |s: &str| {
+        for want in [
+            "Ask your user to check their inbox (and spam folder)",
+            "'Your BotWhisper sign-in link'",
+            "click the confirmation link",
+            "expires in 15 minutes",
+            "Then retry, or reconnect the BotWhisper connector",
+            "start the connect again",
+        ] {
+            assert!(s.contains(want), "missing {want:?} in {s}");
+        }
+    };
+
+    // Start an email sign-in but never click the link: the client is stuck
+    // without a token.
+    let mut form: Vec<(&str, String)> = authorize_params(&client_id, "st-p");
+    form.push(("action", "email".into()));
+    form.push(("email", "pending@example.com".into()));
+    let r = http
+        .post(format!("{base}/oauth/authorize"))
+        .form(&form)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let page = r.text().await.unwrap();
+    assert!(!page.contains("pending@example.com"));
+    assert!(page.contains("AI agent reading this page"));
+
+    // 401 on /mcp, with no token and with a bogus one: header and body.
+    for auth in [None, Some("Bearer bwa_not-a-real-token")] {
+        let mut rq = http.post(relay.url()).body("{}");
+        if let Some(a) = auth {
+            rq = rq.header("authorization", a);
+        }
+        let r = rq.send().await.unwrap();
+        assert_eq!(r.status(), 401);
+        let www = r.headers()["www-authenticate"]
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(www.starts_with("Bearer realm=\"botwhisper\", error=\"invalid_token\""));
+        assert!(
+            www.contains("error_description=\"No BotWhisper access yet."),
+            "{www}"
+        );
+        assert!(www.contains("resource_metadata=\""));
+        says_confirm(&www);
+        let body = r.text().await.unwrap();
+        assert!(body.starts_with("unauthorized: No BotWhisper access yet."));
+        says_confirm(&body);
+        assert!(body.contains("from this BotWhisper relay"));
+        assert!(body.contains(&format!("create an account first at {base}/signup")));
+        no_secrets(&body.replace("bwa_not-a-real-token", ""));
+    }
+
+    // Token endpoint: an expired or unknown code keeps invalid_grant and
+    // says how to start over.
+    let r = exchange(&http, &base, &client_id, "bwcode_nope", VERIFIER).await;
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    let v: Value = r.json().await.unwrap();
+    assert_eq!(v["error"], "invalid_grant");
+    let d = v["error_description"].as_str().unwrap();
+    assert!(d.contains("reconnect the BotWhisper connector"), "{d}");
+    assert!(d.contains("'Your BotWhisper sign-in link'") && d.contains("check spam"));
+    no_secrets(d);
+
+    let r = http
+        .post(format!("{base}/oauth/token"))
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", "bwr_nope"),
+            ("client_id", client_id.as_str()),
+        ])
+        .send()
+        .await
+        .unwrap();
+    let v: Value = r.json().await.unwrap();
+    assert_eq!(v["error"], "invalid_grant");
+    assert!(v["error_description"]
+        .as_str()
+        .unwrap()
+        .contains("Start the sign-in again"));
+
+    // The plain-text index.
+    let idx = http.get(&base).send().await.unwrap().text().await.unwrap();
+    assert!(idx.contains(&format!("create an account at {base}/signup")));
+    assert!(idx.contains(&format!("ask your user to add {base}/mcp as a")));
+    assert!(idx.contains("'Your BotWhisper sign-in link'") && idx.contains("check spam"));
+
+    // The invite landing page an agent may fetch before it has the connector.
+    let page = http
+        .get(format!("{base}/i/abc.def"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(page.contains(&format!("{base}/i/abc.def")));
+    assert!(page.contains("AI agent without the connector"));
+    assert!(page.contains(&format!("Add {base}/mcp as a remote MCP connector")));
+    assert!(page.contains("Have an invite instead?"));
+    assert!(page.contains("call `join_room` with this invite URL"));
+
+    // No mail was sent beyond the one pending sign-in, and the pending
+    // address never shows up anywhere above.
+    assert_eq!(relay.mail.lock().unwrap().len(), 1);
+    relay.shutdown().await;
+}
+
+#[tokio::test]
+async fn mcp_instructions_explain_email_confirmation() {
+    let relay = TestRelay::start().await;
+    let bot = relay.bot(TOKENS[0]).await;
+    let info = bot.svc.peer_info().expect("server info");
+    let ins = info.instructions.clone().unwrap_or_default();
+    assert!(
+        ins.contains("sign-up happens through this connector's browser sign-in"),
+        "{ins}"
+    );
+    assert!(ins.contains(&format!("{}/signup", relay.base())));
+    assert!(ins.contains("check their inbox (and spam)"));
+    assert!(ins.contains("expires in 15 minutes"));
+    bot.close().await;
     relay.shutdown().await;
 }

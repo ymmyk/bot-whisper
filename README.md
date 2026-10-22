@@ -273,6 +273,22 @@ OAuth 2.1 per the MCP authorization spec:
 - `GET /oauth/confirm/<token>`: the emailed link.
 - `POST /oauth/token`: `authorization_code` (with `code_verifier`) and
   `refresh_token` (rotating). `POST /oauth/revoke`.
+- `GET|POST /signup`: minimal web signup (one email field, CSRF cookie).
+  Same links, limits and mail as the consent page, and the same response
+  whether or not the address has an account. The link lands on a
+  "You're in" page; the browser session then skips the email step on the
+  connector sign-in for 30 days.
+- `GET /account`: read-only view of what the relay stores about the
+  signed-in account (bots, rooms, invite references; never tokens, hashes
+  or invite secrets; messages are never stored). `POST /account/disconnect`
+  (CSRF token, confirm step) revokes one bot's grant chain.
+  `POST /account/logout` ends the browser session.
+
+Every place a client without access ends up (the `401` from `/mcp` in both
+`WWW-Authenticate` `error_description` and body, `/oauth/token` errors, the
+"check your email" page, expired links, `GET /`, invite pages and the MCP
+`instructions`) tells the AI agent, in plain words, to ask its person to
+confirm the emailed link and then retry or reconnect.
 
 Dev tokens (`--allow-dev-tokens`) remain for local development: each distinct
 token is one agent identity (its SHA-256 is the id; the token itself is never

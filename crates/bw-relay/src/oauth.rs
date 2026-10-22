@@ -50,7 +50,7 @@ use crate::{
 const CODE_TTL: Duration = Duration::from_secs(10 * 60);
 /// Scope granted to full accounts.
 pub const SCOPE_ROOMS: &str = "rooms";
-const SESSION_COOKIE: &str = "bw_session";
+pub(crate) const SESSION_COOKIE: &str = "bw_session";
 
 /// Shared state for the OAuth routes.
 #[derive(Clone)]
@@ -87,7 +87,7 @@ impl AuthLimiters {
 
 // ----- helpers -----
 
-fn random_token(prefix: &str) -> String {
+pub(crate) fn random_token(prefix: &str) -> String {
     let mut b = [0u8; 32];
     rand::rng().fill_bytes(&mut b);
     format!(
@@ -121,7 +121,7 @@ pub fn client_ip(headers: &HeaderMap, peer: Option<SocketAddr>, behind_proxy: bo
         .unwrap_or_else(|| "unknown".into())
 }
 
-fn esc(s: &str) -> String {
+pub(crate) fn esc(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
@@ -136,7 +136,7 @@ fn esc(s: &str) -> String {
     out
 }
 
-fn page(title: &str, body: &str) -> Html<String> {
+pub(crate) fn page(title: &str, body: &str) -> Html<String> {
     Html(format!(
         r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{t} · BotWhisper</title><meta name="robots" content="noindex">
@@ -154,6 +154,7 @@ button.ghost{{background:#fff;color:#1b1838;border-color:#c9c5e4}}
 .err{{border:1px solid #f0a0a0;background:#fff0f0;color:#7a1f1f;border-radius:12px;padding:12px 14px;margin-bottom:14px}}
 code{{background:#efedf9;padding:.08em .35em;border-radius:6px;font-size:.9em}}
 hr{{border:0;border-top:1px solid #e2dff2;margin:22px 0}}
+.row{{border-top:1px solid #e2dff2;padding:8px 0}}
 </style></head><body><main><div class="card">{b}</div>
 <p class="muted" style="text-align:center;margin-top:16px">BotWhisper · an open-source relay where AI bots take turns · <a href="https://botwhisper.si/">botwhisper.si</a></p></main></body></html>"#,
         t = esc(title),
@@ -161,9 +162,9 @@ hr{{border:0;border-top:1px solid #e2dff2;margin:22px 0}}
     ))
 }
 
-const OPERATOR_NOTICE: &str = r#"<div class="notice"><strong>v1 is a plaintext relay.</strong> While a message waits in the relay's memory, the operator can technically read it. Nothing is logged and messages are deleted once every recipient has them.</div>"#;
+pub(crate) const OPERATOR_NOTICE: &str = r#"<div class="notice"><strong>v1 is a plaintext relay.</strong> While a message waits in the relay's memory, the operator can technically read it. Nothing is logged and messages are deleted once every recipient has them.</div>"#;
 
-fn error_page(status: StatusCode, title: &str, msg: &str) -> Response {
+pub(crate) fn error_page(status: StatusCode, title: &str, msg: &str) -> Response {
     (
         status,
         page(
@@ -174,7 +175,7 @@ fn error_page(status: StatusCode, title: &str, msg: &str) -> Response {
         .into_response()
 }
 
-fn no_store<T: IntoResponse>(r: T) -> Response {
+pub(crate) fn no_store<T: IntoResponse>(r: T) -> Response {
     let mut resp = r.into_response();
     resp.headers_mut()
         .insert(header::CACHE_CONTROL, "no-store".parse().expect("header"));
@@ -190,7 +191,7 @@ fn oauth_error(status: StatusCode, error: &str, description: &str) -> Response {
     ))
 }
 
-fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
+pub(crate) fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
     headers
         .get_all(header::COOKIE)
         .iter()
@@ -201,11 +202,24 @@ fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
         .map(|(_, v)| v.trim().to_string())
 }
 
-fn set_cookie(cfg: &RelayConfig, value: &str, max_age: u64) -> String {
+pub(crate) fn set_cookie(cfg: &RelayConfig, value: &str, max_age: u64) -> String {
     format!(
-        "{SESSION_COOKIE}={value}; Path=/oauth; HttpOnly; SameSite=Lax; Max-Age={max_age}{}",
+        "{SESSION_COOKIE}={value}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}{}",
         if cfg.is_https() { "; Secure" } else { "" }
     )
+}
+
+/// Expire the session cookie, including the pre-0.1.1 one scoped to `/oauth`.
+pub(crate) fn clear_session_cookies(cfg: &RelayConfig, r: &mut Response) {
+    let secure = if cfg.is_https() { "; Secure" } else { "" };
+    for path in ["/", "/oauth"] {
+        r.headers_mut().append(
+            header::SET_COOKIE,
+            format!("{SESSION_COOKIE}=; Path={path}; HttpOnly; SameSite=Lax; Max-Age=0{secure}")
+                .parse()
+                .expect("header"),
+        );
+    }
 }
 
 /// The parts of an authorization request we keep while the user signs in.
@@ -536,6 +550,14 @@ pub async fn register_client(
     no_store((StatusCode::CREATED, Json(out)))
 }
 
+/// "Sign in again" guidance for `/oauth/token` errors that end a grant.
+fn sign_in_again(st: &OauthState) -> String {
+    crate::guidance::sign_in_again(
+        st.mailer.sender_domain().as_deref(),
+        st.cfg.login_link_ttl.as_secs() / 60,
+    )
+}
+
 fn too_many(retry: u64) -> Response {
     let mut r = oauth_error(
         StatusCode::TOO_MANY_REQUESTS,
@@ -551,7 +573,7 @@ fn too_many(retry: u64) -> Response {
 
 // ----- authorize (consent page) -----
 
-fn current_account(st: &OauthState, headers: &HeaderMap) -> Option<AccountRow> {
+pub(crate) fn current_account(st: &OauthState, headers: &HeaderMap) -> Option<AccountRow> {
     let cookie = cookie_value(headers, SESSION_COOKIE)?;
     let id = st
         .db
@@ -663,10 +685,7 @@ pub async fn authorize_post(
                 let _ = st.db.delete_session(&sha256_hex(&c));
             }
             let mut r = no_store(signin_page(&req, &client, None));
-            r.headers_mut().insert(
-                header::SET_COOKIE,
-                set_cookie(&st.cfg, "", 0).parse().expect("header"),
-            );
+            clear_session_cookies(&st.cfg, &mut r);
             r
         }
         "allow" => match current_account(&st, &headers) {
@@ -703,19 +722,31 @@ pub async fn authorize_post(
     }
 }
 
-async fn start_email_signin(
+/// `pending_logins.authz` marker for a web signup (no MCP client waiting).
+pub(crate) const WEB_SIGNUP: &str = "web-signup";
+
+/// Why a sign-in email was not sent.
+pub(crate) enum SigninError {
+    InvalidEmail,
+    RateLimited,
+    Storage,
+    Mail,
+}
+
+/// Validate, rate-limit, store the pending login and mail the single-use
+/// link. Shared by the connector sign-in and the web signup so both get the
+/// same links, limits and mail, and the same outcome whether or not the
+/// address already has an account. `purpose` completes "Open this link to
+/// ...". Logs one line per send, never the address, link or token.
+pub(crate) async fn send_signin_email(
     st: &OauthState,
-    req: &AuthzRequest,
-    client: &ClientRow,
     ip: &str,
     email: &str,
-) -> Response {
+    authz: String,
+    purpose: &str,
+) -> Result<(), SigninError> {
     if !looks_like_email(email) {
-        return no_store(signin_page(
-            req,
-            client,
-            Some("That is not a valid email address."),
-        ));
+        return Err(SigninError::InvalidEmail);
     }
     let email = normalize_email(email);
     if st
@@ -729,20 +760,13 @@ async fn start_email_signin(
             .check(&format!("signup-email:{email}"))
             .is_err()
     {
-        return no_store((
-            StatusCode::TOO_MANY_REQUESTS,
-            signin_page(
-                req,
-                client,
-                Some("Too many sign-in emails requested. Please wait a while and try again."),
-            ),
-        ));
+        return Err(SigninError::RateLimited);
     }
     let token = random_token("");
     let now = now_unix();
     let pending = PendingLogin {
         email: email.clone(),
-        authz: serde_json::to_string(req).unwrap_or_default(),
+        authz,
         expires_at: now + st.cfg.login_link_ttl.as_secs(),
     };
     if st
@@ -750,41 +774,93 @@ async fn start_email_signin(
         .insert_pending_login(&sha256_hex(&token), &pending)
         .is_err()
     {
-        return error_page(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Storage error",
-            "Please try again.",
-        );
+        return Err(SigninError::Storage);
     }
     let link = format!("{}/oauth/confirm/{token}", st.cfg.public_url());
     let minutes = st.cfg.login_link_ttl.as_secs() / 60;
     let msg = Outgoing {
         to: email,
-        subject: "Your BotWhisper sign-in link".into(),
+        subject: crate::guidance::SIGNIN_SUBJECT.into(),
         body: format!(
-            "Open this link to connect {client} to BotWhisper:\n\n{link}\n\n\
+            "Open this link to {purpose}:\n\n{link}\n\n\
              It works once and expires in {minutes} minutes. If you didn't ask for it, ignore this email.\n\n\
              BotWhisper is a plaintext relay in v1: the relay operator can technically read messages while they wait in memory. Nothing is logged.\n",
-            client = client.name.as_deref().unwrap_or("an MCP client"),
         ),
     };
-    // One line per send. Never the address, link or token.
     if let Err(e) = st.mailer.send(msg).await {
         tracing::warn!("mail: sign-in link failed: {e}");
-        return error_page(
+        return Err(SigninError::Mail);
+    }
+    tracing::info!("mail: sign-in link sent");
+    Ok(())
+}
+
+/// Error page for a storage or mail failure while sending the link.
+pub(crate) fn signin_failure_page(e: &SigninError) -> Response {
+    match e {
+        SigninError::Mail => error_page(
             StatusCode::BAD_GATEWAY,
             "Could not send email",
             "The relay could not send the confirmation email. Try again later or contact the operator.",
-        );
+        ),
+        _ => error_page(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Storage error",
+            "Please try again.",
+        ),
     }
-    tracing::info!("mail: sign-in link sent");
+}
+
+pub(crate) const RATE_LIMITED_MSG: &str =
+    "Too many sign-in emails requested. Please wait a while and try again.";
+
+/// The "check your email" page, written for the person and for an AI agent
+/// reading it. `finish` completes "Open it on this device to ...". Never
+/// shows the address.
+pub(crate) fn check_email_page(st: &OauthState, finish: &str) -> Response {
+    let minutes = st.cfg.login_link_ttl.as_secs() / 60;
+    let from = st
+        .mailer
+        .sender_domain()
+        .map(|d| format!(" from <strong>{}</strong>", esc(&d)))
+        .unwrap_or_default();
     no_store(page(
         "Check your email",
         &format!(
-            r#"<h1>Check your email</h1><p>If the address is valid, a sign-in link is on its way. Open it on this device to finish connecting {client}.</p><p class="muted">The link works once and expires in {minutes} minutes. You can close this tab.</p>"#,
-            client = client_label(client)
+            r#"<h1>Check your email</h1><p>If the address is valid, a sign-in link is on its way. Open it on this device to {finish}.</p>
+<p>Look in your inbox (and spam folder) for <strong>{subject}</strong>{from} and click the confirmation link. Until it is clicked, your AI agent has no BotWhisper access.</p>
+<p class="muted">The link works once and expires in {minutes} minutes. If it expired, start again to get a new email. You can close this tab.</p>
+<div class="notice"><strong>AI agent reading this page:</strong> sign-in is waiting on your user. Ask them to check their inbox (and spam) for the email titled '{subject}'{from}, click the confirmation link within {minutes} minutes, then retry or reconnect the BotWhisper connector. If the link expired or was already used, start the connect again for a new email.</div>"#,
+            subject = crate::guidance::SIGNIN_SUBJECT,
         ),
     ))
+}
+
+async fn start_email_signin(
+    st: &OauthState,
+    req: &AuthzRequest,
+    client: &ClientRow,
+    ip: &str,
+    email: &str,
+) -> Response {
+    let purpose = format!(
+        "connect {} to BotWhisper",
+        client.name.as_deref().unwrap_or("an MCP client")
+    );
+    let authz = serde_json::to_string(req).unwrap_or_default();
+    match send_signin_email(st, ip, email, authz, &purpose).await {
+        Ok(()) => check_email_page(st, &format!("finish connecting {}", client_label(client))),
+        Err(SigninError::InvalidEmail) => no_store(signin_page(
+            req,
+            client,
+            Some("That is not a valid email address."),
+        )),
+        Err(SigninError::RateLimited) => no_store((
+            StatusCode::TOO_MANY_REQUESTS,
+            signin_page(req, client, Some(RATE_LIMITED_MSG)),
+        )),
+        Err(e) => signin_failure_page(&e),
+    }
 }
 
 async fn guest_join(
@@ -872,17 +948,25 @@ pub async fn confirm(State(st): State<OauthState>, Path(token): Path<String>) ->
         return error_page(
             StatusCode::BAD_REQUEST,
             "Link expired or already used",
-            "Sign-in links work once and expire after 15 minutes. Go back to your MCP client and start the sign-in again.",
+            &format!(
+                "Sign-in links work once and expire after {} minutes. Go back to your AI app and connect BotWhisper again (or ask your AI agent to reconnect the BotWhisper connector), or create an account again at /signup, to get a new email, then click the new link.",
+                st.cfg.login_link_ttl.as_secs() / 60
+            ),
         );
     };
-    let req: AuthzRequest = match serde_json::from_str(&pending.authz) {
-        Ok(r) => r,
-        Err(_) => {
-            return error_page(
-                StatusCode::BAD_REQUEST,
-                "Invalid link",
-                "Start the sign-in again.",
-            )
+    // A web signup has no MCP client waiting; anything else resumes one.
+    let req: Option<AuthzRequest> = if pending.authz == WEB_SIGNUP {
+        None
+    } else {
+        match serde_json::from_str(&pending.authz) {
+            Ok(r) => Some(r),
+            Err(_) => {
+                return error_page(
+                    StatusCode::BAD_REQUEST,
+                    "Invalid link",
+                    "Start the sign-in again.",
+                )
+            }
         }
     };
     let account = match st.db.account_by_email(&pending.email) {
@@ -917,8 +1001,11 @@ pub async fn confirm(State(st): State<OauthState>, Path(token): Path<String>) ->
     let _ = st
         .db
         .insert_session(&sha256_hex(&session), &account.id, now + max_age);
-    let mut resp = issue_code_and_redirect(&st, &req, &account.id, SCOPE_ROOMS);
-    resp.headers_mut().insert(
+    let mut resp = match req {
+        Some(req) => issue_code_and_redirect(&st, &req, &account.id, SCOPE_ROOMS),
+        None => crate::web::welcome_page(&st, &account),
+    };
+    resp.headers_mut().append(
         header::SET_COOKIE,
         set_cookie(&st.cfg, &session, max_age)
             .parse()
@@ -989,7 +1076,7 @@ fn authenticate_client(
     Ok(client)
 }
 
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
@@ -1063,7 +1150,10 @@ pub async fn token(
                 return oauth_error(
                     StatusCode::BAD_REQUEST,
                     "invalid_grant",
-                    "unknown, expired or already used code",
+                    &format!(
+                        "unknown, expired or already used code. {}",
+                        sign_in_again(&st)
+                    ),
                 );
             };
             if row.expires_at <= now
@@ -1108,7 +1198,7 @@ pub async fn token(
                 return oauth_error(
                     StatusCode::BAD_REQUEST,
                     "invalid_grant",
-                    "unknown or expired refresh token",
+                    &format!("unknown or expired refresh token. {}", sign_in_again(&st)),
                 );
             };
             if row.client_id != client.id {
@@ -1128,7 +1218,10 @@ pub async fn token(
                 return oauth_error(
                     StatusCode::BAD_REQUEST,
                     "invalid_grant",
-                    "refresh token already used; this grant was revoked, sign in again",
+                    &format!(
+                        "refresh token already used; this grant was revoked. {}",
+                        sign_in_again(&st)
+                    ),
                 );
             }
             match issue_tokens(&st, &client.id, &row.account_id, &row.scope) {

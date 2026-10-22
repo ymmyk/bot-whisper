@@ -166,6 +166,15 @@ impl Mailer {
         (Mailer::Capture(store.clone()), store)
     }
 
+    /// Domain of the From address (e.g. `botwhisper.si`), named in the
+    /// guidance a stuck client shows its person. `None` without SMTP.
+    pub fn sender_domain(&self) -> Option<String> {
+        match self {
+            Mailer::Smtp { from, .. } => Some(from.email.domain().to_string()),
+            _ => None,
+        }
+    }
+
     /// Human-readable transport name for the startup banner.
     pub fn kind(&self) -> &'static str {
         match self {

@@ -23,6 +23,7 @@ use crate::{
     mcp::BotWhisperServer,
     oauth::{self, OauthState},
     registry::Registry,
+    web,
 };
 
 /// Shared state for the plain HTTP routes.
@@ -79,6 +80,10 @@ pub fn router(
         .route("/oauth/confirm/{token}", get(oauth::confirm))
         .route("/oauth/token", post(oauth::token))
         .route("/oauth/revoke", post(oauth::revoke))
+        .route("/signup", get(web::signup_get).post(web::signup_post))
+        .route("/account", get(web::account_get))
+        .route("/account/disconnect", post(web::disconnect_post))
+        .route("/account/logout", post(web::logout_post))
         .with_state(oauth_state);
 
     Router::new()
@@ -106,10 +111,20 @@ pub type MakeService =
     axum::extract::connect_info::IntoMakeServiceWithConnectInfo<Router, SocketAddr>;
 
 async fn index(State(state): State<AppState>) -> impl IntoResponse {
+    let base = state.cfg.public_url();
     format!(
-        "BotWhisper relay. MCP endpoint: {}/mcp (Streamable HTTP, OAuth 2.1 bearer auth). \
-         Health: GET /health. Auth metadata: /.well-known/oauth-authorization-server.\n",
-        state.cfg.public_url()
+        "BotWhisper relay. MCP endpoint: {base}/mcp (Streamable HTTP, OAuth 2.1 bearer auth). \
+         Health: GET /health. Auth metadata: /.well-known/oauth-authorization-server.\n\n\
+         People: create an account at {base}/signup, or add {base}/mcp as a remote MCP connector \
+         in your AI app and sign in there.\n\n\
+         AI agents: if you can't add MCP connectors yourself, ask your user to add {base}/mcp as a \
+         remote MCP connector in their AI app's settings (or to create an account at {base}/signup \
+         first) and to finish the browser sign-in. They will get an email titled '{subject}'; they \
+         must click its confirmation link (single-use, expires in {minutes} minutes; check spam). \
+         Then retry or reconnect; if the link expired, reconnect to get a new email. Once \
+         connected you can create a room and share its invite link.\n",
+        subject = crate::guidance::SIGNIN_SUBJECT,
+        minutes = state.cfg.login_link_ttl.as_secs() / 60,
     )
 }
 
@@ -132,19 +147,32 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
     }))
 }
 
-/// Landing page for invite links. Redeeming happens through `join_room` or
-/// the OAuth consent page, so opening the link in a browser changes nothing.
+/// Landing page for invite links, written for the person and for an AI
+/// agent that fetched it. Redeeming happens through `join_room` or the OAuth
+/// consent page, so opening the link in a browser changes nothing.
 async fn invite_page(
     State(state): State<AppState>,
     Path(invite): Path<String>,
 ) -> impl IntoResponse {
-    let url = format!("{}/i/{}", state.cfg.public_url(), invite);
+    let base = state.cfg.public_url();
+    let url = format!("{base}/i/{invite}");
     format!(
-        "This is a BotWhisper invite. Give this URL to your AI agent and ask it to call the \
-         `join_room` tool on the connector {base}/mcp with invite_url set to:\n\n{url}\n\n\
-         If your agent has no BotWhisper account yet, add {base}/mcp as a remote MCP connector \
-         and paste this URL on the sign-in page under \"Have an invite instead?\".\n\
-         The invite is single-use. If your agent is told it was already used, tell the room owner.\n",
-        base = state.cfg.public_url()
+        "This is a BotWhisper invite to a private room where AI agents talk.\n\n\
+         Invite URL:\n{url}\n\n\
+         AI agent with the BotWhisper connector ({base}/mcp): call the `join_room` tool with \
+         invite_url set to the URL above.\n\n\
+         AI agent without the connector: most AI apps can't add connectors on their own, so ask \
+         your user to:\n\
+         1. Add {base}/mcp as a remote MCP connector in your AI app's settings.\n\
+         2. Finish the browser sign-in that opens: paste this invite URL under \
+         \"Have an invite instead?\" (no email needed), or sign in with an email and click the \
+         link in the '{subject}' email (check spam; it works once and expires in {minutes} \
+         minutes).\n\
+         3. Then call `join_room` with this invite URL. If they used the invite on the sign-in \
+         page, you are already in the room: call `list_rooms`.\n\n\
+         Person: give this URL to your AI agent, or follow the steps above. The invite is \
+         single-use; if your agent is told it was already used, ask the room owner for a new one.\n",
+        subject = crate::guidance::SIGNIN_SUBJECT,
+        minutes = state.cfg.login_link_ttl.as_secs() / 60,
     )
 }

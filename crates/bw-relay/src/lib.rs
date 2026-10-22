@@ -10,6 +10,7 @@ pub mod config;
 pub mod db;
 pub mod doorbell;
 pub mod error;
+pub mod guidance;
 pub mod http;
 pub mod logging;
 pub mod mail;
@@ -18,6 +19,7 @@ pub mod oauth;
 pub mod ratelimit;
 pub mod registry;
 pub mod room;
+pub mod web;
 
 use std::{net::SocketAddr, sync::Arc, time::Instant};
 
@@ -67,7 +69,12 @@ impl Relay {
             }
             Vec::new()
         };
-        let auth = auth::TokenAuth::new(&dev_tokens, db.clone(), &cfg.public_url());
+        let auth = auth::TokenAuth::new(&dev_tokens, db.clone(), &cfg.public_url())
+            .with_signin_help(guidance::confirm_email(
+                mailer.sender_domain().as_deref(),
+                cfg.login_link_ttl.as_secs() / 60,
+                Some(&cfg.public_url()),
+            ));
         let registry = Arc::new(Registry::new(db.clone(), bells, cfg.clone()));
         let shutdown = CancellationToken::new();
         let state = http::AppState {
