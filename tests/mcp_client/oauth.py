@@ -44,8 +44,11 @@ async def main():
             print("old refresh reuse:",r.status_code,r.text[:160])
             r=await c.post(B+"/oauth/token",data=dict(grant_type="refresh_token",refresh_token=t2["refresh_token"],client_id=CID))
             print("new refresh after old-reuse (family revoked?):",r.status_code,"revoked" if r.status_code!=200 else "still valid")
-            try:
-                e,w=await whoami(t1["access_token"]); print("old access after refresh:",e,json.dumps(w)[:150])
-            except Exception as ex: print("old access after refresh: rejected",type(ex).__name__)
+            # Reuse of t1's refresh token revokes the whole grant chain, so both
+            # access tokens must now be refused.
+            for lbl,tok in (("new access after old-reuse",t2["access_token"]),("old access after old-reuse",t1["access_token"])):
+                try:
+                    e,w=await asyncio.wait_for(whoami(tok),30); print(lbl+": STILL VALID",e,json.dumps(w)[:150])
+                except Exception as ex: print(lbl+": rejected",type(ex).__name__)
         await call(b1,"close_room",room_id=rid)
 asyncio.run(main())

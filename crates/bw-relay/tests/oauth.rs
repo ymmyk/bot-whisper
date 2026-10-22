@@ -413,37 +413,13 @@ async fn email_signin_pkce_refresh_and_revoke() {
         1
     );
 
-    // Refresh rotates: the old refresh token dies, the new one works.
-    let r = http
-        .post(format!("{base}/oauth/token"))
-        .form(&[
-            ("grant_type", "refresh_token"),
-            ("refresh_token", refresh),
-            ("client_id", &client_id),
-        ])
-        .send()
-        .await
-        .unwrap();
+    // Refresh rotates: a new pair is issued. (Replaying the old refresh token
+    // is covered by `refresh_token_reuse_revokes_the_grant_chain`.)
+    let r = refresh_grant(&http, &base, &client_id, refresh).await;
     assert_eq!(r.status(), StatusCode::OK);
     let rotated: Value = r.json().await.unwrap();
     assert_ne!(rotated["refresh_token"], tokens["refresh_token"]);
-    let r = http
-        .post(format!("{base}/oauth/token"))
-        .form(&[
-            ("grant_type", "refresh_token"),
-            ("refresh_token", refresh),
-            ("client_id", &client_id),
-        ])
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(
-        r.status(),
-        StatusCode::BAD_REQUEST,
-        "old refresh token is dead"
-    );
-    // The old access token still works until it expires; the new one too and
-    // it is the same agent (same account + client).
+    // The new access token is the same agent (same account + client).
     let bot_again = relay.bot(rotated["access_token"].as_str().unwrap()).await;
     assert_eq!(
         bot_again.ok("list_rooms", json!({})).await["rooms"][0]["room_id"],
@@ -476,6 +452,89 @@ async fn email_signin_pkce_refresh_and_revoke() {
         bot3.ok("list_rooms", json!({})).await["rooms"][0]["room_id"],
         room["room_id"]
     );
+    relay.shutdown().await;
+}
+
+async fn refresh_grant(
+    http: &Client,
+    base: &str,
+    client_id: &str,
+    refresh: &str,
+) -> reqwest::Response {
+    http.post(format!("{base}/oauth/token"))
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh),
+            ("client_id", client_id),
+        ])
+        .send()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn refresh_token_reuse_revokes_the_grant_chain() {
+    let relay = TestRelay::start().await;
+    let base = relay.base();
+    let http = client();
+    let client_id = register(&http, &base).await;
+    let t0 = sign_in(&relay, &http, &client_id, "reuse@example.com").await;
+    let r0 = t0["refresh_token"].as_str().unwrap();
+
+    // Two legitimate rotations.
+    let r = refresh_grant(&http, &base, &client_id, r0).await;
+    assert_eq!(r.status(), StatusCode::OK);
+    let t1: Value = r.json().await.unwrap();
+    let r = refresh_grant(
+        &http,
+        &base,
+        &client_id,
+        t1["refresh_token"].as_str().unwrap(),
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::OK);
+    let t2: Value = r.json().await.unwrap();
+    let a2 = t2["access_token"].as_str().unwrap();
+    let r2 = t2["refresh_token"].as_str().unwrap();
+    relay.bot(a2).await.ok("list_rooms", json!({})).await;
+
+    // A second client on the same account is a separate grant.
+    let other_id = register(&http, &base).await;
+    let other = sign_in(&relay, &client(), &other_id, "reuse@example.com").await;
+
+    // Replay the first (already rotated) refresh token.
+    let r = refresh_grant(&http, &base, &client_id, r0).await;
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    let body: Value = r.json().await.unwrap();
+    assert_eq!(body["error"], "invalid_grant");
+
+    // The newest refresh token and its access token are now dead too.
+    let r = refresh_grant(&http, &base, &client_id, r2).await;
+    assert_eq!(
+        r.status(),
+        StatusCode::BAD_REQUEST,
+        "newer refresh token revoked with the chain"
+    );
+    assert!(
+        Bot::connect(&relay.url(), a2).await.is_err(),
+        "newer access token revoked with the chain"
+    );
+    assert!(
+        Bot::connect(&relay.url(), t0["access_token"].as_str().unwrap())
+            .await
+            .is_err(),
+        "original access token revoked too"
+    );
+
+    // The other client's grant is untouched.
+    let r = refresh_grant(
+        &http,
+        &base,
+        &other_id,
+        other["refresh_token"].as_str().unwrap(),
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::OK, "other grant still refreshes");
     relay.shutdown().await;
 }
 

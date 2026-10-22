@@ -59,5 +59,12 @@ every recipient acks.
 - Redirect URIs are validated at registration (https, loopback http, or a
   private app scheme). Authorization codes are single use and bound to the
   client, redirect URI and PKCE challenge.
+- Refresh token reuse detection (OAuth 2.1 4.3.1, RFC 9700 4.14.2):
+  presenting an already-used or revoked refresh token revokes every access
+  and refresh token of that grant (that client for that account). Used
+  refresh tokens are kept, hashed, until they expire so a replay is
+  recognised.
+- One log line per confirmation email (`mail: sign-in link sent` at info,
+  `mail: sign-in link failed: …` at warn) with no address, link or token.
 
 [0.1.0-alpha]: https://github.com/botwhisper/botwhisper/releases/tag/v0.1.0-alpha

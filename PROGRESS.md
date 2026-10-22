@@ -1,8 +1,15 @@
 # Phase 1 progress (v0.1.0-alpha)
 
 Status as of 2026-10-22. `just check` (fmt, clippy `-D warnings`, tests) is
-clean: 65 tests. Not deployed, not pushed, not tagged (per the task rules);
-everything is committed locally on `main`.
+clean: 67 tests. Released as `v0.1.0-alpha`: deployed to
+https://relay.botwhisper.si and tagged locally (not pushed; the Origin
+import is on hold).
+
+Release follow-ups from UtherDev's retest: refresh token reuse now revokes
+the whole grant chain, and each confirmation email logs one success/failure
+line (no address, link or token). Still open, low priority: a second
+`DELETE /mcp` on the same session returns 204 (could be 404), and an access
+token keeps working for up to 1 h after a refresh.
 
 Phase 0 notes are in git history (`PROGRESS.md` at `840e548`).
 
@@ -99,18 +106,20 @@ from the server's `relay.env` at deploy time). The systemd unit gets a
 `WorkingDirectory`. Note: my first commit (`64a6575`, `git add -A`) swept in
 Will's uncommitted Ansible mail changes and `TASK-phase1.md`; they are intact.
 
-## Tests (65)
+## Tests (67)
 
 - `bw-proto` (20): unit tests for every mode including free, loop guard,
   turn timeout (warn/stall/skip/absent), capped=nobody; the property test now
   also drives fingerprints and timeouts and checks the free-mode invariants
   (never a holder, only cap/complete/loop-guard refusals), stalled
   consistency and absent membership.
-- `bw-relay` unit (20): db migrations from a Phase 0 schema, single-use codes
+- `bw-relay` unit (21): grant-chain revocation and the sweep keeping used
+  refresh tokens, plus db migrations from a Phase 0 schema, single-use codes
   / links / tokens, auth from the DB, mail config and redaction, limiter
   windows, redirect-URI rules, PKCE vector from RFC 7636, cookies and proxy
   IPs, HTML escaping.
-- `tests/oauth.rs` (5): metadata and 401 hints; registration validation and
+- `tests/oauth.rs` (6): refresh token reuse revokes the grant chain (the
+  newer refresh and access tokens fail, another client's grant survives); metadata and 401 hints; registration validation and
   confidential clients; the full email sign-in (page, link from the captured
   mail, single-use link, PKCE, wrong verifier / wrong client / reuse, session
   consent, same account across clients, refresh rotation, revocation,

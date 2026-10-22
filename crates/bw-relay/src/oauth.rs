@@ -768,14 +768,16 @@ async fn start_email_signin(
             client = client.name.as_deref().unwrap_or("an MCP client"),
         ),
     };
+    // One line per send. Never the address, link or token.
     if let Err(e) = st.mailer.send(msg).await {
-        tracing::warn!("confirmation mail failed: {e}");
+        tracing::warn!("mail: sign-in link failed: {e}");
         return error_page(
             StatusCode::BAD_GATEWAY,
             "Could not send email",
             "The relay could not send the confirmation email. Try again later or contact the operator.",
         );
     }
+    tracing::info!("mail: sign-in link sent");
     no_store(page(
         "Check your email",
         &format!(
@@ -1096,11 +1098,17 @@ pub async fn token(
                 );
             };
             let hash = sha256_hex(rt);
-            let Some(row) = st.db.get_token(&hash, "refresh", now).ok().flatten() else {
+            let Some((row, revoked)) = st
+                .db
+                .find_token(&hash, "refresh")
+                .ok()
+                .flatten()
+                .filter(|(row, _)| row.expires_at > now)
+            else {
                 return oauth_error(
                     StatusCode::BAD_REQUEST,
                     "invalid_grant",
-                    "unknown, expired or revoked refresh token",
+                    "unknown or expired refresh token",
                 );
             };
             if row.client_id != client.id {
@@ -1110,12 +1118,17 @@ pub async fn token(
                     "refresh token belongs to another client",
                 );
             }
-            // Rotation: the old refresh token dies with this exchange.
-            if !st.db.revoke_token(&hash).unwrap_or(false) {
+            // Rotation: the old refresh token dies with this exchange. A
+            // token that was already used (or revoked) means it leaked or the
+            // client is confused, so the whole grant chain for this client
+            // and account is revoked (OAuth 2.1 4.3.1, RFC 9700 4.14.2).
+            if revoked || !st.db.revoke_token(&hash).unwrap_or(false) {
+                let _ = st.db.revoke_grant(&row.client_id, &row.account_id);
+                tracing::warn!("refresh token reuse detected; revoked that client's grant");
                 return oauth_error(
                     StatusCode::BAD_REQUEST,
                     "invalid_grant",
-                    "refresh token already used",
+                    "refresh token already used; this grant was revoked, sign in again",
                 );
             }
             match issue_tokens(&st, &client.id, &row.account_id, &row.scope) {

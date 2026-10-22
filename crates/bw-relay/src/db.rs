@@ -740,6 +740,46 @@ impl Db {
         })
     }
 
+    /// Look up a token of `kind` whether or not it was revoked, so refresh
+    /// token reuse can be told apart from an unknown token. Returns the row
+    /// and its `revoked` flag.
+    pub fn find_token(&self, token_hash: &str, kind: &str) -> Result<Option<(TokenRow, bool)>> {
+        self.with(|c| {
+            c.query_row(
+                "SELECT kind, client_id, account_id, scope, expires_at, revoked FROM oauth_tokens
+                 WHERE token_hash = ?1 AND kind = ?2",
+                params![token_hash, kind],
+                |r| {
+                    Ok((
+                        TokenRow {
+                            kind: r.get(0)?,
+                            client_id: r.get(1)?,
+                            account_id: r.get(2)?,
+                            scope: r.get(3)?,
+                            expires_at: r.get::<_, i64>(4)? as u64,
+                        },
+                        r.get::<_, i64>(5)? != 0,
+                    ))
+                },
+            )
+            .optional()
+        })
+    }
+
+    /// Revoke every access and refresh token of one grant chain (one client
+    /// for one account). Used when a rotated refresh token is replayed
+    /// (OAuth 2.1 section 4.3.1, RFC 9700 section 4.14.2). Returns how many
+    /// live tokens were revoked.
+    pub fn revoke_grant(&self, client_id: &str, account_id: &str) -> Result<usize> {
+        self.with(|c| {
+            c.execute(
+                "UPDATE oauth_tokens SET revoked = 1
+                 WHERE client_id = ?1 AND account_id = ?2 AND revoked = 0",
+                params![client_id, account_id],
+            )
+        })
+    }
+
     /// Revoke one token. Returns false if it was already revoked or unknown.
     pub fn revoke_token(&self, token_hash: &str) -> Result<bool> {
         self.with(|c| {
@@ -751,13 +791,16 @@ impl Db {
         })
     }
 
-    /// Drop expired codes, tokens, logins and sessions.
+    /// Drop expired codes, tokens, logins and sessions. Revoked refresh
+    /// tokens are kept (hashed) until they expire so a replay is still
+    /// recognised as reuse and can revoke its grant chain.
     pub fn sweep_auth(&self, now: u64) -> Result<()> {
         self.with(|c| {
             let n = now as i64;
             c.execute("DELETE FROM oauth_codes WHERE expires_at <= ?1", params![n])?;
             c.execute(
-                "DELETE FROM oauth_tokens WHERE expires_at <= ?1 OR revoked = 1",
+                "DELETE FROM oauth_tokens
+                 WHERE expires_at <= ?1 OR (revoked = 1 AND kind <> 'refresh')",
                 params![n],
             )?;
             c.execute(
@@ -1018,5 +1061,39 @@ mod tests {
         assert!(!db.revoke_token("t").unwrap());
         assert!(db.get_token("t", "access", 50).unwrap().is_none());
         db.sweep_auth(1000).unwrap();
+    }
+
+    #[test]
+    fn grant_chain_revocation_and_sweep_keep_used_refresh_tokens() {
+        let db = Db::open_in_memory().unwrap();
+        let tok = |kind: &str, client: &str| TokenRow {
+            kind: kind.into(),
+            client_id: client.into(),
+            account_id: "a".into(),
+            scope: "rooms".into(),
+            expires_at: 100,
+        };
+        db.insert_token("r1", &tok("refresh", "cl")).unwrap();
+        db.insert_token("a1", &tok("access", "cl")).unwrap();
+        db.insert_token("r2", &tok("refresh", "cl")).unwrap();
+        db.insert_token("other", &tok("refresh", "cl2")).unwrap();
+        assert!(db.revoke_token("r1").unwrap());
+        db.revoke_token("a1").unwrap();
+        db.sweep_auth(50).unwrap();
+        // The used refresh token survives the sweep (still marked revoked);
+        // the revoked access token does not.
+        assert!(matches!(
+            db.find_token("r1", "refresh").unwrap(),
+            Some((_, true))
+        ));
+        assert!(db.find_token("a1", "access").unwrap().is_none());
+        assert_eq!(db.revoke_grant("cl", "a").unwrap(), 1, "only r2 was live");
+        assert!(db.get_token("r2", "refresh", 50).unwrap().is_none());
+        assert!(
+            db.get_token("other", "refresh", 50).unwrap().is_some(),
+            "other clients are untouched"
+        );
+        db.sweep_auth(1000).unwrap();
+        assert!(db.find_token("r1", "refresh").unwrap().is_none(), "expired");
     }
 }
