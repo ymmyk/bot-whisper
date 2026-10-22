@@ -91,8 +91,97 @@ async fn exchange(
         .unwrap()
 }
 
-/// Sign in with an email through the consent page and return the tokens.
+/// Pull a hidden input's value out of a page.
+fn hidden(page: &str, name: &str) -> String {
+    let key = format!(r#"name="{name}" value=""#);
+    let start = page
+        .find(&key)
+        .unwrap_or_else(|| panic!("no {name} in {page}"))
+        + key.len();
+    page[start..start + page[start..].find('"').unwrap()].to_string()
+}
+
+/// Submit the bot picker (`page` is the picker HTML): `bot` is "new" or a
+/// bot id. Confirms the takeover page when the bot is connected elsewhere.
+/// Returns the final redirect to the client.
+async fn pick(
+    http: &Client,
+    base: &str,
+    page: &str,
+    client_id: &str,
+    state: &str,
+    bot: &str,
+    name: Option<&str>,
+) -> reqwest::Response {
+    assert!(page.contains("Which bot is connecting?"), "picker: {page}");
+    let csrf = hidden(page, "csrf");
+    let mut form = authorize_params(client_id, state);
+    form.push(("action", "allow".into()));
+    form.push(("csrf", csrf.clone()));
+    form.push(("bot", bot.into()));
+    if let Some(n) = name {
+        form.push(("bot_name", n.into()));
+    }
+    let r = http
+        .post(format!("{base}/oauth/authorize"))
+        .form(&form)
+        .send()
+        .await
+        .unwrap();
+    if r.status() != StatusCode::OK {
+        return r;
+    }
+    let body = r.text().await.unwrap();
+    assert!(body.contains("This will disconnect it from"), "{body}");
+    form.push(("confirm", "yes".into()));
+    http.post(format!("{base}/oauth/authorize"))
+        .form(&form)
+        .send()
+        .await
+        .unwrap()
+}
+
+/// The picker for a browser that is already signed in.
+async fn picker(http: &Client, base: &str, client_id: &str, state: &str) -> String {
+    let r = http
+        .get(format!("{base}/oauth/authorize"))
+        .query(&authorize_params(client_id, state))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    r.text().await.unwrap()
+}
+
+/// One click for a signed-in browser: pick `bot`, exchange, return tokens.
+async fn connect(
+    http: &Client,
+    base: &str,
+    client_id: &str,
+    bot: &str,
+    name: Option<&str>,
+) -> Value {
+    let page = picker(http, base, client_id, "sx").await;
+    let r = pick(http, base, &page, client_id, "sx", bot, name).await;
+    let (code, _) = code_from_location(&r);
+    let r = exchange(http, base, client_id, &code, VERIFIER).await;
+    assert_eq!(r.status(), StatusCode::OK);
+    r.json().await.unwrap()
+}
+
+/// Sign in with an email, create a new bot on the picker, return the tokens.
 async fn sign_in(relay: &TestRelay, http: &Client, client_id: &str, email: &str) -> Value {
+    sign_in_as(relay, http, client_id, email, "new").await
+}
+
+/// Sign in with an email and pick `bot` ("new" or a bot id).
+async fn sign_in_as(
+    relay: &TestRelay,
+    http: &Client,
+    client_id: &str,
+    email: &str,
+    bot: &str,
+) -> Value {
     let base = relay.base();
     let mut form: Vec<(&str, String)> = authorize_params(client_id, "st-1");
     form.push(("action", "email".into()));
@@ -131,14 +220,9 @@ async fn sign_in(relay: &TestRelay, http: &Client, client_id: &str, email: &str)
     assert!(link.starts_with(&base));
 
     let r = http.get(&link).send().await.unwrap();
-    // A connector sign-in still ends at the client's redirect_uri with the
-    // code (never at /account, and with no signed-in flash).
-    let (code, state) = code_from_location(&r);
-    assert_eq!(state, "st-1");
-    assert!(!r.headers()["location"]
-        .to_str()
-        .unwrap()
-        .contains("/account"));
+    // A connector sign-in shows the bot picker (never /account, and with no
+    // signed-in flash), then ends at the client's redirect_uri with the code.
+    assert_eq!(r.status(), StatusCode::OK);
     assert!(!r
         .headers()
         .get_all("set-cookie")
@@ -153,6 +237,10 @@ async fn sign_in(relay: &TestRelay, http: &Client, client_id: &str, email: &str)
             .starts_with("bw_session="),
         "browser session cookie set"
     );
+    let page = r.text().await.unwrap();
+    let r = pick(http, &base, &page, client_id, "st-1", bot, None).await;
+    let (code, state) = code_from_location(&r);
+    assert_eq!(state, "st-1");
 
     // The link is single use.
     let again = http.get(&link).send().await.unwrap();
@@ -370,18 +458,30 @@ async fn email_signin_pkce_refresh_and_revoke() {
         .unwrap();
     let page = r.text().await.unwrap();
     assert!(
-        page.contains("Allow"),
-        "consent page for a signed-in browser"
+        page.contains("Which bot is connecting?"),
+        "bot picker for a signed-in browser"
     );
     assert!(page.contains("will@example.com"));
-    let mut allow = authorize_params(&client2, "s2");
-    allow.push(("action", "allow".into()));
+    // The form needs the session's CSRF value.
+    let mut forged = authorize_params(&client2, "s2");
+    forged.push(("action", "allow".into()));
+    forged.push(("bot", "new".into()));
     let r = http
         .post(format!("{base}/oauth/authorize"))
-        .form(&allow)
+        .form(&forged)
         .send()
         .await
         .unwrap();
+    assert_eq!(r.status(), StatusCode::FORBIDDEN, "no csrf");
+    forged.push(("csrf", "wrong".into()));
+    let r = http
+        .post(format!("{base}/oauth/authorize"))
+        .form(&forged)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::FORBIDDEN, "bad csrf");
+    let r = pick(&http, &base, &page, &client2, "s2", "new", Some("Second")).await;
     let (code2, state2) = code_from_location(&r);
     assert_eq!(state2, "s2");
 
@@ -398,34 +498,36 @@ async fn email_signin_pkce_refresh_and_revoke() {
     // (the code is consumed by the failed attempt: single use)
     let r = exchange(&http, &base, &client2, &code2, VERIFIER).await;
     assert_eq!(r.status(), StatusCode::BAD_REQUEST);
-    let mut allow = authorize_params(&client2, "s3");
-    allow.push(("action", "allow".into()));
-    let r = http
-        .post(format!("{base}/oauth/authorize"))
-        .form(&allow)
-        .send()
-        .await
-        .unwrap();
+    let account = relay
+        .db
+        .account_by_email("will@example.com")
+        .unwrap()
+        .unwrap()
+        .id;
+    let second = relay
+        .db
+        .account_bots(&account)
+        .unwrap()
+        .into_iter()
+        .find(|b| b.name == "Second")
+        .expect("Second bot")
+        .id;
+    let page = picker(&http, &base, &client2, "s3").await;
+    let r = pick(&http, &base, &page, &client2, "s3", &second, None).await;
     let (code3, _) = code_from_location(&r);
     let r = exchange(&http, &base, &client_id, &code3, VERIFIER).await;
     assert_eq!(r.status(), StatusCode::BAD_REQUEST, "code bound to client2");
     // A code presented by the wrong client is burned; get a fresh one.
     let r = exchange(&http, &base, &client2, &code3, VERIFIER).await;
     assert_eq!(r.status(), StatusCode::BAD_REQUEST);
-    let mut allow = authorize_params(&client2, "s4");
-    allow.push(("action", "allow".into()));
-    let r = http
-        .post(format!("{base}/oauth/authorize"))
-        .form(&allow)
-        .send()
-        .await
-        .unwrap();
+    let page = picker(&http, &base, &client2, "s4").await;
+    let r = pick(&http, &base, &page, &client2, "s4", &second, None).await;
     let (code4, _) = code_from_location(&r);
     let r = exchange(&http, &base, &client2, &code4, VERIFIER).await;
     assert_eq!(r.status(), StatusCode::OK);
     let tokens2: Value = r.json().await.unwrap();
 
-    // Same account, different client: a different agent, so it does not see
+    // Same account, different bot: a different agent, so it does not see
     // the first client's room, but it is the same account for limits.
     let bot2 = relay.bot(tokens2["access_token"].as_str().unwrap()).await;
     assert_eq!(bot2.ok("list_rooms", json!({})).await["rooms"], json!([]));
@@ -468,14 +570,47 @@ async fn email_signin_pkce_refresh_and_revoke() {
         "revoked access token is refused"
     );
 
-    // Signing in again with the same email is the same account.
+    // Signing in again with the same email is the same account; picking the
+    // first bot (still connected via the rotated grant) is the same member,
+    // and the old grant is replaced.
+    let first = relay
+        .db
+        .account_bots(&account)
+        .unwrap()
+        .into_iter()
+        .find(|b| b.name != "Second")
+        .unwrap();
+    assert_eq!(first.name, "Test <Client>");
     let http2 = client();
-    let tokens3 = sign_in(&relay, &http2, &client_id, "will@example.com").await;
+    let tokens3 = sign_in_as(&relay, &http2, &client_id, "will@example.com", &first.id).await;
     let bot3 = relay.bot(tokens3["access_token"].as_str().unwrap()).await;
-    assert_eq!(
-        bot3.ok("list_rooms", json!({})).await["rooms"][0]["room_id"],
-        room["room_id"]
-    );
+    let rooms = bot3.ok("list_rooms", json!({})).await;
+    assert_eq!(rooms["rooms"][0]["room_id"], room["room_id"]);
+    let r = refresh_grant(
+        &http,
+        &base,
+        &client_id,
+        rotated["refresh_token"].as_str().unwrap(),
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST, "old grant replaced");
+    let err: Value = r.json().await.unwrap();
+    assert!(err["error_description"]
+        .as_str()
+        .unwrap()
+        .contains("connected from another app"));
+    // The replay of a replaced token does not revoke the new grant.
+    bot3.ok("list_rooms", json!({})).await;
+    let r = refresh_grant(
+        &http2,
+        &base,
+        &client_id,
+        tokens3["refresh_token"].as_str().unwrap(),
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::OK, "new grant unaffected");
+    // The other bot is untouched by the takeover.
+    bot2.ok("list_rooms", json!({})).await;
     relay.shutdown().await;
 }
 
@@ -559,6 +694,125 @@ async fn refresh_token_reuse_revokes_the_grant_chain() {
     )
     .await;
     assert_eq!(r.status(), StatusCode::OK, "other grant still refreshes");
+    relay.shutdown().await;
+}
+
+#[tokio::test]
+async fn two_bots_on_one_account_and_client_are_two_members() {
+    let relay = TestRelay::start().await;
+    let base = relay.base();
+    let http = client();
+    let client_id = register(&http, &base).await;
+    let a = sign_in(&relay, &http, &client_id, "me@example.com").await;
+    let account = relay
+        .db
+        .account_by_email("me@example.com")
+        .unwrap()
+        .unwrap()
+        .id;
+
+    // The picker now lists the first bot (preselected, connected) and
+    // suggests a unique name for a new one.
+    let page = picker(&http, &base, &client_id, "p").await;
+    assert!(
+        page.contains("<strong>Test &lt;Client&gt;</strong>"),
+        "{page}"
+    );
+    assert!(page.contains("Connected to Test &lt;Client&gt; now"));
+    assert!(page.contains("Picking it disconnects it from Test &lt;Client&gt;."));
+    assert!(
+        page.contains(r#"value="Test &lt;Client&gt; 2""#),
+        "unique default name"
+    );
+    assert!(page.contains("Create a new bot"));
+    assert!(page.contains("give each connector its own sign-in"));
+    let first = relay.db.account_bots(&account).unwrap().remove(0);
+    assert!(
+        page.contains(&format!(r#"value="{}" checked"#, first.id)),
+        "preselected"
+    );
+
+    // Same browser, same client registration, a second (new) bot.
+    let b = connect(&http, &base, &client_id, "new", Some("  Other\tbot ")).await;
+    let bots = relay.db.account_bots(&account).unwrap();
+    assert_eq!(bots.len(), 2);
+    let other = bots.iter().find(|x| x.id != first.id).unwrap();
+    assert_eq!(other.name, "Other bot", "name cleaned");
+    assert_eq!(other.agent_id, format!("{account}:{}", other.id));
+
+    // Both stay connected, and they are two members of one room whose
+    // display names default to the bot names.
+    let bot_a = relay.bot(a["access_token"].as_str().unwrap()).await;
+    let bot_b = relay.bot(b["access_token"].as_str().unwrap()).await;
+    let room = bot_a
+        .ok("create_room", json!({ "title": "Me and me" }))
+        .await;
+    let room_id = room["room_id"].as_str().unwrap().to_string();
+    let inv = bot_a
+        .ok("create_invite", json!({ "room_id": room_id }))
+        .await;
+    bot_b
+        .ok("join_room", json!({ "invite_url": inv["invite_url"] }))
+        .await;
+    let ma = bot_a.ok("list_rooms", json!({})).await["rooms"][0]["member_id"].clone();
+    let mb = bot_b.ok("list_rooms", json!({})).await["rooms"][0]["member_id"].clone();
+    assert_eq!(
+        (ma.as_str(), mb.as_str()),
+        (Some("m1"), Some("m2")),
+        "distinct members"
+    );
+    let status = bot_a.ok("get_status", json!({ "room_id": room_id })).await;
+    let names: Vec<&str> = status["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["display_name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["Test <Client>", "Other bot"]);
+    bot_a
+        .ok(
+            "send_message",
+            json!({ "room_id": room_id, "text": "hi me" }),
+        )
+        .await;
+
+    // Refresh keeps the bot: same member in the room.
+    let r = refresh_grant(
+        &http,
+        &base,
+        &client_id,
+        b["refresh_token"].as_str().unwrap(),
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::OK);
+    let b2: Value = r.json().await.unwrap();
+    let bot_b2 = relay.bot(b2["access_token"].as_str().unwrap()).await;
+    let st = bot_b2.ok("get_status", json!({ "room_id": room_id })).await;
+    assert_eq!(st["you"]["member"], mb, "{st}");
+
+    // Replaying bot B's old refresh token kills B's chain only.
+    let r = refresh_grant(
+        &http,
+        &base,
+        &client_id,
+        b["refresh_token"].as_str().unwrap(),
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        Bot::connect(&relay.url(), b2["access_token"].as_str().unwrap())
+            .await
+            .is_err()
+    );
+    bot_a.ok("list_rooms", json!({})).await;
+    let r = refresh_grant(
+        &http,
+        &base,
+        &client_id,
+        a["refresh_token"].as_str().unwrap(),
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::OK, "bot A's grant untouched");
     relay.shutdown().await;
 }
 
@@ -753,7 +1007,6 @@ async fn unconfirmed_clients_are_told_to_confirm_the_email() {
         assert!(body.contains(&format!(
             "`claude mcp add --transport http botwhisper {base}/mcp`"
         )));
-        assert!(body.contains(&format!("POST the invite as JSON to {base}/api/v1/join")));
         no_secrets(&body.replace("bwa_not-a-real-token", ""));
     }
 
@@ -803,26 +1056,23 @@ async fn unconfirmed_clients_are_told_to_confirm_the_email() {
     assert!(page.contains(&format!("{base}/i/abc.def")));
     assert!(page.starts_with("This is a BotWhisper room invite. Give it to your AI agent"));
     assert!(page.contains("Opening this page does not use the invite"));
-    assert!(page.contains("If you can run shell commands (curl)"));
-    assert!(page.contains(&format!(
-        r#"-d '{{"invite_url": "{base}/i/abc.def", "display_name": "YOUR NAME"}}'"#
-    )));
-    assert!(page.contains("Keep the token private: it works only for this room"));
-    assert!(page.contains("If you use MCP connectors instead"));
+    assert!(page.contains("AI agent without the connector"));
     assert!(page.contains(&format!(
         "`claude mcp add --transport http botwhisper {base}/mcp`"
     )));
     assert!(page.contains("type `/mcp` in Claude Code"));
     assert!(page.contains(&format!("`codex mcp add botwhisper --url {base}/mcp`")));
     assert!(page.contains("~/.cursor/mcp.json"));
-    assert!(page.contains(&format!("add {base}/mcp as a remote MCP connector")));
+    assert!(page.contains(&format!(
+        "adds {base}/mcp as a connector in the app's settings"
+    )));
+    assert!(page.contains("agents that run on a computer"));
     assert!(page.contains("Have an invite instead?"));
     assert!(page.contains("call `join_room` with this invite URL"));
-    // The index carries the same setup commands and a generic curl route.
+    // The index carries the same setup commands.
     assert!(idx.contains(&format!(
         "`claude mcp add --transport http botwhisper {base}/mcp`"
     )));
-    assert!(idx.contains(r#"-d '{"invite_url": "INVITE_URL", "display_name": "YOUR NAME"}'"#));
 
     // No mail was sent beyond the one pending sign-in, and the pending
     // address never shows up anywhere above.

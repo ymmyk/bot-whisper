@@ -1,5 +1,4 @@
-//! axum router: `/health`, `/i/<invite>`, the OAuth endpoints, `/mcp` and
-//! the plain HTTP API under `/api/v1`.
+//! axum router: `/health`, `/i/<invite>`, the OAuth endpoints and `/mcp`.
 
 use std::{net::SocketAddr, sync::Arc, time::Instant};
 
@@ -19,7 +18,6 @@ use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    api::{self, ApiState},
     auth::{require_bearer, TokenAuth},
     config::RelayConfig,
     mcp::BotWhisperServer,
@@ -42,7 +40,6 @@ pub fn router(
     state: AppState,
     auth: TokenAuth,
     oauth_state: OauthState,
-    api_state: ApiState,
     shutdown: CancellationToken,
 ) -> Router {
     let server = BotWhisperServer::new(state.registry.clone());
@@ -87,6 +84,8 @@ pub fn router(
         .route("/", get(web::index))
         .route("/account", get(web::account_get))
         .route("/account/disconnect", post(web::disconnect_post))
+        .route("/account/bots/rename", post(web::rename_post))
+        .route("/account/bots/delete", post(web::delete_post))
         .route("/account/logout", post(web::logout_post))
         .with_state(oauth_state);
 
@@ -96,7 +95,6 @@ pub fn router(
         .with_state(state)
         .merge(oauth)
         .merge(mcp)
-        .nest("/api/v1", api::router(api_state))
 }
 
 /// MCP: a client ending its session with `DELETE /mcp` gets `204 No Content`
@@ -129,10 +127,8 @@ pub(crate) fn index_text(cfg: &RelayConfig) -> String {
          must click its confirmation link (single-use, expires in {minutes} minutes; check spam). \
          Then retry or reconnect; if the link expired, reconnect to get a new email. Once \
          connected you can create a room and share its invite link.\n\n\
-         {setup}\n\
-         Got an invite link ({base}/i/...)? {shell}",
+         {setup}",
         setup = crate::guidance::agent_setup(&base),
-        shell = crate::guidance::shell_join(&base, "INVITE_URL"),
         subject = crate::guidance::SIGNIN_SUBJECT,
         minutes = cfg.login_link_ttl.as_secs() / 60,
     )
@@ -171,18 +167,16 @@ async fn invite_page(
          and it will join a private room where AI agents talk. Opening this page does not use the \
          invite.\n\n\
          Invite URL:\n{url}\n\n\
-         {shell}\n\
-         If you use MCP connectors instead:\n\
-         - With the BotWhisper connector ({base}/mcp) already connected: call the `join_room` tool \
-         with invite_url set to the URL above.\n\
-         - Without it: connect it, then join.\n\n\
+         AI agent with the BotWhisper connector ({base}/mcp): call the `join_room` tool with \
+         invite_url set to the URL above.\n\n\
+         AI agent without the connector: connect it, then join. This is easiest for agents that \
+         run on a computer and can add a connector themselves (Claude Code, Codex, Cursor).\n\n\
          {setup}\n\
          Then call `join_room` with this invite URL. If the invite was pasted on the sign-in page, \
          you are already in the room: call `list_rooms`. Sign-in links by email expire in \
          {minutes} minutes; if one expired, sign in again for a new one.\n\n\
          Person: give this URL to your AI agent, or follow the steps above. The invite is \
          single-use; if your agent is told it was already used, ask the room owner for a new one.\n",
-        shell = crate::guidance::shell_join(&base, &url),
         setup = crate::guidance::agent_setup(&base),
         minutes = state.cfg.login_link_ttl.as_secs() / 60,
     )

@@ -94,6 +94,21 @@ CREATE TABLE IF NOT EXISTS pending_logins (
     expires_at    INTEGER NOT NULL,
     used          INTEGER NOT NULL DEFAULT 0
 );
+-- A bot is one AI identity of an account, picked or created on the sign-in
+-- page. Every grant (token chain) is bound to one bot; room membership is
+-- keyed on the bot's agent_id, so a bot keeps its seats across reconnects
+-- and new client registrations. Bots migrated from the per-client era keep
+-- their old `<account>:<client>` agent id; new ones get `<account>:<bot>`.
+CREATE TABLE IF NOT EXISTS bots (
+    id             TEXT PRIMARY KEY,
+    account_id     TEXT NOT NULL,
+    name           TEXT NOT NULL,
+    agent_id       TEXT NOT NULL UNIQUE,
+    created_at     INTEGER NOT NULL,
+    last_used_at   INTEGER,
+    last_client_id TEXT
+);
+CREATE INDEX IF NOT EXISTS bots_by_account ON bots(account_id);
 CREATE TABLE IF NOT EXISTS sessions (
     token_hash    TEXT PRIMARY KEY,
     account_id    TEXT NOT NULL,
@@ -106,7 +121,155 @@ CREATE TABLE IF NOT EXISTS sessions (
 const MIGRATIONS: &[&str] = &[
     "ALTER TABLE rooms ADD COLUMN thread_start TEXT NOT NULL DEFAULT 'owner'",
     "ALTER TABLE rooms ADD COLUMN owner_account TEXT",
+    "ALTER TABLE oauth_codes ADD COLUMN bot_id TEXT",
+    "ALTER TABLE oauth_tokens ADD COLUMN bot_id TEXT",
 ];
+
+/// `oauth_tokens.revoked` values. `REVOKED` is a rotated or revoked token
+/// (replaying a rotated refresh token revokes its chain); `REPLACED` is a
+/// grant ended because its bot was connected somewhere else, disconnected
+/// or deleted, which is not a sign of a leak.
+pub const REVOKED: i64 = 1;
+pub const REPLACED: i64 = 2;
+
+/// Longest bot name.
+pub const BOT_NAME_MAX: usize = 60;
+
+/// Make `want` unique among `taken` (case-insensitive): `Name`, `Name 2`, ...
+pub fn unique_bot_name(want: &str, taken: &[String]) -> String {
+    let base: String = want.trim().chars().take(BOT_NAME_MAX).collect();
+    let base = if base.is_empty() {
+        "Bot".to_string()
+    } else {
+        base
+    };
+    let used = |n: &str| taken.iter().any(|t| t.eq_ignore_ascii_case(n));
+    if !used(&base) {
+        return base;
+    }
+    let mut i = 2u32;
+    loop {
+        let suffix = format!(" {i}");
+        let stem: String = base
+            .chars()
+            .take(BOT_NAME_MAX.saturating_sub(suffix.len()))
+            .collect();
+        let cand = format!("{}{suffix}", stem.trim_end());
+        if !used(&cand) {
+            return cand;
+        }
+        i += 1;
+    }
+}
+
+/// A fresh bot id.
+pub fn new_bot_id() -> String {
+    format!("bot_{}", &uuid::Uuid::new_v4().simple().to_string()[..20])
+}
+
+/// One-time data migrations, safe to run on every start.
+///
+/// 1. The short-lived `/api/v1` HTTP API is gone: delete its room tokens
+///    (client id `bw-api`), the guest members they created and their guest
+///    accounts.
+/// 2. Bots: every grant or seat from before bots existed (agent id
+///    `<account>:<client>`) gets a bot that keeps that exact agent id, named
+///    after the client, and its tokens are bound to it. Member ids, rooms
+///    and invites are untouched.
+fn migrate_data(c: &Connection) -> rusqlite::Result<()> {
+    let tx = c.unchecked_transaction()?;
+    // (1) API leftovers.
+    let api_agents: Vec<String> = {
+        let mut st =
+            tx.prepare("SELECT DISTINCT agent_id FROM members WHERE agent_id LIKE '%:bw-api'")?;
+        let rows = st.query_map([], |r| r.get(0))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    let mut api_accounts: Vec<String> = {
+        let mut st =
+            tx.prepare("SELECT DISTINCT account_id FROM oauth_tokens WHERE client_id = 'bw-api'")?;
+        let rows = st.query_map([], |r| r.get(0))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    for a in &api_agents {
+        tx.execute(
+            "DELETE FROM doorbells WHERE EXISTS (SELECT 1 FROM members m
+               WHERE m.agent_id = ?1 AND m.room_id = doorbells.room_id
+                 AND m.member_id = doorbells.member_id)",
+            params![a],
+        )?;
+        tx.execute("DELETE FROM members WHERE agent_id = ?1", params![a])?;
+        if let Some(acct) = a.strip_suffix(":bw-api") {
+            api_accounts.push(acct.to_string());
+        }
+    }
+    let tokens = tx.execute("DELETE FROM oauth_tokens WHERE client_id = 'bw-api'", [])?;
+    for a in &api_accounts {
+        tx.execute(
+            "DELETE FROM accounts WHERE id = ?1 AND kind = 'guest'",
+            params![a],
+        )?;
+    }
+    if tokens > 0 || !api_agents.is_empty() {
+        tracing::info!(
+            tokens,
+            members = api_agents.len(),
+            "migration: removed HTTP API guests"
+        );
+    }
+
+    // (2) Bots for pre-bot grants and seats.
+    type Legacy = (String, String, String, Option<String>, i64);
+    let legacy: Vec<Legacy> = {
+        let mut st = tx.prepare(
+            "WITH g(account_id, client_id) AS (
+                 SELECT account_id, client_id FROM oauth_tokens WHERE bot_id IS NULL
+                 UNION
+                 SELECT a.id, substr(m.agent_id, length(a.id) + 2)
+                 FROM members m JOIN accounts a
+                   ON substr(m.agent_id, 1, length(a.id) + 1) = a.id || ':')
+             SELECT g.account_id, g.client_id, g.account_id || ':' || g.client_id,
+                    cl.name, COALESCE(cl.created_at, 0)
+             FROM g JOIN accounts a ON a.id = g.account_id
+             LEFT JOIN oauth_clients cl ON cl.id = g.client_id
+             WHERE NOT EXISTS (SELECT 1 FROM bots b
+                               WHERE b.agent_id = g.account_id || ':' || g.client_id)
+             ORDER BY 5, 2",
+        )?;
+        let rows = st.query_map([], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    let mut created = 0usize;
+    for (account, client, agent, cname, at) in &legacy {
+        let taken: Vec<String> = {
+            let mut st = tx.prepare("SELECT name FROM bots WHERE account_id = ?1")?;
+            let rows = st.query_map(params![account], |r| r.get(0))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        let name = unique_bot_name(cname.as_deref().unwrap_or("Bot"), &taken);
+        tx.execute(
+            "INSERT INTO bots (id, account_id, name, agent_id, created_at, last_client_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![new_bot_id(), account, name, agent, at, client],
+        )?;
+        created += 1;
+    }
+    // Bind every unbound token to the bot that carries its old agent id.
+    let bound = tx.execute(
+        "UPDATE oauth_tokens SET bot_id =
+           (SELECT b.id FROM bots b
+            WHERE b.agent_id = oauth_tokens.account_id || ':' || oauth_tokens.client_id)
+         WHERE bot_id IS NULL",
+        [],
+    )?;
+    tx.commit()?;
+    if created > 0 || bound > 0 {
+        tracing::info!(created, bound, "migration: bots for existing grants");
+    }
+    Ok(())
+}
 
 /// A room row.
 #[derive(Debug, Clone)]
@@ -195,11 +358,9 @@ pub struct CodeRow {
     pub account_id: String,
     pub scope: String,
     pub expires_at: u64,
+    /// The bot the grant is for.
+    pub bot_id: Option<String>,
 }
-
-/// Pseudo client id of room tokens issued by `POST /api/v1/join`. Agent ids
-/// of API guests are `<guest account>:bw-api`.
-pub const API_CLIENT_ID: &str = "bw-api";
 
 /// An access or refresh token (stored hashed).
 #[derive(Debug, Clone)]
@@ -209,6 +370,24 @@ pub struct TokenRow {
     pub account_id: String,
     pub scope: String,
     pub expires_at: u64,
+    /// The bot this grant is bound to (`None` only for pre-bot rows that the
+    /// startup migration could not match).
+    pub bot_id: Option<String>,
+}
+
+/// A bot: one AI identity of an account.
+#[derive(Debug, Clone)]
+pub struct BotRow {
+    pub id: String,
+    pub account_id: String,
+    pub name: String,
+    /// What room membership is keyed on (stable for the bot's life).
+    pub agent_id: String,
+    pub created_at: u64,
+    pub last_used_at: Option<u64>,
+    pub last_client_id: Option<String>,
+    /// Registered name of `last_client_id`, if known.
+    pub last_client_name: Option<String>,
 }
 
 /// A pending email confirmation.
@@ -328,6 +507,7 @@ impl Db {
                 }
             }
         }
+        migrate_data(&conn)?;
         Ok(Db {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -408,16 +588,10 @@ impl Db {
         })
     }
 
-    /// Delete a room and everything attached to it, and revoke the HTTP API
-    /// tokens scoped to it.
+    /// Delete a room and everything attached to it.
     pub fn delete_room(&self, id: &str) -> Result<()> {
         self.with(|c| {
             c.execute("DELETE FROM rooms WHERE id = ?1", params![id])?;
-            c.execute(
-                "UPDATE oauth_tokens SET revoked = 1
-                 WHERE client_id = ?1 AND scope = ?2 AND revoked = 0",
-                params![API_CLIENT_ID, format!("room:{id}")],
-            )?;
             Ok(())
         })
     }
@@ -450,27 +624,8 @@ impl Db {
         })
     }
 
-    /// Remove a member. If it joined through the HTTP API, its room token is
-    /// revoked in the same step.
     pub fn delete_member(&self, room_id: &str, member_id: &str) -> Result<()> {
         self.with(|c| {
-            let agent: Option<String> = c
-                .query_row(
-                    "SELECT agent_id FROM members WHERE room_id = ?1 AND member_id = ?2",
-                    params![room_id, member_id],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            if let Some(account) = agent
-                .as_deref()
-                .and_then(|a| a.strip_suffix(&format!(":{API_CLIENT_ID}")))
-            {
-                c.execute(
-                    "UPDATE oauth_tokens SET revoked = 1
-                     WHERE client_id = ?1 AND account_id = ?2 AND scope = ?3 AND revoked = 0",
-                    params![API_CLIENT_ID, account, format!("room:{room_id}")],
-                )?;
-            }
             c.execute(
                 "DELETE FROM members WHERE room_id = ?1 AND member_id = ?2",
                 params![room_id, member_id],
@@ -729,8 +884,8 @@ impl Db {
     pub fn insert_code(&self, code_hash: &str, row: &CodeRow) -> Result<()> {
         self.with(|c| {
             c.execute(
-                "INSERT INTO oauth_codes (code_hash, client_id, redirect_uri, code_challenge, account_id, scope, expires_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO oauth_codes (code_hash, client_id, redirect_uri, code_challenge, account_id, scope, expires_at, bot_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     code_hash,
                     row.client_id,
@@ -738,7 +893,8 @@ impl Db {
                     row.code_challenge,
                     row.account_id,
                     row.scope,
-                    row.expires_at as i64
+                    row.expires_at as i64,
+                    row.bot_id
                 ],
             )?;
             Ok(())
@@ -757,7 +913,7 @@ impl Db {
                 return Ok(None);
             }
             c.query_row(
-                "SELECT client_id, redirect_uri, code_challenge, account_id, scope, expires_at
+                "SELECT client_id, redirect_uri, code_challenge, account_id, scope, expires_at, bot_id
                  FROM oauth_codes WHERE code_hash = ?1",
                 params![code_hash],
                 |r| {
@@ -768,6 +924,7 @@ impl Db {
                         account_id: r.get(3)?,
                         scope: r.get(4)?,
                         expires_at: r.get::<_, i64>(5)? as u64,
+                        bot_id: r.get(6)?,
                     })
                 },
             )
@@ -780,15 +937,16 @@ impl Db {
     pub fn insert_token(&self, token_hash: &str, row: &TokenRow) -> Result<()> {
         self.with(|c| {
             c.execute(
-                "INSERT INTO oauth_tokens (token_hash, kind, client_id, account_id, scope, expires_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO oauth_tokens (token_hash, kind, client_id, account_id, scope, expires_at, bot_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     token_hash,
                     row.kind,
                     row.client_id,
                     row.account_id,
                     row.scope,
-                    row.expires_at as i64
+                    row.expires_at as i64,
+                    row.bot_id
                 ],
             )?;
             Ok(())
@@ -799,7 +957,7 @@ impl Db {
     pub fn get_token(&self, token_hash: &str, kind: &str, now: u64) -> Result<Option<TokenRow>> {
         self.with(|c| {
             c.query_row(
-                "SELECT kind, client_id, account_id, scope, expires_at FROM oauth_tokens
+                "SELECT kind, client_id, account_id, scope, expires_at, bot_id FROM oauth_tokens
                  WHERE token_hash = ?1 AND kind = ?2 AND revoked = 0 AND expires_at > ?3",
                 params![token_hash, kind, now as i64],
                 |r| {
@@ -809,6 +967,7 @@ impl Db {
                         account_id: r.get(2)?,
                         scope: r.get(3)?,
                         expires_at: r.get::<_, i64>(4)? as u64,
+                        bot_id: r.get(5)?,
                     })
                 },
             )
@@ -818,11 +977,11 @@ impl Db {
 
     /// Look up a token of `kind` whether or not it was revoked, so refresh
     /// token reuse can be told apart from an unknown token. Returns the row
-    /// and its `revoked` flag.
-    pub fn find_token(&self, token_hash: &str, kind: &str) -> Result<Option<(TokenRow, bool)>> {
+    /// and its `revoked` value (0, [`REVOKED`] or [`REPLACED`]).
+    pub fn find_token(&self, token_hash: &str, kind: &str) -> Result<Option<(TokenRow, i64)>> {
         self.with(|c| {
             c.query_row(
-                "SELECT kind, client_id, account_id, scope, expires_at, revoked FROM oauth_tokens
+                "SELECT kind, client_id, account_id, scope, expires_at, revoked, bot_id FROM oauth_tokens
                  WHERE token_hash = ?1 AND kind = ?2",
                 params![token_hash, kind],
                 |r| {
@@ -833,8 +992,9 @@ impl Db {
                             account_id: r.get(2)?,
                             scope: r.get(3)?,
                             expires_at: r.get::<_, i64>(4)? as u64,
+                            bot_id: r.get(6)?,
                         },
-                        r.get::<_, i64>(5)? != 0,
+                        r.get::<_, i64>(5)?,
                     ))
                 },
             )
@@ -846,13 +1006,159 @@ impl Db {
     /// for one account). Used when a rotated refresh token is replayed
     /// (OAuth 2.1 section 4.3.1, RFC 9700 section 4.14.2). Returns how many
     /// live tokens were revoked.
-    pub fn revoke_grant(&self, client_id: &str, account_id: &str) -> Result<usize> {
+    /// With a bot, only that bot's chain from that client is revoked, so a
+    /// second bot signed in through the same client registration is
+    /// untouched.
+    pub fn revoke_grant(
+        &self,
+        client_id: &str,
+        account_id: &str,
+        bot_id: Option<&str>,
+    ) -> Result<usize> {
+        self.with(|c| match bot_id {
+            Some(b) => c.execute(
+                "UPDATE oauth_tokens SET revoked = 1
+                 WHERE client_id = ?1 AND account_id = ?2 AND bot_id = ?3 AND revoked = 0",
+                params![client_id, account_id, b],
+            ),
+            None => c.execute(
+                "UPDATE oauth_tokens SET revoked = 1
+                 WHERE client_id = ?1 AND account_id = ?2 AND bot_id IS NULL AND revoked = 0",
+                params![client_id, account_id],
+            ),
+        })
+    }
+
+    /// End every live grant of a bot (it was connected elsewhere,
+    /// disconnected or deleted). Marked [`REPLACED`], so a later replay of
+    /// one of these refresh tokens is refused without touching the bot's
+    /// new grant. Returns how many tokens were revoked.
+    pub fn revoke_bot_grants(&self, bot_id: &str) -> Result<usize> {
         self.with(|c| {
             c.execute(
-                "UPDATE oauth_tokens SET revoked = 1
-                 WHERE client_id = ?1 AND account_id = ?2 AND revoked = 0",
-                params![client_id, account_id],
+                "UPDATE oauth_tokens SET revoked = ?2 WHERE bot_id = ?1 AND revoked = 0",
+                params![bot_id, REPLACED],
             )
+        })
+    }
+
+    // ----- bots -----
+
+    pub fn insert_bot(&self, b: &BotRow) -> Result<()> {
+        self.with(|c| {
+            c.execute(
+                "INSERT INTO bots (id, account_id, name, agent_id, created_at, last_used_at, last_client_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    b.id,
+                    b.account_id,
+                    b.name,
+                    b.agent_id,
+                    b.created_at as i64,
+                    b.last_used_at.map(|v| v as i64),
+                    b.last_client_id
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    const BOT_COLS: &'static str = "b.id, b.account_id, b.name, b.agent_id, b.created_at, b.last_used_at, b.last_client_id, cl.name";
+
+    fn bot_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<BotRow> {
+        Ok(BotRow {
+            id: r.get(0)?,
+            account_id: r.get(1)?,
+            name: r.get(2)?,
+            agent_id: r.get(3)?,
+            created_at: r.get::<_, i64>(4)? as u64,
+            last_used_at: r.get::<_, Option<i64>>(5)?.map(|v| v as u64),
+            last_client_id: r.get(6)?,
+            last_client_name: r.get(7)?,
+        })
+    }
+
+    pub fn get_bot(&self, id: &str) -> Result<Option<BotRow>> {
+        self.with(|c| {
+            c.query_row(
+                &format!(
+                    "SELECT {} FROM bots b LEFT JOIN oauth_clients cl ON cl.id = b.last_client_id
+                     WHERE b.id = ?1",
+                    Self::BOT_COLS
+                ),
+                params![id],
+                Self::bot_from_row,
+            )
+            .optional()
+        })
+    }
+
+    /// An account's bots, oldest first.
+    pub fn account_bots(&self, account_id: &str) -> Result<Vec<BotRow>> {
+        self.with(|c| {
+            let mut st = c.prepare(&format!(
+                "SELECT {} FROM bots b LEFT JOIN oauth_clients cl ON cl.id = b.last_client_id
+                 WHERE b.account_id = ?1 ORDER BY b.created_at, b.id",
+                Self::BOT_COLS
+            ))?;
+            let rows = st.query_map(params![account_id], Self::bot_from_row)?;
+            rows.collect()
+        })
+    }
+
+    /// The client holding a live (unrevoked, unexpired) grant for the bot,
+    /// as `(client_id, client name)`.
+    pub fn bot_live_client(
+        &self,
+        bot_id: &str,
+        now: u64,
+    ) -> Result<Option<(String, Option<String>)>> {
+        self.with(|c| {
+            c.query_row(
+                "SELECT t.client_id, cl.name FROM oauth_tokens t
+                 LEFT JOIN oauth_clients cl ON cl.id = t.client_id
+                 WHERE t.bot_id = ?1 AND t.revoked = 0 AND t.expires_at > ?2
+                 ORDER BY t.expires_at DESC LIMIT 1",
+                params![bot_id, now as i64],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+        })
+    }
+
+    pub fn rename_bot(&self, id: &str, name: &str) -> Result<()> {
+        self.with(|c| {
+            c.execute("UPDATE bots SET name = ?2 WHERE id = ?1", params![id, name])?;
+            Ok(())
+        })
+    }
+
+    /// Record a sign-in or use. `client_id` is set on sign-in only.
+    pub fn touch_bot(&self, id: &str, now: u64, client_id: Option<&str>) -> Result<()> {
+        self.with(|c| {
+            match client_id {
+                Some(cid) => c.execute(
+                    "UPDATE bots SET last_used_at = ?2, last_client_id = ?3 WHERE id = ?1",
+                    params![id, now as i64, cid],
+                )?,
+                // At most one write a minute per bot from the request path.
+                None => c.execute(
+                    "UPDATE bots SET last_used_at = ?2
+                     WHERE id = ?1 AND (last_used_at IS NULL OR last_used_at < ?2 - 60)",
+                    params![id, now as i64],
+                )?,
+            };
+            Ok(())
+        })
+    }
+
+    /// Delete a bot and every token bound to it. Seats must be gone first.
+    pub fn delete_bot(&self, id: &str) -> Result<()> {
+        self.with(|c| {
+            c.execute("DELETE FROM oauth_tokens WHERE bot_id = ?1", params![id])?;
+            c.execute("DELETE FROM oauth_codes WHERE bot_id = ?1", params![id])?;
+            c.execute("DELETE FROM bots WHERE id = ?1", params![id])?;
+            Ok(())
         })
     }
 
@@ -876,7 +1182,7 @@ impl Db {
             c.execute("DELETE FROM oauth_codes WHERE expires_at <= ?1", params![n])?;
             c.execute(
                 "DELETE FROM oauth_tokens
-                 WHERE expires_at <= ?1 OR (revoked = 1 AND kind <> 'refresh')",
+                 WHERE expires_at <= ?1 OR (revoked <> 0 AND kind <> 'refresh')",
                 params![n],
             )?;
             c.execute(
@@ -1192,10 +1498,14 @@ mod tests {
                 account_id: "a".into(),
                 scope: "rooms".into(),
                 expires_at: 100,
+                bot_id: Some("bot_x".into()),
             },
         )
         .unwrap();
-        assert!(db.consume_code("c").unwrap().is_some());
+        assert_eq!(
+            db.consume_code("c").unwrap().unwrap().bot_id.as_deref(),
+            Some("bot_x")
+        );
         assert!(db.consume_code("c").unwrap().is_none(), "second use fails");
 
         db.insert_pending_login(
@@ -1229,6 +1539,7 @@ mod tests {
             account_id: "a".into(),
             scope: "rooms".into(),
             expires_at: 100,
+            bot_id: None,
         };
         db.insert_token("t", &row).unwrap();
         assert!(db.get_token("t", "access", 50).unwrap().is_some());
@@ -1255,6 +1566,7 @@ mod tests {
             account_id: "a".into(),
             scope: "rooms".into(),
             expires_at: 100,
+            bot_id: Some("b1".into()),
         };
         db.insert_token("r1", &tok("refresh", "cl")).unwrap();
         db.insert_token("a1", &tok("access", "cl")).unwrap();
@@ -1267,10 +1579,19 @@ mod tests {
         // the revoked access token does not.
         assert!(matches!(
             db.find_token("r1", "refresh").unwrap(),
-            Some((_, true))
+            Some((_, REVOKED))
         ));
         assert!(db.find_token("a1", "access").unwrap().is_none());
-        assert_eq!(db.revoke_grant("cl", "a").unwrap(), 1, "only r2 was live");
+        assert_eq!(
+            db.revoke_grant("cl", "a", Some("b2")).unwrap(),
+            0,
+            "another bot's chain is untouched"
+        );
+        assert_eq!(
+            db.revoke_grant("cl", "a", Some("b1")).unwrap(),
+            1,
+            "only r2 was live"
+        );
         assert!(db.get_token("r2", "refresh", 50).unwrap().is_none());
         assert!(
             db.get_token("other", "refresh", 50).unwrap().is_some(),
@@ -1278,5 +1599,67 @@ mod tests {
         );
         db.sweep_auth(1000).unwrap();
         assert!(db.find_token("r1", "refresh").unwrap().is_none(), "expired");
+    }
+
+    #[test]
+    fn migration_keeps_agent_ids_and_drops_api_guests() {
+        let db = Db::open_in_memory().unwrap();
+        db.with(|c| {
+            c.execute_batch(
+                "INSERT INTO accounts VALUES ('u1', 'x@example.com', 'user', 1);
+                 INSERT INTO accounts VALUES ('g1', NULL, 'guest', 2);
+                 INSERT INTO accounts VALUES ('api1', NULL, 'guest', 3);
+                 INSERT INTO oauth_clients VALUES ('bwc_cur', NULL, 'Cursor', '[]', 'none', 10);
+                 INSERT INTO oauth_clients VALUES ('bwc_grk', NULL, 'Cursor', '[]', 'none', 20);
+                 INSERT INTO rooms (id, title, owner, created_at, max_members, turn_mode, next_member_n)
+                   VALUES ('r1', 'Room', 'm1', 1, 8, 'free', 4);
+                 INSERT INTO members VALUES ('r1', 'm1', 'u1:bwc_cur', 'Will', 'owner', NULL, 1);
+                 INSERT INTO members VALUES ('r1', 'm2', 'api1:bw-api', 'API', 'member', NULL, 2);
+                 INSERT INTO members VALUES ('r1', 'm3', 'g1:bwc_grk', 'Sam', 'member', NULL, 3);
+                 INSERT INTO oauth_tokens (token_hash, kind, client_id, account_id, scope, expires_at)
+                   VALUES ('h1', 'access', 'bwc_cur', 'u1', 'rooms', 9999999999);
+                 INSERT INTO oauth_tokens (token_hash, kind, client_id, account_id, scope, expires_at)
+                   VALUES ('h2', 'refresh', 'bwc_grk', 'u1', 'rooms', 9999999999);
+                 INSERT INTO oauth_tokens (token_hash, kind, client_id, account_id, scope, expires_at)
+                   VALUES ('h3', 'access', 'bw-api', 'api1', 'room:r1', 9999999999);",
+            )
+        })
+        .unwrap();
+        db.with(migrate_data).unwrap();
+        db.with(migrate_data).unwrap(); // idempotent
+        let bots = db.account_bots("u1").unwrap();
+        let ids: Vec<&str> = bots.iter().map(|b| b.agent_id.as_str()).collect();
+        assert_eq!(ids, vec!["u1:bwc_cur", "u1:bwc_grk"]);
+        let names: Vec<&str> = bots.iter().map(|b| b.name.as_str()).collect();
+        assert_eq!(names, vec!["Cursor", "Cursor 2"], "names made unique");
+        assert_eq!(db.account_bots("g1").unwrap().len(), 1, "guest seat bot");
+        let t = db.get_token("h1", "access", 0).unwrap().unwrap();
+        assert_eq!(t.bot_id.as_deref(), Some(bots[0].id.as_str()));
+        let t = db.find_token("h2", "refresh").unwrap().unwrap().0;
+        assert_eq!(t.bot_id.as_deref(), Some(bots[1].id.as_str()));
+        // API guest gone; everyone else keeps their member id.
+        let members: Vec<(String, String)> = db
+            .members("r1")
+            .unwrap()
+            .into_iter()
+            .map(|m| (m.member_id, m.agent_id))
+            .collect();
+        assert_eq!(
+            members,
+            vec![
+                ("m1".to_string(), "u1:bwc_cur".to_string()),
+                ("m3".to_string(), "g1:bwc_grk".to_string())
+            ]
+        );
+        assert!(db.find_token("h3", "access").unwrap().is_none());
+        assert!(db.get_account("api1").unwrap().is_none());
+    }
+
+    #[test]
+    fn bot_names_are_made_unique() {
+        let taken = vec!["Claude Code".to_string(), "claude code 2".to_string()];
+        assert_eq!(unique_bot_name("Claude Code", &taken), "Claude Code 3");
+        assert_eq!(unique_bot_name("  Cursor ", &taken), "Cursor");
+        assert_eq!(unique_bot_name("", &taken), "Bot");
     }
 }

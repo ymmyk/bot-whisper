@@ -43,6 +43,9 @@ pub struct AgentId {
     /// Account the agent belongs to (rate limits). `None` for dev tokens.
     pub account: Option<String>,
     pub scope: Scope,
+    /// The bot's name, the default display name in rooms. `None` for dev
+    /// tokens.
+    pub name: Option<String>,
 }
 
 impl AgentId {
@@ -53,19 +56,27 @@ impl AgentId {
             id: hex::encode(&digest[..16]),
             account: None,
             scope: Scope::Rooms,
+            name: None,
         }
     }
 
-    /// Agent id for an OAuth principal.
-    pub fn from_oauth(account_id: &str, client_id: &str, scope: &str) -> Self {
+    /// Pre-bot agent id for an OAuth principal (`<account>:<client>`). Bots
+    /// migrated from that era keep it; guests still get it.
+    pub fn legacy_oauth_id(account_id: &str, client_id: &str) -> String {
+        format!("{account_id}:{client_id}")
+    }
+
+    /// The agent for a bot, with the token's scope.
+    pub fn for_bot(bot: &crate::db::BotRow, scope: &str) -> Self {
         let scope = match scope.strip_prefix("room:") {
             Some(room) => Scope::Room(room.to_string()),
             None => Scope::Rooms,
         };
         AgentId {
-            id: format!("{account_id}:{client_id}"),
-            account: Some(account_id.to_string()),
+            id: bot.agent_id.clone(),
+            account: Some(bot.account_id.clone()),
             scope,
+            name: Some(bot.name.clone()),
         }
     }
 
@@ -108,15 +119,7 @@ impl TokenAuth {
             db,
             resource_metadata: format!("{public_url}/.well-known/oauth-protected-resource").into(),
             signin_help: crate::guidance::default_confirm_email().into(),
-            setup: format!(
-                "{}- No connector, but you can run shell commands and have an invite link? Join \
-                 over plain HTTP instead: POST the invite as JSON to {}/api/v1/join (steps on \
-                 the invite page and in {}/llms.txt).\n",
-                crate::guidance::agent_setup(public_url),
-                public_url.trim_end_matches('/'),
-                public_url.trim_end_matches('/'),
-            )
-            .into(),
+            setup: crate::guidance::agent_setup(public_url).into(),
         }
     }
 
@@ -141,16 +144,16 @@ impl TokenAuth {
         if self.dev_hashes.contains(&hash) {
             return Some(AgentId::from_token(token));
         }
-        let row = self
-            .db
-            .get_token(&hash, "access", crate::doorbell::now_unix())
-            .ok()
-            .flatten()?;
-        Some(AgentId::from_oauth(
-            &row.account_id,
-            &row.client_id,
-            &row.scope,
-        ))
+        let now = crate::doorbell::now_unix();
+        let row = self.db.get_token(&hash, "access", now).ok().flatten()?;
+        // Every grant is bound to a bot; a token whose bot was deleted is
+        // dead.
+        let bot = self.db.get_bot(row.bot_id.as_deref()?).ok().flatten()?;
+        if bot.account_id != row.account_id {
+            return None;
+        }
+        let _ = self.db.touch_bot(&bot.id, now, None);
+        Some(AgentId::for_bot(&bot, &row.scope))
     }
 }
 
@@ -235,12 +238,26 @@ mod tests {
                 account_id: "acct".into(),
                 scope: "room:r1".into(),
                 expires_at: now + 60,
+                bot_id: Some("bot_1".into()),
             },
         )
         .unwrap();
-        let auth = TokenAuth::new(&[], db, "http://x");
+        let auth = TokenAuth::new(&[], db.clone(), "http://x");
+        assert!(auth.authenticate("tok").is_none(), "no such bot yet");
+        db.insert_bot(&crate::db::BotRow {
+            id: "bot_1".into(),
+            account_id: "acct".into(),
+            name: "Sam".into(),
+            agent_id: "acct:cl".into(),
+            created_at: now,
+            last_used_at: None,
+            last_client_id: None,
+            last_client_name: None,
+        })
+        .unwrap();
         let a = auth.authenticate("tok").unwrap();
         assert_eq!(a.id, "acct:cl");
+        assert_eq!(a.name.as_deref(), Some("Sam"));
         assert_eq!(a.room_scope(), Some("r1"));
         assert_eq!(a.limit_key(), "acct");
         assert!(auth.authenticate("other").is_none());

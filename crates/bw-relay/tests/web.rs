@@ -5,7 +5,7 @@ mod common;
 
 use bw_relay::{
     auth::sha256_hex,
-    db::{ClientRow, PendingLogin, TokenRow},
+    db::{BotRow, ClientRow, PendingLogin, TokenRow},
     doorbell::now_unix,
 };
 use common::*;
@@ -71,9 +71,23 @@ async fn web_sign_up(relay: &TestRelay, http: &Client, email: &str) -> String {
         .id
 }
 
-/// A connected bot for `account`: a registered client plus live tokens.
+/// A connected bot for `account`: a registered client, a bot named after it
+/// (id `bot_<client>`, agent id `<account>:<client>`) and live tokens.
 fn connect_bot(relay: &TestRelay, account: &str, client_id: &str, name: &str) -> String {
     let now = now_unix();
+    relay
+        .db
+        .insert_bot(&BotRow {
+            id: format!("bot_{client_id}"),
+            account_id: account.into(),
+            name: name.into(),
+            agent_id: format!("{account}:{client_id}"),
+            created_at: now,
+            last_used_at: None,
+            last_client_id: Some(client_id.into()),
+            last_client_name: None,
+        })
+        .unwrap();
     relay
         .db
         .insert_client(&ClientRow {
@@ -100,6 +114,7 @@ fn connect_bot(relay: &TestRelay, account: &str, client_id: &str, name: &str) ->
                     account_id: account.into(),
                     scope: "rooms".into(),
                     expires_at: now + ttl,
+                    bot_id: Some(format!("bot_{client_id}")),
                 },
             )
             .unwrap();
@@ -355,10 +370,11 @@ async fn account_page_shows_only_own_data_and_disconnect_needs_csrf() {
         .await
         .unwrap();
     assert!(page.contains("alice@example.com") && page.contains("Alice Claude"));
-    assert!(page.contains("bwc_alice1") && page.contains(&format!("{alice_id}:bwc_alice1")));
+    assert!(page.contains(&format!("{alice_id}:bwc_alice1")));
+    assert!(page.contains("Connected to <strong>Alice Claude</strong>"));
     assert!(page.contains("Alice room") && page.contains(&room_id));
     assert!(page.contains("you own it") && page.contains("for Sam") && page.contains("unused"));
-    assert!(page.contains("Refresh token expires"));
+    assert!(page.contains("Rename") && page.contains("Delete"));
     for other in [
         "bob@example.com",
         "Bob ChatGPT",
@@ -380,7 +396,7 @@ async fn account_page_shows_only_own_data_and_disconnect_needs_csrf() {
         .post(format!("{base}/account/disconnect"))
         .form(&[
             ("csrf", "bad"),
-            ("client_id", "bwc_alice1"),
+            ("bot_id", "bot_bwc_alice1"),
             ("confirm", "yes"),
         ])
         .send()
@@ -400,7 +416,7 @@ async fn account_page_shows_only_own_data_and_disconnect_needs_csrf() {
         .post(format!("{base}/account/disconnect"))
         .form(&[
             ("csrf", bob_csrf.as_str()),
-            ("client_id", "bwc_alice1"),
+            ("bot_id", "bot_bwc_alice1"),
             ("confirm", "yes"),
         ])
         .send()
@@ -412,7 +428,7 @@ async fn account_page_shows_only_own_data_and_disconnect_needs_csrf() {
     // First POST only asks to confirm; nothing is revoked yet.
     let r = alice
         .post(format!("{base}/account/disconnect"))
-        .form(&[("csrf", csrf.as_str()), ("client_id", "bwc_alice1")])
+        .form(&[("csrf", csrf.as_str()), ("bot_id", "bot_bwc_alice1")])
         .send()
         .await
         .unwrap();
@@ -428,7 +444,7 @@ async fn account_page_shows_only_own_data_and_disconnect_needs_csrf() {
         .post(format!("{base}/account/disconnect"))
         .form(&[
             ("csrf", csrf.as_str()),
-            ("client_id", "bwc_alice1"),
+            ("bot_id", "bot_bwc_alice1"),
             ("confirm", "yes"),
         ])
         .send()
@@ -457,7 +473,86 @@ async fn account_page_shows_only_own_data_and_disconnect_needs_csrf() {
         .text()
         .await
         .unwrap();
-    assert!(page.contains("No connected bots"));
+    assert!(page.contains("Not connected (last connected with Alice Claude)"));
+    assert!(
+        !page.contains("/account/disconnect"),
+        "nothing to disconnect"
+    );
+
+    // Rename: CSRF needed, names stay unique per account, Bob can't.
+    let csrf = hidden(&page, "csrf");
+    let rename = |c: &Client, csrf: &str, bot: &str, name: &str| {
+        c.post(format!("{base}/account/bots/rename")).form(&[
+            ("csrf", csrf.to_string()),
+            ("bot_id", bot.to_string()),
+            ("name", name.to_string()),
+        ])
+    };
+    let r = rename(&alice, "bad", "bot_bwc_alice1", "X")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::FORBIDDEN);
+    let r = rename(&bob, &bob_csrf, "bot_bwc_alice1", "X")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::NOT_FOUND);
+    let r = rename(&alice, &csrf, "bot_bwc_alice1", "  Alice's   Claude ")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        relay.db.get_bot("bot_bwc_alice1").unwrap().unwrap().name,
+        "Alice's Claude"
+    );
+    connect_bot(&relay, &alice_id, "bwc_alice2", "Alice Cursor");
+    let r = rename(&alice, &csrf, "bot_bwc_alice2", "alice's claude")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::CONFLICT);
+
+    // Delete: a bot in no room goes right away; one in a room asks first,
+    // then leaves (its owned room closes).
+    let delete = |bot: &str, confirm: bool| {
+        let mut f = vec![("csrf", csrf.clone()), ("bot_id", bot.to_string())];
+        if confirm {
+            f.push(("confirm", "yes".into()));
+        }
+        alice.post(format!("{base}/account/bots/delete")).form(&f)
+    };
+    let r = delete("bot_bwc_alice2", false).send().await.unwrap();
+    assert_eq!(r.status(), StatusCode::SEE_OTHER);
+    assert!(relay.db.get_bot("bot_bwc_alice2").unwrap().is_none());
+    let r = delete("bot_bwc_alice1", false).send().await.unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let body = r.text().await.unwrap();
+    assert!(
+        body.contains("is in 1 room") && body.contains("the room closes"),
+        "{body}"
+    );
+    assert_eq!(
+        relay
+            .db
+            .rooms_for_agent(&format!("{alice_id}:bwc_alice1"))
+            .unwrap()
+            .len(),
+        1
+    );
+    let r = delete("bot_bwc_alice1", true).send().await.unwrap();
+    assert_eq!(r.status(), StatusCode::SEE_OTHER);
+    assert!(relay.db.get_bot("bot_bwc_alice1").unwrap().is_none());
+    assert!(relay
+        .db
+        .rooms_for_agent(&format!("{alice_id}:bwc_alice1"))
+        .unwrap()
+        .is_empty());
+    assert!(
+        relay.db.get_room(&room_id).unwrap().is_none(),
+        "owned room closed"
+    );
     b.close().await;
     relay.shutdown().await;
 }

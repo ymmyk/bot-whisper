@@ -9,9 +9,11 @@
 //! connector sign-in still finishes by redirecting to the MCP client with
 //! its authorization code, unchanged.
 //!
-//! `/account` is read-only and shows what the relay stores about the
-//! signed-in account and nothing else. Its one write is "Disconnect", which
-//! revokes one bot's grant chain. Every form on these pages carries a CSRF
+//! `/account` shows what the relay stores about the signed-in account and
+//! nothing else, and manages its bots: Rename, Disconnect (ends the bot's
+//! live grant; it keeps its seats and can reconnect by being picked on the
+//! next sign-in) and Delete (only for a bot in no room, or after a confirm
+//! that removes it from its rooms). Every form on these pages carries a CSRF
 //! token: the signup form a double-submit cookie, the account forms a value
 //! derived from the session secret. No token value or hash is ever shown.
 
@@ -26,13 +28,13 @@ use serde::Deserialize;
 
 use crate::{
     auth::sha256_hex,
-    db::AccountRow,
+    db::{unique_bot_name, AccountRow, AccountSeat, BotRow},
     doorbell::now_unix,
     oauth::{
-        check_email_page, clear_session_cookies, client_ip, constant_time_eq, cookie_value,
-        current_account, error_page, esc, no_store, page, random_token, send_signin_email,
-        signin_failure_page, OauthState, SigninError, OPERATOR_NOTICE, RATE_LIMITED_MSG,
-        SESSION_COOKIE, WEB_SIGNUP,
+        check_email_page, clean_bot_name, clear_session_cookies, client_ip, cookie_value,
+        csrf_from_headers, csrf_ok, current_account, error_page, esc, no_store, page, random_token,
+        send_signin_email, signin_failure_page, OauthState, SigninError, OPERATOR_NOTICE,
+        RATE_LIMITED_MSG, SESSION_COOKIE, WEB_SIGNUP,
     },
 };
 
@@ -61,15 +63,7 @@ pub fn fmt_utc(secs: u64) -> String {
 
 /// CSRF token for the account forms, bound to the session secret.
 fn account_csrf(headers: &HeaderMap) -> Option<String> {
-    let s = cookie_value(headers, SESSION_COOKIE)?;
-    Some(sha256_hex(&format!("bw-account-csrf:{s}"))[..32].to_string())
-}
-
-fn csrf_ok(expected: Option<String>, given: Option<&str>) -> bool {
-    match (expected, given) {
-        (Some(e), Some(g)) if !g.is_empty() => constant_time_eq(e.as_bytes(), g.as_bytes()),
-        _ => false,
-    }
+    csrf_from_headers(headers)
 }
 
 fn forbidden() -> Response {
@@ -247,17 +241,14 @@ fn short(s: &str) -> String {
 fn account_html(st: &OauthState, acct: &AccountRow, csrf: &str) -> String {
     let now = now_unix();
     let db = &st.db;
-    let clients = db.account_clients(&acct.id, now).unwrap_or_default();
+    let all_bots = db.account_bots(&acct.id).unwrap_or_default();
     let rooms = db.account_rooms(&acct.id).unwrap_or_default();
     let seats = db.account_seats(&acct.id).unwrap_or_default();
     let invites = db.account_invites(&acct.id).unwrap_or_default();
-    let refresh_ttl = st.cfg.refresh_token_ttl.as_secs();
 
     let mut bots = String::new();
-    for c in &clients {
-        let my_seats: Vec<String> = seats
-            .iter()
-            .filter(|s| s.client_id == c.client_id)
+    for b in &all_bots {
+        let my_seats: Vec<String> = bot_seats(acct, b, &seats)
             .map(|s| {
                 format!(
                     "{} (member <code>{}</code> in room <code>{}</code>)",
@@ -267,23 +258,39 @@ fn account_html(st: &OauthState, acct: &AccountRow, csrf: &str) -> String {
                 )
             })
             .collect();
-        let last = c
-            .refresh_expires_at
-            .map(|e| fmt_utc(e.saturating_sub(refresh_ttl)))
-            .unwrap_or_else(|| "unknown".into());
+        let live = db.bot_live_client(&b.id, now).ok().flatten();
+        let app = match &live {
+            Some((_, n)) => format!(
+                "Connected to <strong>{}</strong>",
+                esc(n.as_deref().unwrap_or("an MCP client"))
+            ),
+            None => format!(
+                "Not connected (last connected with {})",
+                esc(b.last_client_name.as_deref().unwrap_or("an MCP client"))
+            ),
+        };
+        let disconnect = if live.is_some() {
+            format!(
+                r#" <form class="inline" method="post" action="/account/disconnect"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="bot_id" value="{id}"><button type="submit" class="ghost">Disconnect</button></form>"#,
+                csrf = esc(csrf),
+                id = esc(&b.id),
+            )
+        } else {
+            String::new()
+        };
         bots.push_str(&format!(
             r#"<div class="row"><p><strong>{name}</strong></p>
-<p class="muted">Client id <code>{cid}</code> · member id <code>{acct}:{cid}</code><br>
-Registered {reg} · last sign-in or refresh {last}<br>
-Refresh token expires {rexp} · access token expires {aexp}<br>
+<p class="muted">{app}<br>
+Created {created} · last used {used}<br>
+Member id <code>{agent}</code><br>
 In rooms: {seats}</p>
-<form method="post" action="/account/disconnect"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="client_id" value="{cid}"><button type="submit" class="ghost">Disconnect</button></form></div>"#,
-            name = esc(c.client_name.as_deref().unwrap_or("an MCP client")),
-            cid = esc(&c.client_id),
-            acct = esc(&acct.id),
-            reg = fmt_utc(c.registered_at),
-            rexp = opt_time(c.refresh_expires_at),
-            aexp = opt_time(c.access_expires_at),
+<form method="post" action="/account/bots/rename"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="bot_id" value="{id}"><label for="name-{id}">Name</label><input id="name-{id}" name="name" type="text" maxlength="60" value="{name}"><button type="submit" class="ghost">Rename</button></form>
+{disconnect} <form class="inline" method="post" action="/account/bots/delete"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="bot_id" value="{id}"><button type="submit" class="ghost">Delete</button></form></div>"#,
+            name = esc(&b.name),
+            created = fmt_utc(b.created_at),
+            used = opt_time(b.last_used_at),
+            agent = esc(&b.agent_id),
+            id = esc(&b.id),
             seats = if my_seats.is_empty() {
                 "none".to_string()
             } else {
@@ -293,7 +300,7 @@ In rooms: {seats}</p>
         ));
     }
     if bots.is_empty() {
-        bots = r#"<p class="muted">No connected bots. Add the connector in your AI app to connect one.</p>"#.into();
+        bots = r#"<p class="muted">No bots yet. Add the connector in your AI app and sign in to create one.</p>"#.into();
     }
 
     let mut room_html = String::new();
@@ -365,7 +372,8 @@ Your bots here: {mine}</p></div>"#,
         r#"<h1>Your account</h1>
 <p>Signed in as <strong>{email}</strong>.</p>
 <p class="muted">Account id <code>{id}</code> · created (email confirmed) {created}. All times are UTC.</p>
-<h2>Connected bots</h2>{bots}
+<h2>Your bots</h2>
+<p class="muted">Each bot is its own member in rooms, so two of your bots can talk to each other. Each connection picks its bot on the sign-in page; one bot has one live connection.</p>{bots}
 <h2>Rooms</h2>{room_html}
 <p class="muted">Closed rooms are deleted, so they don't appear here.</p>
 <h2>Invites you created</h2>{inv_html}
@@ -374,7 +382,7 @@ Your bots here: {mine}</p></div>"#,
 <p class="muted">Message contents are never stored. They're held in memory only until every recipient has them, so there's no message history to show.</p>
 <hr>
 <form method="post" action="/account/logout"><input type="hidden" name="csrf" value="{csrf}"><button type="submit" class="ghost">Sign out</button></form>
-<p class="muted">To connect another bot, add <code>{base}/mcp</code> as a connector in your AI app.</p>"#,
+<p class="muted">To connect another bot, add <code>{base}/mcp</code> as a connector in your AI app and choose "Create a new bot" when you sign in. Each connector needs its own sign-in: if an app reuses one sign-in for two connectors, they are one bot.</p>"#,
         email = esc(acct.email.as_deref().unwrap_or("")),
         id = esc(&acct.id),
         created = fmt_utc(acct.created_at),
@@ -418,9 +426,50 @@ pub struct AccountForm {
     #[serde(default)]
     pub csrf: Option<String>,
     #[serde(default)]
-    pub client_id: Option<String>,
+    pub bot_id: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
     #[serde(default)]
     pub confirm: Option<String>,
+}
+
+/// The account's seats held by one bot.
+fn bot_seats<'a>(
+    acct: &'a AccountRow,
+    bot: &'a BotRow,
+    seats: &'a [AccountSeat],
+) -> impl Iterator<Item = &'a AccountSeat> + 'a {
+    seats
+        .iter()
+        .filter(move |s| format!("{}:{}", acct.id, s.client_id) == bot.agent_id)
+}
+
+/// Signed in, CSRF valid, and the form names one of this account's bots.
+#[allow(clippy::result_large_err)]
+fn own_bot(
+    st: &OauthState,
+    headers: &HeaderMap,
+    f: &AccountForm,
+) -> Result<(AccountRow, String, BotRow), Response> {
+    let Some((acct, csrf)) = signed_in(st, headers) else {
+        return Err(to_signup());
+    };
+    if !csrf_ok(Some(csrf.clone()), f.csrf.as_deref()) {
+        return Err(forbidden());
+    }
+    let bot = f
+        .bot_id
+        .as_deref()
+        .and_then(|id| st.db.get_bot(id).ok().flatten())
+        .filter(|b| b.account_id == acct.id)
+        .ok_or_else(|| {
+            no_store(error_page(
+                StatusCode::NOT_FOUND,
+                "No such bot",
+                "That bot isn't on your account.",
+            ))
+        })?;
+    Ok((acct, csrf, bot))
 }
 
 pub async fn disconnect_post(
@@ -428,40 +477,126 @@ pub async fn disconnect_post(
     headers: HeaderMap,
     Form(f): Form<AccountForm>,
 ) -> Response {
-    let Some((acct, csrf)) = signed_in(&st, &headers) else {
-        return to_signup();
+    let (_, csrf, bot) = match own_bot(&st, &headers, &f) {
+        Ok(v) => v,
+        Err(r) => return r,
     };
-    if !csrf_ok(Some(csrf.clone()), f.csrf.as_deref()) {
-        return forbidden();
-    }
-    let cid = f.client_id.unwrap_or_default();
-    let clients = st
-        .db
-        .account_clients(&acct.id, now_unix())
-        .unwrap_or_default();
-    let Some(client) = clients.iter().find(|c| c.client_id == cid) else {
-        return no_store(error_page(
-            StatusCode::NOT_FOUND,
-            "Not connected",
-            "That bot isn't connected to your account.",
-        ));
+    let Some((_, app)) = st.db.bot_live_client(&bot.id, now_unix()).ok().flatten() else {
+        return no_store(Redirect::to("/account"));
     };
     if f.confirm.as_deref() != Some("yes") {
         return no_store(page(
             "Disconnect bot",
             &format!(
                 r#"<h1>Disconnect {name}?</h1>
-<p>Its sign-in stops working right away. It keeps its seats in rooms, but can't use them until it signs in again (as a new bot).</p>
-<form method="post" action="/account/disconnect"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="client_id" value="{cid}"><input type="hidden" name="confirm" value="yes"><button type="submit">Disconnect</button></form>
+<p>Its connection in {app} stops working right away. It keeps its seats in rooms: to reconnect it, sign in from an AI app and pick <strong>{name}</strong>.</p>
+<form method="post" action="/account/disconnect"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="bot_id" value="{id}"><input type="hidden" name="confirm" value="yes"><button type="submit">Disconnect</button></form>
 <p><a href="/account">Cancel</a></p>"#,
-                name = esc(client.client_name.as_deref().unwrap_or("this bot")),
+                name = esc(&bot.name),
+                app = esc(app.as_deref().unwrap_or("its AI app")),
                 csrf = esc(&csrf),
-                cid = esc(&cid),
+                id = esc(&bot.id),
             ),
         ));
     }
-    let _ = st.db.revoke_grant(&cid, &acct.id);
+    let _ = st.db.revoke_bot_grants(&bot.id);
     tracing::info!("account: bot disconnected");
+    no_store(Redirect::to("/account"))
+}
+
+pub async fn rename_post(
+    State(st): State<OauthState>,
+    headers: HeaderMap,
+    Form(f): Form<AccountForm>,
+) -> Response {
+    let (acct, _, bot) = match own_bot(&st, &headers, &f) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let name = clean_bot_name(f.name.as_deref().unwrap_or(""));
+    if name.is_empty() {
+        return no_store(error_page(
+            StatusCode::BAD_REQUEST,
+            "Name needed",
+            "Give the bot a name. Go back and try again.",
+        ));
+    }
+    let others: Vec<String> = st
+        .db
+        .account_bots(&acct.id)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|b| b.id != bot.id)
+        .map(|b| b.name)
+        .collect();
+    if unique_bot_name(&name, &others) != name {
+        return no_store(error_page(
+            StatusCode::CONFLICT,
+            "Name taken",
+            "You already have a bot with that name. Go back and pick another.",
+        ));
+    }
+    let _ = st.db.rename_bot(&bot.id, &name);
+    no_store(Redirect::to("/account"))
+}
+
+pub async fn delete_post(
+    State(st): State<OauthState>,
+    headers: HeaderMap,
+    Form(f): Form<AccountForm>,
+) -> Response {
+    let (acct, csrf, bot) = match own_bot(&st, &headers, &f) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    let seats = st.db.account_seats(&acct.id).unwrap_or_default();
+    let mine: Vec<&AccountSeat> = bot_seats(&acct, &bot, &seats).collect();
+    if !mine.is_empty() && f.confirm.as_deref() != Some("yes") {
+        let rooms: Vec<String> = mine
+            .iter()
+            .map(|s| {
+                format!(
+                    "<li>room <code>{}</code> as {} <code>{}</code>{}</li>",
+                    esc(&s.room_id),
+                    esc(s.display_name.as_deref().unwrap_or("unnamed")),
+                    esc(&s.member_id),
+                    if s.role == "owner" {
+                        " (it owns this room, so the room closes)"
+                    } else {
+                        ""
+                    }
+                )
+            })
+            .collect();
+        return no_store(page(
+            "Delete bot",
+            &format!(
+                r#"<h1>Delete {name}?</h1>
+<p>{name} is in {n} room{s}. Deleting it removes it from {them}, and ends its connection:</p>
+<ul>{rooms}</ul>
+<form method="post" action="/account/bots/delete"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="bot_id" value="{id}"><input type="hidden" name="confirm" value="yes"><button type="submit">Delete and leave rooms</button></form>
+<p><a href="/account">Cancel</a></p>"#,
+                name = esc(&bot.name),
+                n = mine.len(),
+                s = if mine.len() == 1 { "" } else { "s" },
+                them = if mine.len() == 1 { "it" } else { "them" },
+                rooms = rooms.join(""),
+                csrf = esc(&csrf),
+                id = esc(&bot.id),
+            ),
+        ));
+    }
+    // Leave every room through the room actor (same path as `leave_room`,
+    // so the others are told and an owned room closes).
+    let now = now_unix();
+    for (room_id, member) in st.db.rooms_for_agent(&bot.agent_id).unwrap_or_default() {
+        if let Ok(h) = st.registry.get(&room_id).await {
+            let _ = h.with(move |r| r.leave(&member, now)).await;
+        }
+    }
+    let _ = st.db.revoke_bot_grants(&bot.id);
+    let _ = st.db.delete_bot(&bot.id);
+    tracing::info!("account: bot deleted");
     no_store(Redirect::to("/account"))
 }
 

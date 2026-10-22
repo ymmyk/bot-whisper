@@ -7,14 +7,22 @@
 //! 1. The user enters an email. The relay mails a single-use, 15-minute
 //!    confirmation link (only its hash is stored, along with the pending
 //!    authorization request).
-//! 2. Clicking the link creates the account if needed, sets a browser
-//!    session cookie, and redirects back to the client with the code.
-//! 3. The client exchanges the code (with its PKCE verifier) for an access
+//! 2. Clicking the link creates the account if needed and sets a browser
+//!    session cookie. (A browser that is already signed in skips 1 and 2.)
+//! 3. The person picks which of their bots is connecting, or creates a new
+//!    one ("Which bot is connecting?"). The grant is bound to that bot, and
+//!    the bot's agent id is what rooms see, so two bots of one account are
+//!    two members, and a bot keeps its seats when it reconnects, even from
+//!    another client registration. Picking a bot that is connected elsewhere
+//!    ends that other connection when the new code is exchanged (one live
+//!    connection per bot). Then the relay redirects back with the code.
+//! 4. The client exchanges the code (with its PKCE verifier) for an access
 //!    token and a rotating refresh token. Tokens are opaque; only hashes
 //!    are stored.
 //!
 //! Invitees without an account paste their invite URL on the same page and
-//! get a token scoped to that one room (`scope = room:<id>`).
+//! get a token scoped to that one room (`scope = room:<id>`), bound to one
+//! automatically created guest bot (no picker).
 //!
 //! Nothing here logs email addresses, tokens, codes or links.
 
@@ -39,7 +47,10 @@ use sha2::{Digest, Sha256};
 use crate::{
     auth::{sha256_hex, AgentId},
     config::RelayConfig,
-    db::{AccountRow, ClientRow, CodeRow, Db, PendingLogin, TokenRow},
+    db::{
+        new_bot_id, unique_bot_name, AccountRow, BotRow, ClientRow, CodeRow, Db, PendingLogin,
+        TokenRow, BOT_NAME_MAX, REPLACED,
+    },
     doorbell::now_unix,
     mail::{looks_like_email, normalize_email, Mailer, Outgoing},
     ratelimit::Limiter,
@@ -158,6 +169,9 @@ button.ghost{{background:#fff;color:#1b1838;border-color:#c9c5e4}}
 code{{background:#efedf9;padding:.08em .35em;border-radius:6px;font-size:.9em}}
 hr{{border:0;border-top:1px solid #e2dff2;margin:22px 0}}
 .row{{border-top:1px solid #e2dff2;padding:8px 0}}
+label.pick{{font-weight:400;border:1px solid #e2dff2;border-radius:10px;padding:10px 12px;margin:8px 0;cursor:pointer}}
+label.pick input{{margin-right:8px}} .warn{{color:#6b4510}}
+form.inline{{display:inline}}
 </style></head><body><main><div class="card">{b}</div>
 <p class="muted" style="text-align:center;margin-top:16px">BotWhisper · an open-source relay where AI bots take turns · <a href="https://botwhisper.si/">botwhisper.si</a></p></main></body></html>"#,
         t = esc(title),
@@ -303,6 +317,17 @@ pub struct AuthorizeParams {
     pub invite_url: Option<String>,
     #[serde(default)]
     pub display_name: Option<String>,
+    /// Bot picker: a bot id, or `new`.
+    #[serde(default)]
+    pub bot: Option<String>,
+    /// Name for a new bot.
+    #[serde(default)]
+    pub bot_name: Option<String>,
+    /// `yes` once the person agreed to disconnect the bot elsewhere.
+    #[serde(default)]
+    pub confirm: Option<String>,
+    #[serde(default)]
+    pub csrf: Option<String>,
 }
 
 /// Validate the request against the registered client. Errors that happen
@@ -624,23 +649,223 @@ fn signin_page(req: &AuthzRequest, client: &ClientRow, error: Option<&str>) -> H
     )
 }
 
-fn consent_page(req: &AuthzRequest, client: &ClientRow, account: &AccountRow) -> Html<String> {
-    let fields = req.hidden_fields();
-    page(
-        "Allow access",
+/// CSRF token for forms shown to a signed-in browser, bound to the session
+/// secret (the sign-in page itself needs none: it only sends an email or
+/// redeems an invite the person typed).
+pub(crate) fn session_csrf(session: &str) -> String {
+    sha256_hex(&format!("bw-account-csrf:{session}"))[..32].to_string()
+}
+
+pub(crate) fn csrf_from_headers(headers: &HeaderMap) -> Option<String> {
+    cookie_value(headers, SESSION_COOKIE).map(|s| session_csrf(&s))
+}
+
+pub(crate) fn csrf_ok(expected: Option<String>, given: Option<&str>) -> bool {
+    match (expected, given) {
+        (Some(e), Some(g)) if !g.is_empty() => constant_time_eq(e.as_bytes(), g.as_bytes()),
+        _ => false,
+    }
+}
+
+/// "never" or a UTC time.
+fn when(t: Option<u64>) -> String {
+    t.map(crate::web::fmt_utc).unwrap_or_else(|| "never".into())
+}
+
+fn app_name(name: &Option<String>) -> String {
+    esc(name.as_deref().unwrap_or("an MCP client"))
+}
+
+/// "Which bot is connecting?": the signed-in person picks one of their bots
+/// or creates a new one. Shown after sign-in, before the code is issued.
+fn picker_page(
+    st: &OauthState,
+    req: &AuthzRequest,
+    client: &ClientRow,
+    account: &AccountRow,
+    csrf: &str,
+    error: Option<&str>,
+) -> Response {
+    let now = now_unix();
+    let bots = st.db.account_bots(&account.id).unwrap_or_default();
+    let names: Vec<String> = bots.iter().map(|b| b.name.clone()).collect();
+    let suggested = unique_bot_name(client.name.as_deref().unwrap_or("My bot"), &names);
+    // Reconnecting the same client registration preselects its bot.
+    let preselect = bots
+        .iter()
+        .filter(|b| b.last_client_id.as_deref() == Some(client.id.as_str()))
+        .max_by_key(|b| b.last_used_at.unwrap_or(b.created_at))
+        .map(|b| b.id.clone());
+    let mut list = String::new();
+    for b in &bots {
+        let live = st.db.bot_live_client(&b.id, now).ok().flatten();
+        let detail = match &live {
+            Some((_, n)) => format!(
+                r#"Connected to {app} now · last used {used}<br><span class="warn">Picking it disconnects it from {app}.</span>"#,
+                app = app_name(n),
+                used = when(b.last_used_at),
+            ),
+            None => format!(
+                "Not connected · last connected with {app} · last used {used}",
+                app = app_name(&b.last_client_name),
+                used = when(b.last_used_at),
+            ),
+        };
+        list.push_str(&format!(
+            r#"<label class="pick"><input type="radio" name="bot" value="{id}"{checked}><strong>{name}</strong><br><span class="muted">{detail}</span></label>"#,
+            id = esc(&b.id),
+            checked = if preselect.as_deref() == Some(b.id.as_str()) { " checked" } else { "" },
+            name = esc(&b.name),
+        ));
+    }
+    let err = error
+        .map(|e| format!(r#"<div class="err">{}</div>"#, esc(e)))
+        .unwrap_or_default();
+    let intro = if bots.is_empty() {
+        "Give this bot a name. It's how it shows up in rooms and on your account page."
+    } else {
+        "Pick one of your bots to reconnect it, or create a new one. Each bot is its own member in rooms, so two of your bots can talk to each other."
+    };
+    no_store(page(
+        "Which bot is connecting?",
         &format!(
-            r#"<h1>Allow {client}?</h1>
-<p>Signed in as <strong>{email}</strong>.</p>
-<p class="muted">{client} will be able to create rooms, invite other bots, send and receive messages, and leave or close rooms, as your agent. Each connected client is its own agent (member) in a room.</p>
-<form method="post" action="/oauth/authorize">{fields}<input type="hidden" name="action" value="allow"><button type="submit">Allow</button>
+            r#"<h1>Which bot is connecting?</h1>
+<p>Signed in as <strong>{email}</strong>. {client} (<code>{host}</code>) is connecting to BotWhisper.</p>
+<p class="muted">{intro}</p>
+{err}
+<form method="post" action="/oauth/authorize">{fields}<input type="hidden" name="csrf" value="{csrf}">
+{list}
+<label class="pick"><input type="radio" name="bot" value="new"{new_checked}><strong>Create a new bot</strong></label>
+<label for="bot_name">New bot's name</label><input id="bot_name" name="bot_name" type="text" maxlength="{max}" value="{suggested}">
+<p class="muted">The bot can create rooms, invite other bots, send and receive messages, and leave or close rooms, as you. One bot has one live connection: picking a bot that is connected elsewhere disconnects it there. If your AI app reuses one sign-in for two connectors, they are still one bot; give each connector its own sign-in.</p>
+<button type="submit" name="action" value="allow">Connect</button>
 <button type="submit" name="action" value="deny" class="ghost">Deny</button>
 <button type="submit" name="action" value="logout" class="ghost">Not you? Sign out</button></form>
 {notice}"#,
-            client = client_label(client),
             email = esc(account.email.as_deref().unwrap_or("guest")),
+            client = client_label(client),
+            host = esc(&redirect_host(&req.redirect_uri)),
+            fields = req.hidden_fields(),
+            csrf = esc(csrf),
+            new_checked = if preselect.is_none() { " checked" } else { "" },
+            max = BOT_NAME_MAX,
+            suggested = esc(&suggested),
             notice = OPERATOR_NOTICE,
         ),
-    )
+    ))
+}
+
+/// "This will disconnect it from <app>, continue?"
+fn takeover_page(
+    req: &AuthzRequest,
+    client: &ClientRow,
+    bot: &BotRow,
+    live_app: &Option<String>,
+    csrf: &str,
+) -> Response {
+    no_store(page(
+        "Disconnect it elsewhere?",
+        &format!(
+            r#"<h1>Move {bot} to {client}?</h1>
+<p><strong>{bot}</strong> is connected to <strong>{app}</strong> right now. This will disconnect it from {app} &mdash; continue?</p>
+<p class="muted">It keeps its seats in rooms; only the connection moves. To keep both, go back and create a new bot instead.</p>
+<form method="post" action="/oauth/authorize">{fields}<input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="bot" value="{id}"><input type="hidden" name="confirm" value="yes">
+<button type="submit" name="action" value="allow">Continue</button>
+<button type="submit" name="action" value="back" class="ghost">Back</button></form>"#,
+            bot = esc(&bot.name),
+            client = client_label(client),
+            app = app_name(live_app),
+            fields = req.hidden_fields(),
+            csrf = esc(csrf),
+            id = esc(&bot.id),
+        ),
+    ))
+}
+
+/// Clean a person-typed bot name: no control characters, trimmed, capped.
+pub(crate) fn clean_bot_name(raw: &str) -> String {
+    raw.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(BOT_NAME_MAX)
+        .collect()
+}
+
+/// The picker's submit: resolve or create the bot, then issue the code.
+fn pick_bot(
+    st: &OauthState,
+    req: &AuthzRequest,
+    client: &ClientRow,
+    account: &AccountRow,
+    p: &AuthorizeParams,
+    csrf: &str,
+) -> Response {
+    let now = now_unix();
+    let choice = p.bot.as_deref().unwrap_or("").trim();
+    let bot = if choice.is_empty() || choice == "new" {
+        let taken: Vec<String> = st
+            .db
+            .account_bots(&account.id)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|b| b.name)
+            .collect();
+        let typed = clean_bot_name(p.bot_name.as_deref().unwrap_or(""));
+        let want = if typed.is_empty() {
+            client.name.clone().unwrap_or_else(|| "My bot".into())
+        } else {
+            typed
+        };
+        let id = new_bot_id();
+        let bot = BotRow {
+            agent_id: format!("{}:{id}", account.id),
+            id,
+            account_id: account.id.clone(),
+            name: unique_bot_name(&want, &taken),
+            created_at: now,
+            last_used_at: None,
+            last_client_id: None,
+            last_client_name: None,
+        };
+        if st.db.insert_bot(&bot).is_err() {
+            return error_page(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Storage error",
+                "Please try again.",
+            );
+        }
+        tracing::info!("oauth: new bot created");
+        bot
+    } else {
+        let Some(bot) = st
+            .db
+            .get_bot(choice)
+            .ok()
+            .flatten()
+            .filter(|b| b.account_id == account.id)
+        else {
+            return picker_page(
+                st,
+                req,
+                client,
+                account,
+                csrf,
+                Some("That bot doesn't exist any more. Pick another or create a new one."),
+            );
+        };
+        if p.confirm.as_deref() != Some("yes") {
+            if let Some((_, app)) = st.db.bot_live_client(&bot.id, now).ok().flatten() {
+                return takeover_page(req, client, &bot, &app, csrf);
+            }
+        }
+        bot
+    };
+    let _ = st.db.touch_bot(&bot.id, now, Some(&client.id));
+    issue_code_and_redirect(st, req, &account.id, SCOPE_ROOMS, &bot.id)
 }
 
 fn redirect_host(uri: &str) -> String {
@@ -663,11 +888,12 @@ pub async fn authorize_get(
         Ok(v) => v,
         Err(r) => return r,
     };
-    let body = match current_account(&st, &headers) {
-        Some(acct) if acct.kind == "user" => consent_page(&req, &client, &acct),
-        _ => signin_page(&req, &client, None),
-    };
-    no_store(body)
+    match (current_account(&st, &headers), csrf_from_headers(&headers)) {
+        (Some(acct), Some(csrf)) if acct.kind == "user" => {
+            picker_page(&st, &req, &client, &acct, &csrf, None)
+        }
+        _ => no_store(signin_page(&req, &client, None)),
+    }
 }
 
 pub async fn authorize_post(
@@ -691,9 +917,22 @@ pub async fn authorize_post(
             clear_session_cookies(&st.cfg, &mut r);
             r
         }
-        "allow" => match current_account(&st, &headers) {
+        action @ ("allow" | "back") => match current_account(&st, &headers) {
             Some(acct) if acct.kind == "user" => {
-                issue_code_and_redirect(&st, &req, &acct.id, SCOPE_ROOMS)
+                let csrf = csrf_from_headers(&headers);
+                if !csrf_ok(csrf.clone(), p.csrf.as_deref()) {
+                    return no_store(error_page(
+                        StatusCode::FORBIDDEN,
+                        "Form expired",
+                        "This form is out of date. Start the connect again from your AI app.",
+                    ));
+                }
+                let csrf = csrf.unwrap_or_default();
+                if action == "back" {
+                    picker_page(&st, &req, &client, &acct, &csrf, None)
+                } else {
+                    pick_bot(&st, &req, &client, &acct, &p, &csrf)
+                }
             }
             _ => no_store(signin_page(
                 &req,
@@ -893,13 +1132,38 @@ async fn guest_join(
             "Please try again.",
         );
     }
-    let agent = AgentId::from_oauth(&account.id, &client.id, SCOPE_ROOMS);
+    // One automatically created guest bot, keeping the pre-bot agent id
+    // shape `<guest account>:<client>`.
+    let bot = BotRow {
+        id: new_bot_id(),
+        account_id: account.id.clone(),
+        name: display_name
+            .clone()
+            .or_else(|| client.name.as_deref().map(clean_bot_name))
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| "Guest bot".into()),
+        agent_id: AgentId::legacy_oauth_id(&account.id, &client.id),
+        created_at: now,
+        last_used_at: Some(now),
+        last_client_id: Some(client.id.clone()),
+        last_client_name: None,
+    };
+    if st.db.insert_bot(&bot).is_err() {
+        let _ = st.db.delete_account(&account.id);
+        return error_page(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Storage error",
+            "Please try again.",
+        );
+    }
+    let agent = AgentId::for_bot(&bot, SCOPE_ROOMS);
     match st.registry.join(&agent, invite_url, display_name).await {
         Ok((room, _member)) => {
-            issue_code_and_redirect(st, req, &account.id, &format!("room:{}", room.id))
+            issue_code_and_redirect(st, req, &account.id, &format!("room:{}", room.id), &bot.id)
         }
         Err(e) => {
-            // Nothing else references the guest account yet.
+            // Nothing else references the guest account or bot yet.
+            let _ = st.db.delete_bot(&bot.id);
             let _ = st.db.delete_account(&account.id);
             no_store(signin_page(
                 req,
@@ -918,6 +1182,7 @@ fn issue_code_and_redirect(
     req: &AuthzRequest,
     account_id: &str,
     scope: &str,
+    bot_id: &str,
 ) -> Response {
     let code = random_token("bwcode_");
     let row = CodeRow {
@@ -927,6 +1192,7 @@ fn issue_code_and_redirect(
         account_id: account_id.to_string(),
         scope: scope.to_string(),
         expires_at: now_unix() + CODE_TTL.as_secs(),
+        bot_id: Some(bot_id.to_string()),
     };
     if st.db.insert_code(&sha256_hex(&code), &row).is_err() {
         return error_page(
@@ -1005,7 +1271,23 @@ pub async fn confirm(State(st): State<OauthState>, Path(token): Path<String>) ->
         .db
         .insert_session(&sha256_hex(&session), &account.id, now + max_age);
     let mut resp = match req {
-        Some(req) => issue_code_and_redirect(&st, &req, &account.id, SCOPE_ROOMS),
+        // An MCP client is waiting: ask which bot is connecting. The page's
+        // forms carry the CSRF token of the session set below.
+        Some(req) => match st.db.get_client(&req.client_id).ok().flatten() {
+            Some(client) => picker_page(
+                &st,
+                &req,
+                &client,
+                &account,
+                &session_csrf(&session),
+                None,
+            ),
+            None => error_page(
+                StatusCode::BAD_REQUEST,
+                "Unknown client",
+                "This MCP client is not registered with the relay. Remove and re-add the connector.",
+            ),
+        },
         // No MCP client is waiting on this browser: go to the account page
         // with a one-shot "signed in" banner.
         None => crate::web::signed_in_redirect(&st.cfg),
@@ -1090,6 +1372,7 @@ fn issue_tokens(
     client_id: &str,
     account_id: &str,
     scope: &str,
+    bot_id: Option<&str>,
 ) -> Result<Value, Response> {
     let now = now_unix();
     let access = random_token("bwa_");
@@ -1100,6 +1383,7 @@ fn issue_tokens(
         account_id: account_id.into(),
         scope: scope.into(),
         expires_at: now + st.cfg.access_token_ttl.as_secs(),
+        bot_id: bot_id.map(str::to_string),
     };
     let r = TokenRow {
         kind: "refresh".into(),
@@ -1116,6 +1400,9 @@ fn issue_tokens(
                 "storage error",
             )
         })?;
+    if let Some(b) = bot_id {
+        let _ = st.db.touch_bot(b, now, Some(client_id));
+    }
     Ok(json!({
         "access_token": access,
         "token_type": "Bearer",
@@ -1179,7 +1466,20 @@ pub async fn token(
                     "code does not match this client, redirect_uri or PKCE verifier",
                 );
             }
-            match issue_tokens(&st, &client.id, &row.account_id, &row.scope) {
+            let Some(bot_id) = code_bot(&st, &row) else {
+                return oauth_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_grant",
+                    &format!("this bot no longer exists. {}", sign_in_again(&st)),
+                );
+            };
+            // One live connection per bot: the bot's previous grant (from
+            // this or another client) ends now.
+            let ended = st.db.revoke_bot_grants(&bot_id).unwrap_or(0);
+            if ended > 0 {
+                tracing::info!("oauth: bot reconnected; its previous grant was ended");
+            }
+            match issue_tokens(&st, &client.id, &row.account_id, &row.scope, Some(&bot_id)) {
                 Ok(v) => no_store(Json(v)),
                 Err(r) => r,
             }
@@ -1217,8 +1517,20 @@ pub async fn token(
             // token that was already used (or revoked) means it leaked or the
             // client is confused, so the whole grant chain for this client
             // and account is revoked (OAuth 2.1 4.3.1, RFC 9700 4.14.2).
-            if revoked || !st.db.revoke_token(&hash).unwrap_or(false) {
-                let _ = st.db.revoke_grant(&row.client_id, &row.account_id);
+            if revoked == REPLACED {
+                return oauth_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_grant",
+                    &format!(
+                        "this bot was connected from another app, or disconnected on the account page. {}",
+                        sign_in_again(&st)
+                    ),
+                );
+            }
+            if revoked != 0 || !st.db.revoke_token(&hash).unwrap_or(false) {
+                let _ = st
+                    .db
+                    .revoke_grant(&row.client_id, &row.account_id, row.bot_id.as_deref());
                 tracing::warn!("refresh token reuse detected; revoked that client's grant");
                 return oauth_error(
                     StatusCode::BAD_REQUEST,
@@ -1229,7 +1541,13 @@ pub async fn token(
                     ),
                 );
             }
-            match issue_tokens(&st, &client.id, &row.account_id, &row.scope) {
+            match issue_tokens(
+                &st,
+                &client.id,
+                &row.account_id,
+                &row.scope,
+                row.bot_id.as_deref(),
+            ) {
                 Ok(v) => no_store(Json(v)),
                 Err(r) => r,
             }
@@ -1240,6 +1558,43 @@ pub async fn token(
             "use authorization_code or refresh_token",
         ),
     }
+}
+
+/// The bot a code is for. Codes issued before bots existed (10-minute
+/// lifetime, so only right after an upgrade) get the bot that carries their
+/// old agent id, created if needed.
+fn code_bot(st: &OauthState, row: &CodeRow) -> Option<String> {
+    if let Some(b) = &row.bot_id {
+        return st
+            .db
+            .get_bot(b)
+            .ok()
+            .flatten()
+            .filter(|b| b.account_id == row.account_id)
+            .map(|b| b.id);
+    }
+    let agent = AgentId::legacy_oauth_id(&row.account_id, &row.client_id);
+    let bots = st.db.account_bots(&row.account_id).ok()?;
+    if let Some(b) = bots.iter().find(|b| b.agent_id == agent) {
+        return Some(b.id.clone());
+    }
+    let names: Vec<String> = bots.into_iter().map(|b| b.name).collect();
+    let client = st.db.get_client(&row.client_id).ok().flatten();
+    let bot = BotRow {
+        id: new_bot_id(),
+        account_id: row.account_id.clone(),
+        name: unique_bot_name(
+            client.and_then(|c| c.name).as_deref().unwrap_or("Bot"),
+            &names,
+        ),
+        agent_id: agent,
+        created_at: now_unix(),
+        last_used_at: None,
+        last_client_id: Some(row.client_id.clone()),
+        last_client_name: None,
+    };
+    st.db.insert_bot(&bot).ok()?;
+    Some(bot.id)
 }
 
 /// RFC 7009 revocation. Always 200 for a well-formed request.

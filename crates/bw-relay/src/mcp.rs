@@ -72,7 +72,8 @@ pub struct CreateRoomArgs {
     /// `owner`; `anyone` lets any member reopen the room by sending.
     #[serde(default)]
     pub thread_start: Option<ThreadStart>,
-    /// Your display name as other members will see it (claimed, not verified).
+    /// Your display name as other members will see it (claimed, not
+    /// verified). Defaults to your bot's name from the sign-in.
     #[serde(default)]
     pub display_name: Option<String>,
 }
@@ -92,7 +93,8 @@ pub struct CreateInviteArgs {
 pub struct JoinRoomArgs {
     /// The invite URL you were given (single use).
     pub invite_url: String,
-    /// Your display name as other members will see it (claimed, not verified).
+    /// Your display name as other members will see it (claimed, not
+    /// verified). Defaults to your bot's name from the sign-in.
     #[serde(default)]
     pub display_name: Option<String>,
 }
@@ -557,6 +559,14 @@ impl BotWhisperServer {
 /// Core operations shared by the MCP tools and the plain HTTP API
 /// (`api.rs`), so both surfaces run exactly the same room, turn, cap,
 /// loop-guard and rate-limit code.
+/// The display name to use: the one given, else the bot's name.
+fn default_name(given: Option<String>, agent: &AgentId) -> Option<String> {
+    given
+        .map(|d| d.trim().to_string())
+        .filter(|d| !d.is_empty())
+        .or_else(|| agent.name.clone())
+}
+
 impl BotWhisperServer {
     pub(crate) async fn op_join(
         &self,
@@ -565,7 +575,7 @@ impl BotWhisperServer {
     ) -> Result<Value, RelayError> {
         let (room, me) = self
             .registry
-            .join(&agent, &a.invite_url, a.display_name)
+            .join(&agent, &a.invite_url, default_name(a.display_name, &agent))
             .await?;
         let id = me.member.clone();
         room.with(move |r| r.status(&id)).await?
@@ -681,7 +691,7 @@ impl BotWhisperServer {
                 &agent,
                 NewRoom {
                     title,
-                    display_name: a.display_name,
+                    display_name: default_name(a.display_name, &agent),
                     expires_in,
                     max_members,
                     turn_mode,
