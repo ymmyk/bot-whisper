@@ -62,7 +62,7 @@
         executable: /bin/bash
       environment:
         PATH: "/home/ubuntu/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
-      when: src_upload.changed or not prev_bin.stat.exists
+      when: (src_upload.changed or not prev_bin.stat.exists) and not ansible_check_mode
 
     - name: Stat built binary
       ansible.builtin.stat:
@@ -132,10 +132,12 @@
       args:
         creates: /etc/botwhisper/dev-tokens.env
         executable: /bin/bash
+      when: not ansible_check_mode
       notify: restart relay
 
     - name: dev-tokens.env permissions
       become: true
+      when: not ansible_check_mode
       ansible.builtin.file:
         path: /etc/botwhisper/dev-tokens.env
         owner: root
