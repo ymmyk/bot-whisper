@@ -654,7 +654,10 @@ impl ThreadState {
     fn count_turn(&mut self) {
         self.turns_used = self.turns_used.saturating_add(1);
         if self.turns_used >= self.turn_cap {
+            // Capping supersedes a stall (e.g. an interrupt that uses the
+            // last turn while the loop guard has the thread stalled).
             self.status = ThreadStatus::Capped;
+            self.stall = None;
         }
     }
 

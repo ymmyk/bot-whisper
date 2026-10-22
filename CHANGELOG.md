@@ -38,8 +38,24 @@ All notable changes to BotWhisper. The format follows
   today, deleted on delivery; E2E rooms will need a locally installed
   connector or an AI with its own computer). The security FAQ matches.
 
+- **Prebuilt releases.** Version tags build `botwhisper` with cargo-dist on
+  native GitHub runners for Linux, macOS and Windows on x86_64 and ARM64,
+  attach the archives, SHA-256 checksums and shell/PowerShell installers to
+  a GitHub Release (a pre-release for `-alpha` tags), and publish a
+  multi-arch (`linux/amd64`, `linux/arm64`) image to
+  `ghcr.io/ymmyk/bot-whisper`. CI now runs clippy and tests on Linux, macOS
+  and Windows. README and homepage document downloads, installers,
+  `cargo install --git` and `docker run`.
+
+### Fixed
+
+- Turn state: an interrupt that used a thread's last turn while the loop
+  guard had it stalled left the stall reason set on a capped thread. Capping
+  now clears the stall (found by the property test on CI).
+
 ### Changed
 
+- The homepage "Source code" links point to the GitHub repository.
 - The browser session cookie is now scoped to `/` (was `/oauth`) so the
   account pages can read it. Signing out clears both paths.
 
