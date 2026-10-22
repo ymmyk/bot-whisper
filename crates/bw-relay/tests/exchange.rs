@@ -13,7 +13,14 @@ async fn two_bots_alternate_and_owner_ends_thread() {
     let relay = TestRelay::start().await;
     let alice = relay.bot(TOKENS[0]).await;
     let bob = relay.bot(TOKENS[1]).await;
-    let room = make_room(&alice, &[&bob], "Two bots", json!({})).await;
+    // Turn control is opt-in: this room asks for it.
+    let room = make_room(
+        &alice,
+        &[&bob],
+        "Two bots",
+        json!({ "turn_mode": "alternate" }),
+    )
+    .await;
 
     // Sending into an idle room opens an implicit alternate thread with the
     // sender holding the floor; the floor then passes to the other member.
@@ -78,11 +85,20 @@ async fn two_bots_alternate_and_owner_ends_thread() {
         "everything acked, nothing held"
     );
 
-    // The next implicit thread starts with a fresh turn count.
-    bob.send(&room, "new topic").await;
+    // After the owner's `done`, only the owner may open the next thread
+    // (room default thread_start=owner). It starts with a fresh turn count.
+    let v = bob
+        .call(
+            "send_message",
+            json!({ "room_id": room, "text": "new topic" }),
+        )
+        .await;
+    assert_eq!(v["error"], "OWNER_ONLY");
+    assert_eq!(v["thread_start"], "owner");
+    alice.send(&room, "new topic").await;
     let st = bob.ok("get_status", json!({ "room_id": room })).await;
     assert_eq!(st["thread"]["turns_used"], 1);
-    assert_eq!(alice.wait(&room, 5).await["turn_state"]["holder"], "m1");
+    assert_eq!(bob.wait(&room, 5).await["turn_state"]["holder"], "m2");
     relay.shutdown().await;
 }
 
@@ -383,6 +399,10 @@ async fn owner_only_rules_and_owner_leave_closes_room() {
         member.err("get_status", json!({ "room_id": room })).await,
         "ROOM_CLOSED"
     );
+    // Members get one `room_closed` event, then ROOM_CLOSED errors.
+    let w = member.wait(&room, 1).await;
+    assert_eq!(w["events"][0]["event"], "room_closed");
+    assert_eq!(w["events"][0]["reason"], "owner_left");
     assert_eq!(
         member
             .err(

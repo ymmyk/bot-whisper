@@ -7,8 +7,9 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
 use crate::{
+    auth::AgentId,
     config::RelayConfig,
-    db::Db,
+    db::{Db, ThreadStart},
     doorbell::{self, Doorbells},
     error::RelayError,
     room::{Member, Room, RoomHandle},
@@ -20,6 +21,17 @@ pub struct Registry {
     pub db: Db,
     pub bells: Doorbells,
     pub cfg: Arc<RelayConfig>,
+}
+
+/// Options for a new room.
+#[derive(Debug, Clone)]
+pub struct NewRoom {
+    pub title: String,
+    pub display_name: Option<String>,
+    pub expires_in: Option<Duration>,
+    pub max_members: u32,
+    pub turn_mode: TurnMode,
+    pub thread_start: ThreadStart,
 }
 
 impl Registry {
@@ -39,26 +51,33 @@ impl Registry {
         map.len()
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub async fn create_room(
         &self,
-        agent_id: &str,
-        title: String,
-        display_name: Option<String>,
-        expires_in: Option<Duration>,
-        max_members: u32,
-        turn_mode: Option<TurnMode>,
+        agent: &AgentId,
+        opts: NewRoom,
     ) -> Result<RoomHandle, RelayError> {
+        if agent.room_scope().is_some() {
+            return Err(RelayError::new(
+                ErrorCode::Unauthorized,
+                "invite-scoped guests cannot create rooms; sign in with an account",
+            ));
+        }
+        let max_rooms = self.cfg.limits.rooms_per_account;
+        if max_rooms > 0 && self.db.count_rooms_owned_by(agent.limit_key())? >= max_rooms {
+            return Err(RelayError::new(
+                ErrorCode::RateLimited,
+                format!("this account already owns {max_rooms} rooms; close one first"),
+            ));
+        }
         let room = Room::create(
             self.db.clone(),
             self.bells.clone(),
             self.cfg.clone(),
-            title,
-            agent_id,
-            display_name,
-            expires_in,
-            max_members.clamp(2, self.cfg.max_members),
-            turn_mode,
+            agent,
+            NewRoom {
+                max_members: opts.max_members.clamp(2, self.cfg.max_members),
+                ..opts
+            },
             doorbell::now_unix(),
         )?;
         let handle = RoomHandle::spawn(room);
@@ -92,16 +111,20 @@ impl Registry {
         Ok(handle)
     }
 
-    /// Resolve the calling agent's membership in a room.
+    /// Resolve the calling agent's membership in a room. Guest tokens only
+    /// resolve the room they are scoped to.
     pub async fn resolve(
         &self,
-        agent_id: &str,
+        agent: &AgentId,
         room_id: &str,
     ) -> Result<(RoomHandle, Member), RelayError> {
+        if agent.room_scope().is_some_and(|r| r != room_id) {
+            return Err(RelayError::not_a_member());
+        }
         let handle = self.get(room_id).await?;
-        let agent = agent_id.to_string();
+        let id = agent.id.clone();
         let member = handle
-            .with(move |room| room.member_for_agent(&agent).cloned())
+            .with(move |room| room.member_for_agent(&id).cloned())
             .await?
             .ok_or_else(RelayError::not_a_member)?;
         Ok((handle, member))
@@ -110,10 +133,13 @@ impl Registry {
     /// All rooms the agent belongs to, with the member id in each.
     pub async fn rooms_for_agent(
         &self,
-        agent_id: &str,
+        agent: &AgentId,
     ) -> Result<Vec<(RoomHandle, MemberId)>, RelayError> {
         let mut out = Vec::new();
-        for (room_id, member_id) in self.db.rooms_for_agent(agent_id)? {
+        for (room_id, member_id) in self.db.rooms_for_agent(&agent.id)? {
+            if agent.room_scope().is_some_and(|r| r != room_id) {
+                continue;
+            }
             match self.get(&room_id).await {
                 Ok(h) => out.push((h, member_id)),
                 Err(_) => continue,
@@ -125,10 +151,16 @@ impl Registry {
     /// Redeem an invite URL (or bare `id.secret` token) and join the room.
     pub async fn join(
         &self,
-        agent_id: &str,
+        agent: &AgentId,
         invite_url: &str,
         display_name: Option<String>,
     ) -> Result<(RoomHandle, Member), RelayError> {
+        if agent.room_scope().is_some() {
+            return Err(RelayError::new(
+                ErrorCode::Unauthorized,
+                "this token is scoped to one room; sign in with an account to join more",
+            ));
+        }
         let token = invite_url
             .trim()
             .trim_end_matches('/')
@@ -166,9 +198,9 @@ impl Registry {
             ));
         }
         let handle = self.get(&invite.room_id).await?;
-        let agent = agent_id.to_string();
+        let id = agent.id.clone();
         let member = handle
-            .with(move |room| room.join(&invite, &agent, display_name, now))
+            .with(move |room| room.join(&invite, &id, display_name, now))
             .await??;
         Ok((handle, member))
     }

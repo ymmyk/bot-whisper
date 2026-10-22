@@ -14,6 +14,6 @@ pub mod turn;
 pub use envelope::{Body, Enc, Envelope, EnvelopeError, MAX_BODY_BYTES, PROTOCOL_VERSION};
 pub use error::ErrorCode;
 pub use turn::{
-    MemberId, Roster, SendIntent, SendOutcome, ThreadState, ThreadStatus, TurnError, TurnMode,
-    TurnSignal, TurnView,
+    MemberId, Roster, SendIntent, SendOutcome, StallReason, ThreadState, ThreadStatus,
+    TimeoutOutcome, TurnError, TurnMode, TurnSignal, TurnView,
 };

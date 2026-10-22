@@ -1,6 +1,6 @@
 //! `botwhisper` binary. v1 has one subcommand: `relay`.
 
-use std::{net::SocketAddr, path::PathBuf};
+use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 use clap::{Args, Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
@@ -18,8 +18,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run the relay (remote MCP endpoint + doorbells + SQLite metadata).
-    Relay(RelayArgs),
+    /// Run the relay (remote MCP endpoint + OAuth + doorbells + SQLite metadata).
+    Relay(Box<RelayArgs>),
 }
 
 #[derive(Args, Debug)]
@@ -28,31 +28,75 @@ struct RelayArgs {
     #[arg(long, env = "BW_BIND", default_value = "0.0.0.0:9100")]
     bind: SocketAddr,
 
-    /// SQLite file for room metadata (never message content). Use `memory`
-    /// to keep metadata in RAM only.
+    /// SQLite file for room metadata and accounts (never message content).
+    /// Use `memory` to keep everything in RAM only.
     #[arg(long, env = "BW_DATA", default_value = "data/botwhisper.sqlite3")]
     data: String,
 
-    /// Public base URL used in invite links, e.g. https://relay.example.com.
+    /// Public base URL used in invite links, sign-in links and OAuth
+    /// metadata, e.g. https://relay.example.com.
     #[arg(long, env = "BW_PUBLIC_URL")]
     public_url: Option<String>,
 
-    /// Dev bearer token. Repeat for several agents; each token is one agent
-    /// identity. If none is given, one is generated and printed at startup.
+    /// Dev bearer token (local dev only; needs --allow-dev-tokens). Repeat
+    /// for several agents; each token is one agent identity.
     #[arg(long = "dev-token", env = "BW_DEV_TOKENS", value_delimiter = ',')]
     dev_tokens: Vec<String>,
+
+    /// Accept dev tokens as bearer tokens alongside OAuth. Off by default.
+    #[arg(long, env = "BW_ALLOW_DEV_TOKENS", default_value_t = false)]
+    allow_dev_tokens: bool,
+
+    /// Trust X-Forwarded-For / X-Real-IP for client IPs (behind Caddy or a
+    /// CDN). Off by default so headers cannot spoof rate limits.
+    #[arg(long, env = "BW_BEHIND_PROXY", default_value_t = false)]
+    behind_proxy: bool,
 
     /// How long an unacked message may sit in memory (e.g. 72h, max 14d).
     #[arg(long, env = "BW_UNACKED_TTL", default_value = "72h")]
     unacked_ttl: String,
 
+    /// Turn timeout for rooms with a turn mode (e.g. 30m). The silent floor
+    /// holder is rung once, then skipped (groups) or the thread stalls
+    /// (two parties). `0s` disables.
+    #[arg(long, env = "BW_TURN_TIMEOUT", default_value = "30m")]
+    turn_timeout: String,
+
     /// Members per room cap.
     #[arg(long, env = "BW_MAX_MEMBERS", default_value_t = 8)]
     max_members: u32,
 
-    /// Default turn cap per thread.
+    /// Default message cap per thread.
     #[arg(long, env = "BW_TURN_CAP", default_value_t = 40)]
     turn_cap: u32,
+
+    /// Rate limit: content messages per member per minute (0 = unlimited).
+    #[arg(long, env = "BW_RATE_MSGS_PER_MEMBER", default_value_t = 10)]
+    rate_msgs_per_member: u32,
+
+    /// Rate limit: content messages per room per minute (0 = unlimited).
+    #[arg(long, env = "BW_RATE_MSGS_PER_ROOM", default_value_t = 30)]
+    rate_msgs_per_room: u32,
+
+    /// Rate limit: doorbell rings per member per hour (0 = unlimited).
+    #[arg(long, env = "BW_RATE_DOORBELLS_PER_MEMBER", default_value_t = 20)]
+    rate_doorbells_per_member: u32,
+
+    /// Rate limit: rooms an account may own at once (0 = unlimited).
+    #[arg(long, env = "BW_RATE_ROOMS_PER_ACCOUNT", default_value_t = 20)]
+    rate_rooms_per_account: u32,
+
+    /// Rate limit: sign-in emails per address per hour (0 = unlimited).
+    #[arg(long, env = "BW_RATE_SIGNUPS_PER_EMAIL", default_value_t = 5)]
+    rate_signups_per_email: u32,
+
+    /// Rate limit: sign-in emails per client IP per hour (0 = unlimited).
+    #[arg(long, env = "BW_RATE_SIGNUPS_PER_IP", default_value_t = 20)]
+    rate_signups_per_ip: u32,
+
+    /// Loop guard: minimum seconds between one member's messages (0 = off).
+    #[arg(long, env = "BW_MIN_TURN_INTERVAL", default_value_t = 2)]
+    min_turn_interval: u64,
 
     /// Allow http:// and private-network doorbell URLs (dev / LAN only).
     #[arg(long, env = "BW_ALLOW_INSECURE_DOORBELLS", default_value_t = false)]
@@ -71,9 +115,12 @@ struct RelayArgs {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // `.env` in the working directory (mail provider settings and the like).
+    // Real environment variables win over the file.
+    let _ = dotenvy::dotenv();
     let cli = Cli::parse();
     match cli.command {
-        Command::Relay(args) => relay(args).await,
+        Command::Relay(args) => relay(*args).await,
     }
 }
 
@@ -85,25 +132,28 @@ async fn relay(args: RelayArgs) -> anyhow::Result<()> {
         .with_target(false)
         .init();
 
-    let mut dev_tokens: Vec<String> = args
+    let dev_tokens: Vec<String> = args
         .dev_tokens
         .into_iter()
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty())
         .collect();
-    if dev_tokens.is_empty() {
-        let token = generate_token();
+    if args.allow_dev_tokens && dev_tokens.is_empty() {
+        anyhow::bail!("--allow-dev-tokens needs at least one --dev-token / BW_DEV_TOKENS");
+    }
+    if !args.allow_dev_tokens && !dev_tokens.is_empty() {
         eprintln!(
-            "No --dev-token given. Generated one for this run (each token is one agent identity):"
+            "note: BW_DEV_TOKENS is set but --allow-dev-tokens is off; dev tokens are ignored."
         );
-        eprintln!("  BW_DEV_TOKENS={token}");
-        eprintln!("Pass several with --dev-token A --dev-token B so different bots are different members.");
-        dev_tokens.push(token);
     }
 
     let unacked_ttl = bw_relay::config::parse_expiry(&args.unacked_ttl)
         .map_err(anyhow::Error::msg)?
         .ok_or_else(|| anyhow::anyhow!("--unacked-ttl cannot be `never`"))?;
+    let turn_timeout = bw_relay::config::parse_expiry(&args.turn_timeout)
+        .map_err(anyhow::Error::msg)?
+        .unwrap_or(Duration::ZERO);
+    let mail = bw_relay::mail::MailConfig::from_env().map_err(anyhow::Error::msg)?;
 
     let cfg = bw_relay::RelayConfig {
         bind: args.bind,
@@ -114,6 +164,20 @@ async fn relay(args: RelayArgs) -> anyhow::Result<()> {
         },
         public_url: args.public_url,
         dev_tokens,
+        allow_dev_tokens: args.allow_dev_tokens,
+        mail,
+        behind_proxy: args.behind_proxy,
+        limits: bw_relay::ratelimit::RateLimits {
+            msgs_per_member_per_min: args.rate_msgs_per_member,
+            msgs_per_room_per_min: args.rate_msgs_per_room,
+            doorbells_per_member_per_hour: args.rate_doorbells_per_member,
+            rooms_per_account: args.rate_rooms_per_account,
+            signups_per_email_per_hour: args.rate_signups_per_email,
+            signups_per_ip_per_hour: args.rate_signups_per_ip,
+            min_turn_interval_s: args.min_turn_interval,
+            ..Default::default()
+        },
+        turn_timeout,
         unacked_ttl,
         max_members: args.max_members,
         default_turn_cap: args.turn_cap,
@@ -125,17 +189,16 @@ async fn relay(args: RelayArgs) -> anyhow::Result<()> {
             .collect(),
         ..Default::default()
     };
+    let mail_kind = match &cfg.mail {
+        bw_relay::mail::MailConfig::Log => "log (links printed to stdout; local dev only)",
+        bw_relay::mail::MailConfig::Smtp { .. } => "smtp",
+    };
     eprintln!(
-        "BotWhisper relay v{} on {} — MCP at /mcp, health at /health. v1 is a plaintext relay: the operator can read messages in memory.",
+        "BotWhisper relay v{} on {} — MCP at /mcp (OAuth 2.1 sign-in), health at /health, mail: {}. \
+         v1 is a plaintext relay: the operator can read messages in memory.",
         env!("CARGO_PKG_VERSION"),
-        cfg.bind
+        cfg.bind,
+        mail_kind,
     );
     bw_relay::run(cfg).await
-}
-
-fn generate_token() -> String {
-    use rand::RngCore;
-    let mut b = [0u8; 24];
-    rand::rng().fill_bytes(&mut b);
-    format!("bw_{}", hex::encode(b))
 }

@@ -3,6 +3,8 @@
 
 use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
+use crate::{mail::MailConfig, ratelimit::RateLimits};
+
 /// Everything the relay needs to run.
 #[derive(Debug, Clone)]
 pub struct RelayConfig {
@@ -14,9 +16,31 @@ pub struct RelayConfig {
     /// Public base URL used in invite links, e.g. `https://relay.example.com`.
     /// Defaults to `http://<bind>`.
     pub public_url: Option<String>,
-    /// Dev bearer tokens. Each token is one agent identity.
-    /// OAuth 2.1 replaces this in Phase 1.
+    /// Dev bearer tokens (local dev only). Each token is one agent identity.
+    /// Only honoured when `allow_dev_tokens` is set.
     pub dev_tokens: Vec<String>,
+    /// Accept `dev_tokens` as bearer tokens. Off by default: OAuth 2.1 is
+    /// the normal way in.
+    pub allow_dev_tokens: bool,
+    /// How confirmation mail is sent.
+    pub mail: MailConfig,
+    /// Trust `X-Forwarded-For` / `X-Real-IP` for client IPs (behind Caddy,
+    /// Cloudflare). Off by default so headers cannot spoof rate limits.
+    pub behind_proxy: bool,
+    /// Rate limits.
+    pub limits: RateLimits,
+    /// Turn timeout: how long the floor holder may stay silent before being
+    /// rung, then skipped (groups) or stalled (2 parties). Default 30 min.
+    /// Zero disables.
+    pub turn_timeout: Duration,
+    /// Access token lifetime. Default 1 h.
+    pub access_token_ttl: Duration,
+    /// Refresh token lifetime. Default 90 d.
+    pub refresh_token_ttl: Duration,
+    /// Browser session lifetime (consent page "continue as"). Default 30 d.
+    pub session_ttl: Duration,
+    /// Confirmation link lifetime. Default 15 min.
+    pub login_link_ttl: Duration,
     /// How long an unacked message may sit in memory. Default 72 h, max 14 d.
     pub unacked_ttl: Duration,
     /// Hard cap on members per room. Default 8.
@@ -44,6 +68,15 @@ impl Default for RelayConfig {
             db_path: Some(PathBuf::from("data/botwhisper.sqlite3")),
             public_url: None,
             dev_tokens: Vec::new(),
+            allow_dev_tokens: false,
+            mail: MailConfig::Log,
+            behind_proxy: false,
+            limits: RateLimits::default(),
+            turn_timeout: Duration::from_secs(30 * 60),
+            access_token_ttl: Duration::from_secs(3600),
+            refresh_token_ttl: Duration::from_secs(90 * 24 * 3600),
+            session_ttl: Duration::from_secs(30 * 24 * 3600),
+            login_link_ttl: Duration::from_secs(15 * 60),
             unacked_ttl: Duration::from_secs(72 * 3600),
             max_members: 8,
             default_turn_cap: 40,
@@ -57,12 +90,17 @@ impl Default for RelayConfig {
 }
 
 impl RelayConfig {
-    /// Base URL for invite links.
+    /// Base URL for invite links and OAuth metadata.
     pub fn public_url(&self) -> String {
         match &self.public_url {
             Some(u) => u.trim_end_matches('/').to_string(),
             None => format!("http://{}", self.bind),
         }
+    }
+
+    /// True when the public URL is https (cookies get `Secure`).
+    pub fn is_https(&self) -> bool {
+        self.public_url().starts_with("https://")
     }
 
     /// Clamp values into their documented ranges.

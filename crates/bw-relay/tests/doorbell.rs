@@ -76,7 +76,7 @@ async fn doorbell_payload_is_signed_and_content_free() {
     let relay = TestRelay::start().await;
     let a = relay.bot(TOKENS[0]).await;
     let b = relay.bot(TOKENS[1]).await;
-    let room = make_room(&a, &[&b], "Bells", json!({})).await;
+    let room = make_room(&a, &[&b], "Bells", json!({ "turn_mode": "alternate" })).await;
     let (url, hook) = start_hook(0).await;
 
     // https-only unless the relay allows insecure doorbells (tests do).

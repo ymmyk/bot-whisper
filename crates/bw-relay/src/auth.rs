@@ -1,9 +1,17 @@
 //! Bearer-token authentication for the MCP endpoint.
 //!
-//! Phase 0 uses operator-configured dev tokens. Each distinct token is one
-//! agent identity; the identity is the hex SHA-256 of the token, so the raw
-//! token is never stored. OAuth 2.1 (PKCE + dynamic client registration +
-//! invite-scoped guest tokens) replaces this in Phase 1; see README.
+//! Two kinds of bearer token are accepted:
+//!
+//! - **OAuth 2.1 access tokens** issued by `oauth.rs` (the normal way in).
+//!   The token is opaque; only its SHA-256 is stored. The agent identity is
+//!   `<account>:<client>`, so each connected MCP client is its own agent and
+//!   the account anchors rate limits.
+//! - **Dev tokens** (`--dev-token`, local development only, behind
+//!   `--allow-dev-tokens`). The identity is the hex SHA-256 of the token, as
+//!   in Phase 0, so Phase 0 databases keep working.
+//!
+//! Invite-scoped guests get a token whose scope is `room:<id>`; they can act
+//! only inside that room.
 
 use std::{collections::HashSet, sync::Arc};
 
@@ -15,52 +23,118 @@ use axum::{
 };
 use sha2::{Digest, Sha256};
 
+use crate::db::Db;
+
+/// What a token may do.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Scope {
+    /// A full account: create rooms, join by invite, everything.
+    Rooms,
+    /// An invite-scoped guest: only this room.
+    Room(String),
+}
+
 /// The authenticated agent, stored in request extensions and visible to tool
 /// handlers through `http::request::Parts`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct AgentId(pub String);
+pub struct AgentId {
+    /// Stable agent identity (what room membership is keyed on).
+    pub id: String,
+    /// Account the agent belongs to (rate limits). `None` for dev tokens.
+    pub account: Option<String>,
+    pub scope: Scope,
+}
 
 impl AgentId {
-    /// Derive an agent id from a bearer token.
+    /// Derive a dev-token agent id (Phase 0 compatible).
     pub fn from_token(token: &str) -> Self {
         let digest = Sha256::digest(token.as_bytes());
-        AgentId(hex::encode(&digest[..16]))
+        AgentId {
+            id: hex::encode(&digest[..16]),
+            account: None,
+            scope: Scope::Rooms,
+        }
+    }
+
+    /// Agent id for an OAuth principal.
+    pub fn from_oauth(account_id: &str, client_id: &str, scope: &str) -> Self {
+        let scope = match scope.strip_prefix("room:") {
+            Some(room) => Scope::Room(room.to_string()),
+            None => Scope::Rooms,
+        };
+        AgentId {
+            id: format!("{account_id}:{client_id}"),
+            account: Some(account_id.to_string()),
+            scope,
+        }
+    }
+
+    /// The room a guest token is confined to, if any.
+    pub fn room_scope(&self) -> Option<&str> {
+        match &self.scope {
+            Scope::Room(r) => Some(r),
+            Scope::Rooms => None,
+        }
+    }
+
+    /// Key used for per-account rate limits (falls back to the agent id).
+    pub fn limit_key(&self) -> &str {
+        self.account.as_deref().unwrap_or(&self.id)
     }
 }
 
-/// Validates bearer tokens. Stores only token hashes.
+/// Validates bearer tokens: OAuth access tokens from the database plus the
+/// optional dev-token allowlist. Stores only hashes.
 #[derive(Debug, Clone)]
 pub struct TokenAuth {
-    hashes: Arc<HashSet<String>>,
+    dev_hashes: Arc<HashSet<String>>,
+    db: Db,
+    resource_metadata: Arc<str>,
 }
 
 impl TokenAuth {
-    pub fn new(tokens: &[String]) -> Self {
-        let hashes = tokens
+    pub fn new(dev_tokens: &[String], db: Db, public_url: &str) -> Self {
+        let dev_hashes = dev_tokens
             .iter()
             .filter(|t| !t.trim().is_empty())
             .map(|t| sha256_hex(t.trim()))
             .collect();
         TokenAuth {
-            hashes: Arc::new(hashes),
+            dev_hashes: Arc::new(dev_hashes),
+            db,
+            resource_metadata: format!("{public_url}/.well-known/oauth-protected-resource").into(),
         }
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.hashes.is_empty()
+    pub fn has_dev_tokens(&self) -> bool {
+        !self.dev_hashes.is_empty()
     }
 
-    /// Returns the agent id when the token is valid.
+    /// Returns the agent when the token is valid.
     pub fn authenticate(&self, token: &str) -> Option<AgentId> {
         let token = token.trim();
-        if token.is_empty() || !self.hashes.contains(&sha256_hex(token)) {
+        if token.is_empty() {
             return None;
         }
-        Some(AgentId::from_token(token))
+        let hash = sha256_hex(token);
+        if self.dev_hashes.contains(&hash) {
+            return Some(AgentId::from_token(token));
+        }
+        let row = self
+            .db
+            .get_token(&hash, "access", crate::doorbell::now_unix())
+            .ok()
+            .flatten()?;
+        Some(AgentId::from_oauth(
+            &row.account_id,
+            &row.client_id,
+            &row.scope,
+        ))
     }
 }
 
-fn sha256_hex(s: &str) -> String {
+/// Hex SHA-256 of a secret, the only form ever stored.
+pub fn sha256_hex(s: &str) -> String {
     hex::encode(Sha256::digest(s.as_bytes()))
 }
 
@@ -83,19 +157,20 @@ pub async fn require_bearer(
             req.extensions_mut().insert(agent);
             next.run(req).await
         }
-        None => unauthorized(),
+        None => unauthorized(&auth.resource_metadata),
     }
 }
 
-fn unauthorized() -> Response {
+fn unauthorized(resource_metadata: &str) -> Response {
     (
         StatusCode::UNAUTHORIZED,
         [(
             header::WWW_AUTHENTICATE,
-            // TODO(oauth): add resource_metadata="<public_url>/.well-known/oauth-protected-resource"
-            "Bearer realm=\"botwhisper\", error=\"invalid_token\"",
+            format!(
+                "Bearer realm=\"botwhisper\", error=\"invalid_token\", resource_metadata=\"{resource_metadata}\""
+            ),
         )],
-        "unauthorized: send `Authorization: Bearer <token>`",
+        "unauthorized: send `Authorization: Bearer <token>` (sign in with OAuth; see /.well-known/oauth-protected-resource)",
     )
         .into_response()
 }
@@ -106,12 +181,37 @@ mod tests {
 
     #[test]
     fn distinct_tokens_are_distinct_agents() {
-        let auth = TokenAuth::new(&["alice".into(), "bob".into()]);
+        let db = Db::open_in_memory().unwrap();
+        let auth = TokenAuth::new(&["alice".into(), "bob".into()], db, "http://x");
         let a = auth.authenticate("alice").unwrap();
         let b = auth.authenticate("bob").unwrap();
         assert_ne!(a, b);
         assert_eq!(a, auth.authenticate(" alice ").unwrap());
+        assert_eq!(a.account, None);
         assert!(auth.authenticate("carol").is_none());
         assert!(auth.authenticate("").is_none());
+    }
+
+    #[test]
+    fn oauth_tokens_come_from_the_db() {
+        let db = Db::open_in_memory().unwrap();
+        let now = crate::doorbell::now_unix();
+        db.insert_token(
+            &sha256_hex("tok"),
+            &crate::db::TokenRow {
+                kind: "access".into(),
+                client_id: "cl".into(),
+                account_id: "acct".into(),
+                scope: "room:r1".into(),
+                expires_at: now + 60,
+            },
+        )
+        .unwrap();
+        let auth = TokenAuth::new(&[], db, "http://x");
+        let a = auth.authenticate("tok").unwrap();
+        assert_eq!(a.id, "acct:cl");
+        assert_eq!(a.room_scope(), Some("r1"));
+        assert_eq!(a.limit_key(), "acct");
+        assert!(auth.authenticate("other").is_none());
     }
 }

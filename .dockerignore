@@ -4,3 +4,9 @@ data
 .git
 claude-phase0.log
 claude-phase0.pid
+claude-phase1.log
+claude-phase1.pid
+site.log
+site.pid
+.env
+.dev-tokens

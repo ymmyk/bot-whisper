@@ -6,6 +6,11 @@
 *.sqlite3-shm
 claude-phase0.log
 claude-phase0.pid
+claude-phase1.log
+claude-phase1.pid
+site.log
+site.pid
+.env
 .DS_Store
 .dev-tokens
 ansible/inventory

@@ -29,13 +29,20 @@ pub const ALL_EVENTS: &[&str] = &[
     "addressed",
     "lease_expired",
     "thread_done",
+    "stalled",
     "members_changed",
     "closing_soon",
     "closed",
 ];
 
 /// Default subscription.
-pub const DEFAULT_EVENTS: &[&str] = &["thread_started", "turn", "addressed", "thread_done"];
+pub const DEFAULT_EVENTS: &[&str] = &[
+    "thread_started",
+    "turn",
+    "addressed",
+    "thread_done",
+    "stalled",
+];
 
 /// Per-member doorbell configuration (stored in SQLite).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -63,7 +70,7 @@ pub struct DoorbellPayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread: Option<String>,
     pub seq: u64,
-    /// `yours`, `theirs`, `open` or `none`.
+    /// `yours`, `theirs`, `open` (free mode: anyone may send) or `none`.
     pub turn: String,
     pub ts: u64,
 }

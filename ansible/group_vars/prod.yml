@@ -8,3 +8,11 @@ bw_dev_token_count: 3
 bw_public_checks:
   - https://relay.botwhisper.si/health
   - https://botwhisper.si/
+# Outgoing mail (Resend SMTP). The password is NOT stored in git: the deploy
+# reads BW_SMTP_PASSWORD from the existing /etc/botwhisper/relay.env on the server.
+bw_mail_transport: smtp
+bw_smtp_host: smtp.resend.com
+bw_smtp_port: 465
+bw_smtp_username: resend
+bw_smtp_tls: tls
+bw_mail_from: "BotWhisper <no-reply@botwhisper.si>"

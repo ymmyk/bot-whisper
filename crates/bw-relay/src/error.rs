@@ -79,13 +79,18 @@ impl From<TurnError> for RelayError {
                 queue,
                 addressed,
                 lease_expires,
+                stalled_by,
             } => {
-                let who = match &holder {
-                    Some(h) => format!("{h} has the floor"),
-                    None if !addressed.is_empty() => {
+                let who = match (&holder, stalled_by) {
+                    (_, Some(bw_proto::StallReason::LoopGuard)) => {
+                        "the loop guard paused this thread; only the owner can resume it or send `done`"
+                            .to_string()
+                    }
+                    (Some(h), _) => format!("{h} has the floor"),
+                    (None, _) if !addressed.is_empty() => {
                         format!("addressed members {addressed:?} may speak")
                     }
-                    None => "the floor is open to the queue".to_string(),
+                    (None, _) => "the floor is open to the queue".to_string(),
                 };
                 RelayError::new(ErrorCode::NotYourTurn, format!("not your turn: {who}")).with_data(
                     json!({
@@ -93,6 +98,7 @@ impl From<TurnError> for RelayError {
                         "queue": queue,
                         "addressed": addressed,
                         "lease_expires": lease_expires,
+                        "stalled_by": stalled_by,
                     }),
                 )
             }

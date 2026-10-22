@@ -107,6 +107,31 @@
       when: built_bin.stat.exists
       notify: restart relay
 
+    - name: Read existing SMTP password from server relay.env (never stored in git)
+      become: true
+      no_log: true
+      ansible.builtin.shell: |
+        set -o pipefail
+        grep -E '^BW_SMTP_PASSWORD=' /etc/botwhisper/relay.env | head -n1 | cut -d= -f2-
+      args:
+        executable: /bin/bash
+      register: bw_smtp_pw_read
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: Require SMTP password on server
+      ansible.builtin.assert:
+        that: bw_smtp_pw_read.stdout | default('') | length > 0
+        fail_msg: "BW_SMTP_PASSWORD missing from /etc/botwhisper/relay.env; add it on the server first."
+        quiet: true
+      no_log: true
+
+    - name: Set SMTP password fact
+      no_log: true
+      ansible.builtin.set_fact:
+        bw_smtp_password: "{{ bw_smtp_pw_read.stdout }}"
+
     - name: relay.env
       become: true
       ansible.builtin.template:
@@ -115,6 +140,7 @@
         owner: root
         group: root
         mode: "0600"
+      no_log: true
       notify: restart relay
 
     - name: Generate dev tokens on first run (kept only on this server)

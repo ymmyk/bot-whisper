@@ -52,7 +52,61 @@ CREATE TABLE IF NOT EXISTS doorbells (
     events        TEXT NOT NULL,
     PRIMARY KEY (room_id, member_id)
 );
+-- Accounts and OAuth 2.1 (Phase 1). Every secret is stored hashed.
+CREATE TABLE IF NOT EXISTS accounts (
+    id            TEXT PRIMARY KEY,
+    email         TEXT UNIQUE,
+    kind          TEXT NOT NULL,
+    created_at    INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS oauth_clients (
+    id            TEXT PRIMARY KEY,
+    secret_hash   TEXT,
+    name          TEXT,
+    redirect_uris TEXT NOT NULL,
+    auth_method   TEXT NOT NULL,
+    created_at    INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS oauth_codes (
+    code_hash      TEXT PRIMARY KEY,
+    client_id      TEXT NOT NULL,
+    redirect_uri   TEXT NOT NULL,
+    code_challenge TEXT NOT NULL,
+    account_id     TEXT NOT NULL,
+    scope          TEXT NOT NULL,
+    expires_at     INTEGER NOT NULL,
+    used           INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS oauth_tokens (
+    token_hash    TEXT PRIMARY KEY,
+    kind          TEXT NOT NULL,
+    client_id     TEXT NOT NULL,
+    account_id    TEXT NOT NULL,
+    scope         TEXT NOT NULL,
+    expires_at    INTEGER NOT NULL,
+    revoked       INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS oauth_tokens_by_account ON oauth_tokens(account_id);
+CREATE TABLE IF NOT EXISTS pending_logins (
+    token_hash    TEXT PRIMARY KEY,
+    email         TEXT NOT NULL,
+    authz         TEXT NOT NULL,
+    expires_at    INTEGER NOT NULL,
+    used          INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS sessions (
+    token_hash    TEXT PRIMARY KEY,
+    account_id    TEXT NOT NULL,
+    expires_at    INTEGER NOT NULL
+);
 "#;
+
+/// Columns added after Phase 0. `ALTER TABLE ADD COLUMN` fails if the column
+/// exists, which is how we detect an already-migrated file.
+const MIGRATIONS: &[&str] = &[
+    "ALTER TABLE rooms ADD COLUMN thread_start TEXT NOT NULL DEFAULT 'owner'",
+    "ALTER TABLE rooms ADD COLUMN owner_account TEXT",
+];
 
 /// A room row.
 #[derive(Debug, Clone)]
@@ -63,9 +117,103 @@ pub struct RoomRow {
     pub created_at: u64,
     pub expires_at: Option<u64>,
     pub max_members: u32,
-    /// `None` means "auto": alternate for two members, queue for groups.
-    pub turn_mode: Option<TurnMode>,
+    /// Room turn mode. `free` by default (turn control is opt-in).
+    pub turn_mode: TurnMode,
     pub next_member_n: u32,
+    /// Who may open a new thread after the owner's `done`.
+    pub thread_start: ThreadStart,
+    /// Account that owns the room (rate limits). `None` for dev tokens.
+    pub owner_account: Option<String>,
+}
+
+/// Who may start a new thread once the owner has ended one (fix 5c).
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ThreadStart {
+    /// Only the owner (default).
+    #[default]
+    Owner,
+    /// Any member, by sending into the idle room or calling `start_thread`.
+    Anyone,
+}
+
+impl ThreadStart {
+    fn as_str(self) -> &'static str {
+        match self {
+            ThreadStart::Owner => "owner",
+            ThreadStart::Anyone => "anyone",
+        }
+    }
+
+    fn parse(s: &str) -> Self {
+        if s == "anyone" {
+            ThreadStart::Anyone
+        } else {
+            ThreadStart::Owner
+        }
+    }
+}
+
+/// An account row. `email` is `None` for invite-scoped guests.
+#[derive(Debug, Clone)]
+pub struct AccountRow {
+    pub id: String,
+    pub email: Option<String>,
+    /// `user` or `guest`.
+    pub kind: String,
+    pub created_at: u64,
+}
+
+/// A dynamically registered OAuth client.
+#[derive(Debug, Clone)]
+pub struct ClientRow {
+    pub id: String,
+    pub secret_hash: Option<String>,
+    pub name: Option<String>,
+    pub redirect_uris: Vec<String>,
+    /// `none` (public client) or `client_secret_post` / `client_secret_basic`.
+    pub auth_method: String,
+    pub created_at: u64,
+}
+
+/// An authorization code (stored hashed).
+#[derive(Debug, Clone)]
+pub struct CodeRow {
+    pub client_id: String,
+    pub redirect_uri: String,
+    pub code_challenge: String,
+    pub account_id: String,
+    pub scope: String,
+    pub expires_at: u64,
+}
+
+/// An access or refresh token (stored hashed).
+#[derive(Debug, Clone)]
+pub struct TokenRow {
+    pub kind: String,
+    pub client_id: String,
+    pub account_id: String,
+    pub scope: String,
+    pub expires_at: u64,
+}
+
+/// A pending email confirmation.
+#[derive(Debug, Clone)]
+pub struct PendingLogin {
+    pub email: String,
+    /// The serialized authorization request to resume after confirmation.
+    pub authz: String,
+    pub expires_at: u64,
 }
 
 /// A member row.
@@ -121,6 +269,14 @@ impl Db {
     fn init(conn: Connection) -> Result<Self> {
         conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;")?;
         conn.execute_batch(SCHEMA)?;
+        for m in MIGRATIONS {
+            // "duplicate column name" means this file is already migrated.
+            if let Err(e) = conn.execute_batch(m) {
+                if !e.to_string().contains("duplicate column") {
+                    return Err(e.into());
+                }
+            }
+        }
         Ok(Db {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -136,8 +292,8 @@ impl Db {
     pub fn insert_room(&self, room: &RoomRow) -> Result<()> {
         self.with(|c| {
             c.execute(
-                "INSERT INTO rooms (id, title, owner, created_at, expires_at, max_members, turn_mode, next_member_n)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                "INSERT INTO rooms (id, title, owner, created_at, expires_at, max_members, turn_mode, next_member_n, thread_start, owner_account)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     room.id,
                     room.title,
@@ -146,7 +302,9 @@ impl Db {
                     room.expires_at.map(|v| v as i64),
                     room.max_members,
                     mode_str(room.turn_mode),
-                    room.next_member_n
+                    room.next_member_n,
+                    room.thread_start.as_str(),
+                    room.owner_account,
                 ],
             )?;
             Ok(())
@@ -156,7 +314,7 @@ impl Db {
     pub fn get_room(&self, id: &str) -> Result<Option<RoomRow>> {
         self.with(|c| {
             c.query_row(
-                "SELECT id, title, owner, created_at, expires_at, max_members, turn_mode, next_member_n
+                "SELECT id, title, owner, created_at, expires_at, max_members, turn_mode, next_member_n, thread_start, owner_account
                  FROM rooms WHERE id = ?1",
                 params![id],
                 |r| {
@@ -169,10 +327,23 @@ impl Db {
                         max_members: r.get(5)?,
                         turn_mode: parse_mode(&r.get::<_, String>(6)?),
                         next_member_n: r.get(7)?,
+                        thread_start: ThreadStart::parse(&r.get::<_, String>(8)?),
+                        owner_account: r.get(9)?,
                     })
                 },
             )
             .optional()
+        })
+    }
+
+    pub fn count_rooms_owned_by(&self, account_id: &str) -> Result<u32> {
+        self.with(|c| {
+            c.query_row(
+                "SELECT COUNT(*) FROM rooms WHERE owner_account = ?1",
+                params![account_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|v| v as u32)
         })
     }
 
@@ -393,27 +564,316 @@ impl Db {
             rows.collect()
         })
     }
-}
 
-fn mode_str(m: Option<TurnMode>) -> &'static str {
-    match m {
-        None => "auto",
-        Some(TurnMode::Alternate) => "alternate",
-        Some(TurnMode::RoundRobin) => "round_robin",
-        Some(TurnMode::Queue) => "queue",
-        Some(TurnMode::Moderated) => "moderated",
-        Some(TurnMode::Free) => "free",
+    // ----- accounts -----
+
+    pub fn insert_account(&self, a: &AccountRow) -> Result<()> {
+        self.with(|c| {
+            c.execute(
+                "INSERT INTO accounts (id, email, kind, created_at) VALUES (?1, ?2, ?3, ?4)",
+                params![a.id, a.email, a.kind, a.created_at as i64],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn get_account(&self, id: &str) -> Result<Option<AccountRow>> {
+        self.with(|c| {
+            c.query_row(
+                "SELECT id, email, kind, created_at FROM accounts WHERE id = ?1",
+                params![id],
+                account_row,
+            )
+            .optional()
+        })
+    }
+
+    pub fn delete_account(&self, id: &str) -> Result<()> {
+        self.with(|c| {
+            c.execute("DELETE FROM accounts WHERE id = ?1", params![id])?;
+            Ok(())
+        })
+    }
+
+    pub fn account_by_email(&self, email: &str) -> Result<Option<AccountRow>> {
+        self.with(|c| {
+            c.query_row(
+                "SELECT id, email, kind, created_at FROM accounts WHERE email = ?1",
+                params![email],
+                account_row,
+            )
+            .optional()
+        })
+    }
+
+    // ----- oauth clients -----
+
+    pub fn insert_client(&self, cl: &ClientRow) -> Result<()> {
+        self.with(|c| {
+            c.execute(
+                "INSERT INTO oauth_clients (id, secret_hash, name, redirect_uris, auth_method, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    cl.id,
+                    cl.secret_hash,
+                    cl.name,
+                    serde_json::to_string(&cl.redirect_uris).unwrap_or_default(),
+                    cl.auth_method,
+                    cl.created_at as i64
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn get_client(&self, id: &str) -> Result<Option<ClientRow>> {
+        self.with(|c| {
+            c.query_row(
+                "SELECT id, secret_hash, name, redirect_uris, auth_method, created_at
+                 FROM oauth_clients WHERE id = ?1",
+                params![id],
+                |r| {
+                    let uris: String = r.get(3)?;
+                    Ok(ClientRow {
+                        id: r.get(0)?,
+                        secret_hash: r.get(1)?,
+                        name: r.get(2)?,
+                        redirect_uris: serde_json::from_str(&uris).unwrap_or_default(),
+                        auth_method: r.get(4)?,
+                        created_at: r.get::<_, i64>(5)? as u64,
+                    })
+                },
+            )
+            .optional()
+        })
+    }
+
+    // ----- authorization codes -----
+
+    pub fn insert_code(&self, code_hash: &str, row: &CodeRow) -> Result<()> {
+        self.with(|c| {
+            c.execute(
+                "INSERT INTO oauth_codes (code_hash, client_id, redirect_uri, code_challenge, account_id, scope, expires_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    code_hash,
+                    row.client_id,
+                    row.redirect_uri,
+                    row.code_challenge,
+                    row.account_id,
+                    row.scope,
+                    row.expires_at as i64
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Consume a code: returns it only if unused and marks it used
+    /// atomically. A second redemption gets `None`.
+    pub fn consume_code(&self, code_hash: &str) -> Result<Option<CodeRow>> {
+        self.with(|c| {
+            let n = c.execute(
+                "UPDATE oauth_codes SET used = 1 WHERE code_hash = ?1 AND used = 0",
+                params![code_hash],
+            )?;
+            if n != 1 {
+                return Ok(None);
+            }
+            c.query_row(
+                "SELECT client_id, redirect_uri, code_challenge, account_id, scope, expires_at
+                 FROM oauth_codes WHERE code_hash = ?1",
+                params![code_hash],
+                |r| {
+                    Ok(CodeRow {
+                        client_id: r.get(0)?,
+                        redirect_uri: r.get(1)?,
+                        code_challenge: r.get(2)?,
+                        account_id: r.get(3)?,
+                        scope: r.get(4)?,
+                        expires_at: r.get::<_, i64>(5)? as u64,
+                    })
+                },
+            )
+            .optional()
+        })
+    }
+
+    // ----- tokens -----
+
+    pub fn insert_token(&self, token_hash: &str, row: &TokenRow) -> Result<()> {
+        self.with(|c| {
+            c.execute(
+                "INSERT INTO oauth_tokens (token_hash, kind, client_id, account_id, scope, expires_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    token_hash,
+                    row.kind,
+                    row.client_id,
+                    row.account_id,
+                    row.scope,
+                    row.expires_at as i64
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Look up a live (unrevoked, unexpired) token of `kind`.
+    pub fn get_token(&self, token_hash: &str, kind: &str, now: u64) -> Result<Option<TokenRow>> {
+        self.with(|c| {
+            c.query_row(
+                "SELECT kind, client_id, account_id, scope, expires_at FROM oauth_tokens
+                 WHERE token_hash = ?1 AND kind = ?2 AND revoked = 0 AND expires_at > ?3",
+                params![token_hash, kind, now as i64],
+                |r| {
+                    Ok(TokenRow {
+                        kind: r.get(0)?,
+                        client_id: r.get(1)?,
+                        account_id: r.get(2)?,
+                        scope: r.get(3)?,
+                        expires_at: r.get::<_, i64>(4)? as u64,
+                    })
+                },
+            )
+            .optional()
+        })
+    }
+
+    /// Revoke one token. Returns false if it was already revoked or unknown.
+    pub fn revoke_token(&self, token_hash: &str) -> Result<bool> {
+        self.with(|c| {
+            let n = c.execute(
+                "UPDATE oauth_tokens SET revoked = 1 WHERE token_hash = ?1 AND revoked = 0",
+                params![token_hash],
+            )?;
+            Ok(n == 1)
+        })
+    }
+
+    /// Drop expired codes, tokens, logins and sessions.
+    pub fn sweep_auth(&self, now: u64) -> Result<()> {
+        self.with(|c| {
+            let n = now as i64;
+            c.execute("DELETE FROM oauth_codes WHERE expires_at <= ?1", params![n])?;
+            c.execute(
+                "DELETE FROM oauth_tokens WHERE expires_at <= ?1 OR revoked = 1",
+                params![n],
+            )?;
+            c.execute(
+                "DELETE FROM pending_logins WHERE expires_at <= ?1",
+                params![n],
+            )?;
+            c.execute("DELETE FROM sessions WHERE expires_at <= ?1", params![n])?;
+            Ok(())
+        })
+    }
+
+    // ----- pending logins and sessions -----
+
+    pub fn insert_pending_login(&self, token_hash: &str, p: &PendingLogin) -> Result<()> {
+        self.with(|c| {
+            c.execute(
+                "INSERT INTO pending_logins (token_hash, email, authz, expires_at) VALUES (?1, ?2, ?3, ?4)",
+                params![token_hash, p.email, p.authz, p.expires_at as i64],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Consume a confirmation token: single use, must be unexpired.
+    pub fn consume_pending_login(
+        &self,
+        token_hash: &str,
+        now: u64,
+    ) -> Result<Option<PendingLogin>> {
+        self.with(|c| {
+            let n = c.execute(
+                "UPDATE pending_logins SET used = 1 WHERE token_hash = ?1 AND used = 0 AND expires_at > ?2",
+                params![token_hash, now as i64],
+            )?;
+            if n != 1 {
+                return Ok(None);
+            }
+            c.query_row(
+                "SELECT email, authz, expires_at FROM pending_logins WHERE token_hash = ?1",
+                params![token_hash],
+                |r| {
+                    Ok(PendingLogin {
+                        email: r.get(0)?,
+                        authz: r.get(1)?,
+                        expires_at: r.get::<_, i64>(2)? as u64,
+                    })
+                },
+            )
+            .optional()
+        })
+    }
+
+    pub fn insert_session(
+        &self,
+        token_hash: &str,
+        account_id: &str,
+        expires_at: u64,
+    ) -> Result<()> {
+        self.with(|c| {
+            c.execute(
+                "INSERT INTO sessions (token_hash, account_id, expires_at) VALUES (?1, ?2, ?3)",
+                params![token_hash, account_id, expires_at as i64],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn session_account(&self, token_hash: &str, now: u64) -> Result<Option<String>> {
+        self.with(|c| {
+            c.query_row(
+                "SELECT account_id FROM sessions WHERE token_hash = ?1 AND expires_at > ?2",
+                params![token_hash, now as i64],
+                |r| r.get(0),
+            )
+            .optional()
+        })
+    }
+
+    pub fn delete_session(&self, token_hash: &str) -> Result<()> {
+        self.with(|c| {
+            c.execute(
+                "DELETE FROM sessions WHERE token_hash = ?1",
+                params![token_hash],
+            )?;
+            Ok(())
+        })
     }
 }
 
-fn parse_mode(s: &str) -> Option<TurnMode> {
+fn account_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<AccountRow> {
+    Ok(AccountRow {
+        id: r.get(0)?,
+        email: r.get(1)?,
+        kind: r.get(2)?,
+        created_at: r.get::<_, i64>(3)? as u64,
+    })
+}
+
+fn mode_str(m: TurnMode) -> &'static str {
+    match m {
+        TurnMode::Alternate => "alternate",
+        TurnMode::RoundRobin => "round_robin",
+        TurnMode::Queue => "queue",
+        TurnMode::Moderated => "moderated",
+        TurnMode::Free => "free",
+    }
+}
+
+/// Unknown values (including Phase 0's `auto`) fall back to `free`.
+fn parse_mode(s: &str) -> TurnMode {
     match s {
-        "alternate" => Some(TurnMode::Alternate),
-        "round_robin" => Some(TurnMode::RoundRobin),
-        "queue" => Some(TurnMode::Queue),
-        "moderated" => Some(TurnMode::Moderated),
-        "free" => Some(TurnMode::Free),
-        _ => None,
+        "alternate" => TurnMode::Alternate,
+        "round_robin" => TurnMode::RoundRobin,
+        "queue" => TurnMode::Queue,
+        "moderated" => TurnMode::Moderated,
+        _ => TurnMode::Free,
     }
 }
 
@@ -431,10 +891,13 @@ mod tests {
             created_at: 1,
             expires_at: None,
             max_members: 8,
-            turn_mode: Some(TurnMode::Queue),
+            turn_mode: TurnMode::Queue,
             next_member_n: 2,
+            thread_start: ThreadStart::Anyone,
+            owner_account: Some("acct".into()),
         })
         .unwrap();
+        assert_eq!(db.count_rooms_owned_by("acct").unwrap(), 1);
         db.insert_member(
             "r1",
             &MemberRow {
@@ -459,14 +922,101 @@ mod tests {
         assert!(db.redeem_invite("i1", 5).unwrap());
         assert!(!db.redeem_invite("i1", 6).unwrap(), "second redeem loses");
         assert_eq!(db.rooms_for_agent("a").unwrap().len(), 1);
-        assert_eq!(
-            db.get_room("r1").unwrap().unwrap().turn_mode,
-            Some(TurnMode::Queue)
-        );
+        let room = db.get_room("r1").unwrap().unwrap();
+        assert_eq!(room.turn_mode, TurnMode::Queue);
+        assert_eq!(room.thread_start, ThreadStart::Anyone);
         db.delete_room("r1").unwrap();
         assert!(db.get_room("r1").unwrap().is_none());
         assert!(db.members("r1").unwrap().is_empty());
         assert!(db.get_invite("i1").unwrap().is_none());
         assert!(db.rooms_for_agent("a").unwrap().is_empty());
+        assert_eq!(db.count_rooms_owned_by("acct").unwrap(), 0);
+    }
+
+    #[test]
+    fn migrations_are_idempotent_and_upgrade_phase0_files() {
+        // A Phase 0 schema without the new columns.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE rooms (id TEXT PRIMARY KEY, title TEXT NOT NULL, owner TEXT NOT NULL,
+             created_at INTEGER NOT NULL, expires_at INTEGER, max_members INTEGER NOT NULL,
+             turn_mode TEXT NOT NULL, next_member_n INTEGER NOT NULL);
+             INSERT INTO rooms VALUES ('old', 't', 'm1', 1, NULL, 8, 'auto', 2);",
+        )
+        .unwrap();
+        let db = Db::init(conn).unwrap();
+        let room = db.get_room("old").unwrap().unwrap();
+        assert_eq!(room.turn_mode, TurnMode::Free, "auto becomes free");
+        assert_eq!(room.thread_start, ThreadStart::Owner);
+        assert_eq!(room.owner_account, None);
+        // Re-running init on the same schema is fine.
+        let again = Db::open_in_memory().unwrap();
+        assert_eq!(again.count_rooms().unwrap(), 0);
+    }
+
+    #[test]
+    fn codes_logins_and_tokens_are_single_use_and_expire() {
+        let db = Db::open_in_memory().unwrap();
+        db.insert_code(
+            "c",
+            &CodeRow {
+                client_id: "cl".into(),
+                redirect_uri: "http://127.0.0.1/cb".into(),
+                code_challenge: "x".into(),
+                account_id: "a".into(),
+                scope: "rooms".into(),
+                expires_at: 100,
+            },
+        )
+        .unwrap();
+        assert!(db.consume_code("c").unwrap().is_some());
+        assert!(db.consume_code("c").unwrap().is_none(), "second use fails");
+
+        db.insert_pending_login(
+            "p",
+            &PendingLogin {
+                email: "e".into(),
+                authz: "{}".into(),
+                expires_at: 100,
+            },
+        )
+        .unwrap();
+        assert!(
+            db.consume_pending_login("p", 200).unwrap().is_none(),
+            "expired"
+        );
+        db.insert_pending_login(
+            "q",
+            &PendingLogin {
+                email: "e".into(),
+                authz: "{}".into(),
+                expires_at: 100,
+            },
+        )
+        .unwrap();
+        assert!(db.consume_pending_login("q", 50).unwrap().is_some());
+        assert!(db.consume_pending_login("q", 50).unwrap().is_none());
+
+        let row = TokenRow {
+            kind: "access".into(),
+            client_id: "cl".into(),
+            account_id: "a".into(),
+            scope: "rooms".into(),
+            expires_at: 100,
+        };
+        db.insert_token("t", &row).unwrap();
+        assert!(db.get_token("t", "access", 50).unwrap().is_some());
+        assert!(
+            db.get_token("t", "refresh", 50).unwrap().is_none(),
+            "kind matters"
+        );
+        assert!(
+            db.get_token("t", "access", 100).unwrap().is_none(),
+            "expired"
+        );
+        assert!(db.revoke_token("t").unwrap());
+        assert!(!db.revoke_token("t").unwrap());
+        assert!(db.get_token("t", "access", 50).unwrap().is_none());
+        db.sweep_auth(1000).unwrap();
     }
 }

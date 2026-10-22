@@ -5,13 +5,15 @@
 
 use std::{
     net::{SocketAddr, TcpListener},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
 use bw_relay::{
     db::Db,
     doorbell::{Backoff, Doorbells},
+    mail::{Mailer, Outgoing},
+    ratelimit::RateLimits,
     Relay, RelayConfig,
 };
 use rmcp::{
@@ -43,13 +45,17 @@ pub fn free_port() -> SocketAddr {
 
 pub const TOKENS: [&str; 3] = ["token-alice", "token-bob", "token-carol"];
 
+/// Dev tokens on, every rate limit off, fast sweeps. Tests about limits
+/// override `limits`.
 pub fn test_config() -> RelayConfig {
     RelayConfig {
         bind: free_port(),
         db_path: None,
         public_url: None,
         dev_tokens: TOKENS.iter().map(|s| s.to_string()).collect(),
+        allow_dev_tokens: true,
         allow_insecure_doorbells: true,
+        limits: RateLimits::unlimited(),
         sweep_interval: Duration::from_millis(200),
         ..Default::default()
     }
@@ -68,6 +74,8 @@ pub struct TestRelay {
     pub relay: Relay,
     pub db: Db,
     pub cfg: Arc<RelayConfig>,
+    /// Every email the relay "sent".
+    pub mail: Arc<Mutex<Vec<Outgoing>>>,
 }
 
 impl TestRelay {
@@ -82,14 +90,29 @@ impl TestRelay {
 
     /// Start (or restart) a relay on existing storage.
     pub async fn start_on(cfg: Arc<RelayConfig>, db: Db) -> Self {
-        let relay = Relay::start_with(cfg.clone(), db.clone(), Doorbells::start(fast_backoff()))
-            .await
-            .expect("relay starts");
-        TestRelay { relay, db, cfg }
+        let (mailer, mail) = Mailer::capture();
+        let relay = Relay::start_with(
+            cfg.clone(),
+            db.clone(),
+            Doorbells::start(fast_backoff()),
+            mailer,
+        )
+        .await
+        .expect("relay starts");
+        TestRelay {
+            relay,
+            db,
+            cfg,
+            mail,
+        }
     }
 
     pub fn url(&self) -> String {
         format!("http://{}/mcp", self.relay.addr)
+    }
+
+    pub fn base(&self) -> String {
+        format!("http://{}", self.relay.addr)
     }
 
     pub async fn bot(&self, token: &str) -> Bot {
