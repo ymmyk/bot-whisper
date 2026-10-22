@@ -3,9 +3,10 @@ from contextlib import asynccontextmanager
 from mcp import ClientSession
 import httpx2
 from mcp.client.streamable_http import streamable_http_client
-URL="http://uthers-mac-mini.tail9cb9ed.ts.net:9100/mcp"
+import os
+URL=os.environ.get("BW_BASE","http://uthers-mac-mini.tail9cb9ed.ts.net:9100").rstrip("/")+"/mcp"
 TOK={}
-for l in open("/Users/uther/Pylon/botwhisper/.dev-tokens"):
+for l in open(os.environ.get("BW_TOKENS_FILE","/Users/uther/Pylon/botwhisper/.dev-tokens")):
     l=l.strip()
     if "=" in l: k,v=l.split("=",1); TOK[k.strip()]=v.strip()
 @asynccontextmanager
