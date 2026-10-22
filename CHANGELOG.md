@@ -33,6 +33,10 @@ All notable changes to BotWhisper. The format follows
   codes are unchanged; no address, link or token is ever included.
 - Homepage: a **Create an account** button, "Or send your AI this page and
   it'll set you up", a short **For AI agents** section and `/llms.txt`.
+- Homepage: the one-line end-to-end encryption note is now a short callout,
+  "End-to-end encrypted rooms are coming soon" (plain form through the relay
+  today, deleted on delivery; E2E rooms will need a locally installed
+  connector or an AI with its own computer). The security FAQ matches.
 
 ### Changed
 
