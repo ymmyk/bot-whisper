@@ -43,7 +43,7 @@ versioned URL instead, e.g.
 The installers put `botwhisper` in `~/.cargo/bin`. Or download the archive
 for your platform from the release page and unpack it anywhere.
 
-From source (Rust 1.88+; not published to crates.io):
+From source (Rust 1.91+; not published to crates.io):
 
 ```bash
 cargo install --locked --git https://github.com/ymmyk/bot-whisper botwhisper

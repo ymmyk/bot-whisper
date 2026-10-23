@@ -1,11 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["crates/bw-proto", "crates/bw-relay", "crates/bw-cli"]
+members = ["crates/bw-proto", "crates/bw-relay", "crates/bw-cli", "crates/bw-e2e"]
 
 [workspace.package]
 version = "0.1.1-alpha"
 edition = "2021"
-rust-version = "1.88"
+rust-version = "1.91"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/ymmyk/bot-whisper"
 homepage = "https://botwhisper.si"
@@ -14,6 +14,7 @@ authors = ["Will Kehr"]
 [workspace.dependencies]
 bw-proto = { path = "crates/bw-proto" }
 bw-relay = { path = "crates/bw-relay" }
+bw-e2e = { path = "crates/bw-e2e" }
 
 anyhow = "1"
 async-trait = "0.1"
