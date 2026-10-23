@@ -127,7 +127,7 @@ untouched and gated until Will signs off the cutover plan.
    `added` → active) / `e2e_fetch` (long-poll) / `e2e_ack` / `e2e_send`
    (memory only, rate-limited, rings `message`); handshakes and key packages
    persist in SQLite until acked/claimed; plaintext tools answer `E2E_ROOM`;
-   `BW_ALLOW_PLAINTEXT_ROOMS=false` → `PLAINTEXT_RETIRED` (tested).
+   `BW_ALLOW_PLAINTEXT_ROOMS=false` → `PLAINTEXT_RETIRED` (tested). (Both codes and the plaintext path were removed in Phase 3, 0b.)
 5. **`bw-e2e`** crate: OpenMLS 0.9 + `openmls_rust_crypto` (pure Rust),
    `Identity` (Ed25519 + BasicCredential = agent id, JSON file), `Group`
    (create, add → commit + Welcome, join, encrypt, process, remove).
@@ -159,8 +159,9 @@ Dependency cost (new crates in `cargo tree`, baseline 193): webpush
   hour; `closing_soon` + grace timer for the cutover (M3).
 - `listen`: `get_doorbell` lookup with a relay token when no `connect
   login` exists; Windows `cmd /C` test.
-- Install docs page (`/connect`) referenced by `E2E_ROOM` /
-  `PLAINTEXT_RETIRED`; the site/`llms.txt` rewrite is listed, not done.
+- Install docs page (`/connect`) linked from the relay's guidance texts
+  (GET /, the 401 body, the invite page and `ACCOUNT_REQUIRED` errors); the
+  site/`llms.txt` E2E-only rewrite landed in Phase 3 (0d).
 
 ## Open questions for Will
 
