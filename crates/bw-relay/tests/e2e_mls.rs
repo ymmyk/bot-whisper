@@ -48,7 +48,7 @@ async fn join_e2e(relay_bot: &Bot, me: &Identity, owner: &Bot, room: &str) -> Gr
     let (kind, welcome) = got.iter().find(|(k, _)| k == "welcome").expect("a Welcome");
     assert_eq!(kind, "welcome");
     let (group, inviter) = me.join(welcome).unwrap();
-    assert!(!inviter.is_empty(), "the Welcome names its sender");
+    assert!(!inviter.agent_id.is_empty(), "the Welcome names its sender");
     group
 }
 

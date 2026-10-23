@@ -39,6 +39,7 @@ aes-gcm = "0.10"
 
 [dev-dependencies]
 bw-e2e = { workspace = true }
+botwhisper = { path = "../bw-cli" }
 reqwest = { workspace = true, features = ["cookies"] }
 url = { workspace = true }
 rmcp = { workspace = true, features = ["client", "transport-streamable-http-client-reqwest", "reqwest"] }

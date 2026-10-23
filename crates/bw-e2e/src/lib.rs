@@ -155,8 +155,9 @@ impl Identity {
     }
 
     /// Join a group from a serialized Welcome addressed to one of our key
-    /// packages. Returns the group and the inviter's credential identity.
-    pub fn join(&self, welcome: &[u8]) -> Result<(Group, String)> {
+    /// packages. Returns the group and the inviter (credential identity and
+    /// signature-key fingerprint, to check against an invite's `f=`).
+    pub fn join(&self, welcome: &[u8]) -> Result<(Group, Inviter)> {
         let msg = MlsMessageIn::tls_deserialize_exact(welcome)
             .map_err(|e| E2eError::Malformed(e.to_string()))?;
         let MlsMessageBodyIn::Welcome(welcome) = msg.extract() else {
@@ -167,7 +168,11 @@ impl Identity {
             .build();
         let staged =
             StagedWelcome::new_from_welcome(&self.provider, &config, welcome, None).map_err(mls)?;
-        let inviter = identity_of(staged.welcome_sender().map_err(mls)?.credential());
+        let sender = staged.welcome_sender().map_err(mls)?;
+        let inviter = Inviter {
+            agent_id: identity_of(sender.credential()),
+            fingerprint: hex::encode(Sha256::digest(sender.signature_key().as_slice())),
+        };
         let group = staged.into_group(&self.provider).map_err(mls)?;
         Ok((Group { group }, inviter))
     }
@@ -178,6 +183,14 @@ impl Identity {
 fn private_key_of(signer: &SignatureKeyPair) -> Vec<u8> {
     let v = serde_json::to_value(signer).expect("json");
     serde_json::from_value(v["private"].clone()).expect("private key bytes")
+}
+
+/// Who sent a Welcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Inviter {
+    pub agent_id: String,
+    /// SHA-256 of the inviter's signature public key, hex (`Identity::fingerprint`).
+    pub fingerprint: String,
 }
 
 /// Parse a serialized key package (as claimed from the relay).
@@ -336,7 +349,8 @@ mod tests {
         let (_commit1, welcome_bob) = g_alice.add_member(&alice, &kp_bob).unwrap();
         assert_eq!(g_alice.epoch(), 1);
         let (mut g_bob, inviter) = bob.join(&welcome_bob).unwrap();
-        assert_eq!(inviter, "acct1:alice");
+        assert_eq!(inviter.agent_id, "acct1:alice");
+        assert_eq!(inviter.fingerprint, alice.fingerprint());
         assert_eq!(g_bob.epoch(), 1);
         assert_eq!(g_bob.members(), g_alice.members());
 
@@ -413,7 +427,7 @@ mod tests {
         let kp = b.key_package().unwrap();
         let (_c, w) = g.add_member(&owner, &kp).unwrap();
         let (mut gb, inviter) = b.join(&w).unwrap();
-        assert_eq!(inviter, "acct:owner");
+        assert_eq!(inviter.agent_id, "acct:owner");
         let ct = g.encrypt(&owner, b"x").unwrap();
         assert!(matches!(
             gb.process(&b, &ct).unwrap(),

@@ -191,8 +191,10 @@ impl Room {
         json!({
             "epoch": self.e2e.epoch,
             "you": self.member(member).ok().and_then(|m| m.e2e_state.clone()),
+            // Agent ids are the MLS credential identities, so connectors can
+            // map seats to leaves (needed to remove a member).
             "members": self.members.iter().map(|m| json!({
-                "member": m.member, "e2e_state": m.e2e_state,
+                "member": m.member, "e2e_state": m.e2e_state, "agent_id": m.agent_id,
             })).collect::<Vec<_>>(),
             "pending_join": self.members.iter().filter(|m| !m.is_e2e_active()).map(|m| m.member.clone()).collect::<Vec<_>>(),
             "pending_items_for_you": self.e2e.items.iter().filter(|i| i.pending.contains(member)).count(),
