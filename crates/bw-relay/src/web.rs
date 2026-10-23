@@ -1,4 +1,9 @@
-//! Minimal web account pages: `/signup` and `/account`.
+//! Minimal web account pages: `/signup`, `/signin` and `/account`.
+//!
+//! `/signin` is the browser sign-in for `/account`: the person chooses a
+//! one-time code (typed on the next page, `oauth::code_post`) or a link (the
+//! HTML part's `<a>` carries `rel="nofollow"`). Both work once and expire
+//! with the other sign-in emails.
 //!
 //! Signup reuses the connector sign-in machinery (`oauth::send_signin_email`):
 //! the same single-use links, mail, rate limits and session cookie. A
@@ -31,14 +36,15 @@ use crate::{
     db::{unique_bot_name, AccountRow, AccountSeat, BotRow},
     doorbell::{now_unix, DoorbellConfig, DoorbellStatus, DoorbellTarget},
     oauth::{
-        check_email_page, clean_bot_name, clear_session_cookies, client_ip, cookie_value,
-        csrf_from_headers, csrf_ok, current_account, error_page, esc, no_store, page, random_token,
-        send_signin_email, signin_failure_page, OauthState, SigninError, OPERATOR_NOTICE,
-        RATE_LIMITED_MSG, SESSION_COOKIE, WEB_SIGNUP,
+        check_email_page, clean_bot_name, clear_session_cookies, client_ip, code_page,
+        cookie_value, csrf_from_headers, csrf_ok, current_account, error_page, esc, no_store, page,
+        random_token, send_signin_email, signin_failure_page, Delivery, OauthState, SigninError,
+        OPERATOR_NOTICE, RATE_LIMITED_MSG, SESSION_COOKIE, WEB_SIGNIN, WEB_SIGNUP,
     },
 };
 
 const SIGNUP_CSRF_COOKIE: &str = "bw_signup_csrf";
+const SIGNIN_CSRF_COOKIE: &str = "bw_signin_csrf";
 
 /// `YYYY-MM-DD HH:MM UTC` for a unix time.
 pub fn fmt_utc(secs: u64) -> String {
@@ -74,8 +80,8 @@ fn forbidden() -> Response {
     ))
 }
 
-fn to_signup() -> Response {
-    no_store(Redirect::to("/signup"))
+fn to_signin() -> Response {
+    no_store(Redirect::to("/signin"))
 }
 
 // ----- index -----
@@ -112,7 +118,7 @@ fn signup_form(st: &OauthState, csrf: &str, error: Option<&str>) -> String {
 <form method="post" action="/signup"><input type="hidden" name="csrf" value="{csrf}">
 <label for="email">Email</label><input id="email" name="email" type="email" required autocomplete="email" placeholder="you@example.com">
 <button type="submit">Email me a link</button></form>
-<p class="muted">Already have an account? The same form signs you in. You can also skip this page: install the botwhisper binary and run <code>botwhisper connect login --relay {base}</code>, which signs you in from the browser.</p>
+<p class="muted">Already have an account? <a href="/signin">Sign in</a> with a one-time code or a link (this form also works). You can also skip this page: install the botwhisper binary and run <code>botwhisper connect login --relay {base}</code>, which signs you in from the browser.</p>
 {notice}"#,
         minutes = st.cfg.login_link_ttl.as_secs() / 60,
         csrf = esc(csrf),
@@ -174,10 +180,11 @@ pub async fn signup_post(
         email,
         WEB_SIGNUP.to_string(),
         "create or sign in to your BotWhisper account",
+        Delivery::Link,
     )
     .await
     {
-        Ok(()) => check_email_page(&st, "finish creating your account"),
+        Ok(_) => check_email_page(&st, "finish creating your account"),
         Err(SigninError::InvalidEmail) => signup_page(
             &st,
             StatusCode::OK,
@@ -185,6 +192,108 @@ pub async fn signup_post(
         ),
         Err(SigninError::RateLimited) => {
             signup_page(&st, StatusCode::TOO_MANY_REQUESTS, Some(RATE_LIMITED_MSG))
+        }
+        Err(e) => signin_failure_page(&e),
+    }
+}
+
+// ----- sign in -----
+
+fn signin_form(st: &OauthState, csrf: &str, error: Option<&str>) -> String {
+    let err = error
+        .map(|e| format!(r#"<div class="err">{}</div>"#, esc(e)))
+        .unwrap_or_default();
+    format!(
+        r#"<h1>Sign in to BotWhisper</h1>
+<p class="muted">One email, no password. Pick how you want to confirm it: whatever we send works once and expires in {minutes} minutes.</p>
+{err}
+<form method="post" action="/signin"><input type="hidden" name="csrf" value="{csrf}">
+<label for="email">Email</label><input id="email" name="email" type="email" required autocomplete="email" placeholder="you@example.com">
+<label class="pick"><input type="radio" name="method" value="code" checked><strong>Email me a one-time code</strong><br><span class="muted">Type it on the next page. Handy when your email is on another device, like your phone.</span></label>
+<label class="pick"><input type="radio" name="method" value="link"><strong>Email me a sign-in link</strong><br><span class="muted">Open it in this browser.</span></label>
+<button type="submit">Send</button></form>
+<p class="muted">New here? The same form creates your account, or <a href="/signup">sign up</a>.</p>
+{notice}"#,
+        minutes = st.cfg.login_link_ttl.as_secs() / 60,
+        csrf = esc(csrf),
+        notice = OPERATOR_NOTICE,
+    )
+}
+
+fn signin_page(st: &OauthState, status: StatusCode, error: Option<&str>) -> Response {
+    let csrf = random_token("");
+    let mut r = no_store((status, page("Sign in", &signin_form(st, &csrf, error))));
+    r.headers_mut().append(
+        header::SET_COOKIE,
+        format!(
+            "{SIGNIN_CSRF_COOKIE}={csrf}; Path=/signin; HttpOnly; SameSite=Strict; Max-Age=3600{}",
+            if st.cfg.is_https() { "; Secure" } else { "" }
+        )
+        .parse()
+        .expect("header"),
+    );
+    r
+}
+
+/// `GET /signin`: the web sign-in form (signed-in browsers go to /account).
+pub async fn signin_get(State(st): State<OauthState>, headers: HeaderMap) -> Response {
+    if current_account(&st, &headers).is_some() {
+        return no_store(Redirect::to("/account"));
+    }
+    signin_page(&st, StatusCode::OK, None)
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct SigninForm {
+    #[serde(default)]
+    pub email: Option<String>,
+    /// `code` (default) or `link`.
+    #[serde(default)]
+    pub method: Option<String>,
+    #[serde(default)]
+    pub csrf: Option<String>,
+}
+
+/// `POST /signin`: mail a one-time code (and show the code box) or a link
+/// (HTML `<a rel="nofollow">`), as the person chose. Same response whether
+/// or not the address has an account.
+pub async fn signin_post(
+    State(st): State<OauthState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Form(f): Form<SigninForm>,
+) -> Response {
+    if !csrf_ok(
+        cookie_value(&headers, SIGNIN_CSRF_COOKIE),
+        f.csrf.as_deref(),
+    ) {
+        return forbidden();
+    }
+    let delivery = match f.method.as_deref().unwrap_or("code") {
+        "link" => Delivery::LinkHtml,
+        _ => Delivery::Code,
+    };
+    let ip = client_ip(&headers, Some(peer), st.cfg.behind_proxy);
+    let email = f.email.as_deref().unwrap_or_default();
+    match send_signin_email(
+        &st,
+        &ip,
+        email,
+        WEB_SIGNIN.to_string(),
+        "sign in to your BotWhisper account",
+        delivery,
+    )
+    .await
+    {
+        Ok(Some(handle)) => code_page(&st, &handle, "sign in to your account", None),
+        Ok(None) => check_email_page(&st, "sign in to your account"),
+        Err(SigninError::InvalidEmail) => signin_page(
+            &st,
+            StatusCode::OK,
+            Some("That is not a valid email address."),
+        ),
+        Err(SigninError::RateLimited) => {
+            signin_page(&st, StatusCode::TOO_MANY_REQUESTS, Some(RATE_LIMITED_MSG))
         }
         Err(e) => signin_failure_page(&e),
     }
@@ -475,7 +584,7 @@ fn signed_in(st: &OauthState, headers: &HeaderMap) -> Option<(AccountRow, String
 
 pub async fn account_get(State(st): State<OauthState>, headers: HeaderMap) -> Response {
     let Some((acct, csrf)) = signed_in(&st, &headers) else {
-        return to_signup();
+        return to_signin();
     };
     let flash = cookie_value(&headers, FLASH_COOKIE).as_deref() == Some(FLASH_SIGNED_IN);
     let banner = if flash {
@@ -528,7 +637,7 @@ fn own_bot(
     f: &AccountForm,
 ) -> Result<(AccountRow, String, BotRow), Response> {
     let Some((acct, csrf)) = signed_in(st, headers) else {
-        return Err(to_signup());
+        return Err(to_signin());
     };
     if !csrf_ok(Some(csrf.clone()), f.csrf.as_deref()) {
         return Err(forbidden());
@@ -682,7 +791,7 @@ pub async fn logout_post(
     Form(f): Form<AccountForm>,
 ) -> Response {
     let Some((_, csrf)) = signed_in(&st, &headers) else {
-        return to_signup();
+        return to_signin();
     };
     if !csrf_ok(Some(csrf), f.csrf.as_deref()) {
         return forbidden();
@@ -692,7 +801,7 @@ pub async fn logout_post(
     }
     let mut r = no_store(page(
         "Signed out",
-        r#"<h1>Signed out</h1><p>This browser is no longer signed in. Your connected bots keep working.</p><p><a href="/signup">Sign in again</a></p>"#,
+        r#"<h1>Signed out</h1><p>This browser is no longer signed in. Your connected bots keep working.</p><p><a href="/signin">Sign in again</a></p>"#,
     ));
     clear_session_cookies(&st.cfg, &mut r);
     r.into_response()

@@ -193,10 +193,10 @@ async fn confirm_link_signs_in_once_and_expired_links_fail() {
     let base = relay.base();
     let http = browser();
 
-    // Not signed in: /account sends you to /signup.
+    // Not signed in: /account sends you to the web sign-in.
     let r = http.get(format!("{base}/account")).send().await.unwrap();
     assert_eq!(r.status(), StatusCode::SEE_OTHER);
-    assert_eq!(r.headers()["location"], "/signup");
+    assert_eq!(r.headers()["location"], "/signin");
 
     let r = post_signup(&http, &base, "Me@Example.com").await;
     assert_eq!(r.status(), StatusCode::OK);
@@ -249,7 +249,7 @@ async fn confirm_link_signs_in_once_and_expired_links_fail() {
         .send()
         .await
         .unwrap();
-    assert_eq!(r.headers()["location"], "/signup");
+    assert_eq!(r.headers()["location"], "/signin");
 
     // Signed in now: /signup forwards to /account, which shows the address.
     let r = http.get(format!("{base}/signup")).send().await.unwrap();
@@ -280,6 +280,7 @@ async fn confirm_link_signs_in_once_and_expired_links_fail() {
                 email: "late@example.com".into(),
                 authz: "web-signup".into(),
                 expires_at: now_unix() - 1,
+                code_hash: None,
             },
         )
         .unwrap();
@@ -640,7 +641,7 @@ async fn index_redirects_only_a_valid_session_to_account() {
     let r = alice.get(format!("{base}/account")).send().await.unwrap();
     assert_eq!(r.status(), StatusCode::OK);
 
-    // Expired session: the text index (and /account goes to /signup, which
+    // Expired session: the text index (and /account goes to /signin, which
     // renders, so nothing loops).
     relay
         .db
@@ -660,6 +661,262 @@ async fn index_redirects_only_a_valid_session_to_account() {
         .send()
         .await
         .unwrap();
-    assert_eq!(r.headers()["location"], "/signup");
+    assert_eq!(r.headers()["location"], "/signin");
+    relay.shutdown().await;
+}
+
+/// GET /signin, POST an email with `method` ("code" or "link").
+async fn post_signin(http: &Client, base: &str, email: &str, method: &str) -> reqwest::Response {
+    let page = http
+        .get(format!("{base}/signin"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let csrf = hidden(&page, "csrf");
+    http.post(format!("{base}/signin"))
+        .form(&[
+            ("email", email),
+            ("method", method),
+            ("csrf", csrf.as_str()),
+        ])
+        .send()
+        .await
+        .unwrap()
+}
+
+async fn post_code(http: &Client, base: &str, pending: &str, code: &str) -> reqwest::Response {
+    http.post(format!("{base}/signin/code"))
+        .form(&[("pending", pending), ("code", code)])
+        .send()
+        .await
+        .unwrap()
+}
+
+/// A wrong code: the right one with its last digit changed.
+fn wrong(code: &str) -> String {
+    let last = code.as_bytes()[7] - b'0';
+    format!("{}{}", &code[..7], (last + 1) % 10)
+}
+
+#[tokio::test]
+async fn web_signin_offers_code_or_link_and_needs_csrf() {
+    let relay = TestRelay::start().await;
+    let base = relay.base();
+    let http = browser();
+    let page = http
+        .get(format!("{base}/signin"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(page.contains("Sign in to BotWhisper"));
+    assert!(page.contains(r#"name="method" value="code" checked"#));
+    assert!(page.contains(r#"name="method" value="link""#));
+    for csrf in ["", "wrong"] {
+        let r = http
+            .post(format!("{base}/signin"))
+            .form(&[
+                ("email", "a@example.com"),
+                ("method", "code"),
+                ("csrf", csrf),
+            ])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+    }
+    assert!(relay.mail.lock().unwrap().is_empty());
+    // The signup page points at it.
+    let page = http
+        .get(format!("{base}/signup"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(page.contains(r#"<a href="/signin">Sign in</a>"#));
+    relay.shutdown().await;
+}
+
+#[tokio::test]
+async fn web_signin_with_a_code() {
+    let relay = TestRelay::start().await;
+    let base = relay.base();
+    let http = browser();
+    let r = post_signin(&http, &base, "Coder@Example.com", "code").await;
+    assert_eq!(r.status(), StatusCode::OK);
+    let page = r.text().await.unwrap();
+    assert!(page.contains(r#"action="/signin/code""#));
+    assert!(page.contains(r#"autocomplete="one-time-code""#));
+    assert!(
+        !page.contains("coder@example.com"),
+        "never echoes the address"
+    );
+    let pending = hidden(&page, "pending");
+
+    let mail = relay.mail.lock().unwrap().last().cloned().unwrap();
+    assert_eq!(mail.to, "coder@example.com");
+    assert_eq!(mail.subject, "Your BotWhisper sign-in code");
+    assert!(!mail.body.contains("/oauth/confirm/"), "code only, no link");
+    assert!(mail.html.is_none());
+    let code = mail_code(&mail.body);
+    assert!(!page.contains(&code));
+    assert!(
+        !mail.body.contains(&pending),
+        "the pending handle is never mailed"
+    );
+
+    // A wrong code says how many tries are left and keeps the same login.
+    let r = post_code(&http, &base, &pending, &wrong(&code)).await;
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    let again = r.text().await.unwrap();
+    assert!(again.contains("4 tries left"), "{again}");
+    assert_eq!(hidden(&again, "pending"), pending);
+
+    // Spaces and dashes are fine; success signs the browser in.
+    let typed = format!(" {}-{} ", &code[..4], &code[4..]);
+    let r = post_code(&http, &base, &pending, &typed).await;
+    assert_eq!(r.status(), StatusCode::SEE_OTHER);
+    assert_eq!(r.headers()["location"], "/account");
+    assert!(r
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .any(|c| c.to_str().unwrap().starts_with("bw_session=")));
+    let r = http.get(format!("{base}/account")).send().await.unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    assert!(relay
+        .db
+        .account_by_email("coder@example.com")
+        .unwrap()
+        .is_some());
+
+    // Single use, and the handle is not a link.
+    let r = post_code(&browser(), &base, &pending, &code).await;
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    assert!(r.text().await.unwrap().contains("expired or already used"));
+    let r = browser()
+        .get(format!("{base}/oauth/confirm/{pending}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    relay.shutdown().await;
+}
+
+#[tokio::test]
+async fn web_signin_with_a_nofollow_link() {
+    let relay = TestRelay::start().await;
+    let base = relay.base();
+    let http = browser();
+    let r = post_signin(&http, &base, "linker@example.com", "link").await;
+    assert_eq!(r.status(), StatusCode::OK);
+    let page = r.text().await.unwrap();
+    assert!(page.contains("Check your email"));
+    assert!(
+        !page.contains(r#"name="pending""#),
+        "no code box for a link"
+    );
+
+    let mail = relay.mail.lock().unwrap().last().cloned().unwrap();
+    assert_eq!(mail.subject, "Your BotWhisper sign-in link");
+    let link = last_link(&relay);
+    assert!(!mail.body.contains("<a "), "plain text part unchanged");
+    let html = mail.html.clone().expect("an HTML part");
+    assert!(
+        html.contains(&format!(r#"<a href="{link}" rel="nofollow">"#)),
+        "{html}"
+    );
+    let r = http.get(&link).send().await.unwrap();
+    assert_eq!(r.status(), StatusCode::SEE_OTHER);
+    assert_eq!(r.headers()["location"], "/account");
+    let r = http.get(format!("{base}/account")).send().await.unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    // Single use.
+    let r = browser().get(&link).send().await.unwrap();
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    // A link token is not a code handle.
+    let token = link.rsplit('/').next().unwrap();
+    let r = post_code(&browser(), &base, token, "12345678").await;
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+
+    // The web signup is unchanged: a plain-text link, no HTML part.
+    post_signup(&browser(), &base, "new@example.com").await;
+    let mail = relay.mail.lock().unwrap().last().cloned().unwrap();
+    assert!(mail.body.contains("/oauth/confirm/"));
+    assert!(mail.html.is_none());
+    relay.shutdown().await;
+}
+
+#[tokio::test]
+async fn web_signin_codes_lock_out_and_are_bound_to_their_page() {
+    let relay = TestRelay::start().await;
+    let base = relay.base();
+    let http = browser();
+
+    // Two sign-ins in flight: A's code does not work on B's page.
+    let a = hidden(
+        &post_signin(&http, &base, "a@example.com", "code")
+            .await
+            .text()
+            .await
+            .unwrap(),
+        "pending",
+    );
+    let code_a = mail_code(&relay.mail.lock().unwrap().last().unwrap().body);
+    let b = hidden(
+        &post_signin(&http, &base, "b@example.com", "code")
+            .await
+            .text()
+            .await
+            .unwrap(),
+        "pending",
+    );
+    let code_b = mail_code(&relay.mail.lock().unwrap().last().unwrap().body);
+    if code_a != code_b {
+        let r = post_code(&http, &base, &b, &code_a).await;
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        assert!(r.text().await.unwrap().contains("4 tries left"));
+    }
+
+    // Five wrong tries on A end it; the right code then fails too.
+    for _ in 0..4 {
+        let r = post_code(&http, &base, &a, &wrong(&code_a)).await;
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    }
+    let r = post_code(&http, &base, &a, &wrong(&code_a)).await;
+    assert!(r.text().await.unwrap().contains("Too many wrong codes"));
+    let r = post_code(&http, &base, &a, &code_a).await;
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    assert!(relay
+        .db
+        .account_by_email("a@example.com")
+        .unwrap()
+        .is_none());
+
+    // B still works with its own code.
+    let r = post_code(&http, &base, &b, &code_b).await;
+    assert_eq!(r.status(), StatusCode::SEE_OTHER);
+    relay.shutdown().await;
+}
+
+#[tokio::test]
+async fn code_guesses_are_rate_limited_per_ip() {
+    let relay = TestRelay::start().await;
+    let base = relay.base();
+    let http = browser();
+    let mut last = StatusCode::OK;
+    for i in 0..31 {
+        last = post_code(&http, &base, &format!("nope-{i}"), "12345678")
+            .await
+            .status();
+    }
+    assert_eq!(last, StatusCode::TOO_MANY_REQUESTS);
     relay.shutdown().await;
 }

@@ -12,7 +12,7 @@
 use std::sync::{Arc, Mutex};
 
 use lettre::{
-    message::{header::ContentType, Mailbox},
+    message::{header::ContentType, Mailbox, MultiPart},
     transport::smtp::authentication::Credentials,
     AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor,
 };
@@ -102,12 +102,14 @@ impl MailConfig {
     }
 }
 
-/// A message to send. Plain text only.
+/// A message to send: plain text, optionally with an HTML alternative.
 #[derive(Debug, Clone)]
 pub struct Outgoing {
     pub to: String,
     pub subject: String,
     pub body: String,
+    /// HTML alternative of `body` (sent as multipart/alternative).
+    pub html: Option<String>,
 }
 
 /// Where mail goes.
@@ -203,13 +205,17 @@ impl Mailer {
                     .to
                     .parse()
                     .map_err(|_| "recipient address is not valid".to_string())?;
-                let email = Message::builder()
+                let builder = Message::builder()
                     .from(from.as_ref().clone())
                     .to(to)
-                    .subject(msg.subject)
-                    .header(ContentType::TEXT_PLAIN)
-                    .body(msg.body)
-                    .map_err(|_| "could not build the message".to_string())?;
+                    .subject(msg.subject);
+                let email = match msg.html {
+                    Some(html) => {
+                        builder.multipart(MultiPart::alternative_plain_html(msg.body, html))
+                    }
+                    None => builder.header(ContentType::TEXT_PLAIN).body(msg.body),
+                }
+                .map_err(|_| "could not build the message".to_string())?;
                 transport
                     .send(email)
                     .await

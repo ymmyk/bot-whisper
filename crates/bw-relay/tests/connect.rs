@@ -32,7 +32,7 @@ fn tmp_dir(name: &str) -> std::path::PathBuf {
 }
 
 /// Act as the person's browser: open the authorize URL, sign in by email
-/// (link from the captured mail), pick "Create a new bot", and follow the
+/// (one-time code from the captured mail, typed on the code page), pick "Create a new bot", and follow the
 /// final redirect to the connector's loopback listener.
 async fn browse(relay: Arc<TestRelayHandle>, url: String) {
     let http = Client::builder()
@@ -60,14 +60,21 @@ async fn browse(relay: Arc<TestRelayHandle>, url: String) {
         .await
         .unwrap();
     assert_eq!(r.status(), StatusCode::OK);
+    let code_page = r.text().await.unwrap();
     let mail = relay.mail.lock().unwrap().pop().expect("a sign-in mail");
-    let link = mail
-        .body
-        .split_whitespace()
-        .find(|w| w.contains("/oauth/confirm/"))
-        .unwrap()
-        .to_string();
-    let r = http.get(&link).send().await.unwrap();
+    assert!(
+        !mail.body.contains("/oauth/confirm/"),
+        "bot sign-in: no link"
+    );
+    let r = http
+        .post(format!("{base}/signin/code"))
+        .form(&[
+            ("pending", hidden(&code_page, "pending")),
+            ("code", mail_code(&mail.body)),
+        ])
+        .send()
+        .await
+        .unwrap();
     assert_eq!(r.status(), StatusCode::OK, "bot picker");
     let picker = r.text().await.unwrap();
     assert!(picker.contains("Which bot is connecting?"));

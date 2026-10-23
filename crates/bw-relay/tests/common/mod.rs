@@ -275,3 +275,17 @@ pub fn contents(fetch: &Value) -> Vec<String> {
         })
         .unwrap_or_default()
 }
+
+/// The one-time code ("1234 5678") in a captured sign-in mail, as digits.
+#[allow(dead_code)]
+pub fn mail_code(body: &str) -> String {
+    body.lines()
+        .map(str::trim)
+        .find(|l| {
+            l.len() == 9
+                && l.as_bytes()[4] == b' '
+                && l.chars().filter(char::is_ascii_digit).count() == 8
+        })
+        .unwrap_or_else(|| panic!("no code in mail"))
+        .replace(' ', "")
+}

@@ -1,10 +1,15 @@
 //! OAuth 2.1 end to end: metadata, dynamic client registration, the consent
-//! page, email confirmation links, PKCE, refresh rotation, revocation,
+//! page, emailed one-time codes (bot sign-in is code only), PKCE, refresh rotation, revocation,
 //! and the dev-token flag.
 
 mod common;
 
-use bw_relay::oauth::pkce_challenge;
+use bw_relay::{
+    auth::sha256_hex,
+    db::PendingLogin,
+    doorbell::now_unix,
+    oauth::{pkce_challenge, AuthzRequest},
+};
 use common::*;
 use reqwest::{redirect::Policy, Client, StatusCode};
 use serde_json::{json, Value};
@@ -198,7 +203,8 @@ async fn sign_in_as(
     assert!(
         body.contains("AI agent reading this page")
             && body.contains("check their inbox (and spam)")
-            && body.contains("Your BotWhisper sign-in link")
+            && body.contains("Your BotWhisper sign-in code")
+            && body.contains("type the 8-digit code into this page")
             && body.contains("within 15 minutes")
             && body.contains("start the connect again"),
         "waiting page tells the agent to ask its person to confirm: {body}"
@@ -210,16 +216,36 @@ async fn sign_in_as(
 
     let mail = relay.mail.lock().unwrap().pop().expect("one mail sent");
     assert_eq!(mail.to, email.to_ascii_lowercase());
-    assert!(mail.subject.contains("sign-in"));
-    let link = mail
-        .body
-        .split_whitespace()
-        .find(|w| w.contains("/oauth/confirm/"))
-        .expect("link in mail")
-        .to_string();
-    assert!(link.starts_with(&base));
+    assert_eq!(mail.subject, "Your BotWhisper sign-in code");
+    assert!(
+        !mail.body.contains("/oauth/confirm/") && !mail.body.contains("http"),
+        "bot sign-in mails a code only, never a link: {}",
+        mail.body
+    );
+    assert!(mail.html.is_none());
+    let code = mail_code(&mail.body);
+    let pending = hidden(&body, "pending");
+    assert!(!body.contains(&code), "the page never shows the code");
 
-    let r = http.get(&link).send().await.unwrap();
+    // A wrong code keeps the same pending sign-in.
+    let bad = format!("{}{}", &code[..7], (code.as_bytes()[7] - b'0' + 1) % 10);
+    let r = http
+        .post(format!("{base}/signin/code"))
+        .form(&[("pending", pending.as_str()), ("code", bad.as_str())])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    let retry = r.text().await.unwrap();
+    assert!(retry.contains("4 tries left"), "{retry}");
+    assert_eq!(hidden(&retry, "pending"), pending);
+
+    let r = http
+        .post(format!("{base}/signin/code"))
+        .form(&[("pending", pending.as_str()), ("code", code.as_str())])
+        .send()
+        .await
+        .unwrap();
     // A connector sign-in shows the bot picker (never /account, and with no
     // signed-in flash), then ends at the client's redirect_uri with the code.
     assert_eq!(r.status(), StatusCode::OK);
@@ -242,14 +268,25 @@ async fn sign_in_as(
     let (code, state) = code_from_location(&r);
     assert_eq!(state, "st-1");
 
-    // The link is single use.
-    let again = http.get(&link).send().await.unwrap();
+    // The code is single use, and the pending handle is no link.
+    let again = http
+        .post(format!("{base}/signin/code"))
+        .form(&[("pending", pending.as_str()), ("code", code.as_str())])
+        .send()
+        .await
+        .unwrap();
     assert_eq!(again.status(), StatusCode::BAD_REQUEST);
     let again = again.text().await.unwrap();
     assert!(
-        again.contains("connect BotWhisper again") && again.contains("get a new email"),
-        "expired-link page says how to get a new email: {again}"
+        again.contains("reconnect the BotWhisper connector") && again.contains("get a new email"),
+        "used-code page says how to get a new email: {again}"
     );
+    let r = http
+        .get(format!("{base}/oauth/confirm/{pending}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
 
     let r = exchange(http, &base, client_id, &code, VERIFIER).await;
     assert_eq!(r.status(), StatusCode::OK);
@@ -880,8 +917,8 @@ async fn unconfirmed_clients_are_told_to_confirm_the_email() {
     let says_confirm = |s: &str| {
         for want in [
             "Ask your user to check their inbox (and spam folder)",
-            "'Your BotWhisper sign-in link'",
-            "click the confirmation link",
+            "'Your BotWhisper sign-in code'",
+            "type the one-time code from it into the sign-in page",
             "expires in 15 minutes",
             "Then retry, or reconnect the BotWhisper connector",
             "start the connect again",
@@ -943,7 +980,7 @@ async fn unconfirmed_clients_are_told_to_confirm_the_email() {
     assert_eq!(v["error"], "invalid_grant");
     let d = v["error_description"].as_str().unwrap();
     assert!(d.contains("reconnect the BotWhisper connector"), "{d}");
-    assert!(d.contains("'Your BotWhisper sign-in link'") && d.contains("check spam"));
+    assert!(d.contains("'Your BotWhisper sign-in code'") && d.contains("check spam"));
     no_secrets(d);
 
     let r = http
@@ -967,7 +1004,8 @@ async fn unconfirmed_clients_are_told_to_confirm_the_email() {
     let idx = http.get(&base).send().await.unwrap().text().await.unwrap();
     assert!(idx.contains(&format!("create a free account at {base}/signup")));
     assert!(idx.contains("Every bot's person needs an account"));
-    assert!(idx.contains("'Your BotWhisper sign-in link'") && idx.contains("check spam"));
+    assert!(idx.contains("'Your BotWhisper sign-in code'") && idx.contains("check spam"));
+    assert!(idx.contains("type its one-time code into the browser sign-in page"));
 
     // The invite landing page an agent may fetch before it has the connector.
     let page = http
@@ -1015,7 +1053,67 @@ async fn mcp_instructions_explain_email_confirmation() {
     assert!(ins.contains("no tool here that reads or writes message text"));
     assert!(ins.contains(&format!("{}/signup", relay.base())));
     assert!(ins.contains("check their inbox (and spam)"));
+    assert!(ins.contains("'Your BotWhisper sign-in code'") && ins.contains("one-time code"));
     assert!(ins.contains("expires in 15 minutes"));
     bot.close().await;
+    relay.shutdown().await;
+}
+
+/// A bot-requested sign-in is code only: the relay never mails a link for
+/// it, and refuses a link for a pending connector sign-in.
+#[tokio::test]
+async fn bot_signin_never_accepts_a_link() {
+    let relay = TestRelay::start().await;
+    let base = relay.base();
+    let http = client();
+    let client_id = register(&http, &base).await;
+    let page = http
+        .get(format!("{base}/oauth/authorize"))
+        .query(&authorize_params(&client_id, "st-x"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(page.contains("Email me a code"));
+    assert!(
+        !page.contains(r#"name="method""#),
+        "no code/link choice for bots"
+    );
+
+    // Even a link-style pending row for a connector sign-in is refused.
+    let authz = serde_json::to_string(&AuthzRequest {
+        client_id: client_id.clone(),
+        redirect_uri: REDIRECT.into(),
+        code_challenge: pkce_challenge(VERIFIER),
+        state: None,
+        scope: None,
+    })
+    .unwrap();
+    relay
+        .db
+        .insert_pending_login(
+            &sha256_hex("forged-link"),
+            &PendingLogin {
+                email: "bot@example.com".into(),
+                authz,
+                expires_at: now_unix() + 600,
+                code_hash: None,
+            },
+        )
+        .unwrap();
+    let r = http
+        .get(format!("{base}/oauth/confirm/forged-link"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    assert!(r.text().await.unwrap().contains("one-time code"));
+    assert!(relay
+        .db
+        .account_by_email("bot@example.com")
+        .unwrap()
+        .is_none());
     relay.shutdown().await;
 }

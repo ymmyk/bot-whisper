@@ -105,7 +105,14 @@ CREATE TABLE IF NOT EXISTS pending_logins (
     email         TEXT NOT NULL,
     authz         TEXT NOT NULL,
     expires_at    INTEGER NOT NULL,
-    used          INTEGER NOT NULL DEFAULT 0
+    used          INTEGER NOT NULL DEFAULT 0,
+    -- `link`: `token_hash` is sha256 of the emailed link token.
+    -- `code`: `token_hash` is sha256 of the opaque pending handle kept in the
+    -- browser's code-entry form, `code_hash` the HMAC of the emailed one-time
+    -- code keyed by that handle, `attempts` the wrong guesses so far.
+    method        TEXT NOT NULL DEFAULT 'link',
+    code_hash     TEXT,
+    attempts      INTEGER NOT NULL DEFAULT 0
 );
 -- A bot is one AI identity of an account, picked or created on the sign-in
 -- page. Every grant (token chain) is bound to one bot; room membership is
@@ -394,7 +401,31 @@ pub struct PendingLogin {
     /// The serialized authorization request to resume after confirmation.
     pub authz: String,
     pub expires_at: u64,
+    /// `Some` for a one-time-code sign-in: the HMAC of the code keyed by the
+    /// pending handle. `None` for a link sign-in.
+    pub code_hash: Option<String>,
 }
+
+/// Outcome of a one-time code check (`Db::check_pending_code`).
+#[derive(Debug)]
+pub enum CodeCheck {
+    /// Right code: the pending login is consumed.
+    Ok(PendingLogin),
+    /// Wrong code; this many tries are left.
+    Wrong { left: u32 },
+    /// Wrong code and no tries left: the pending login is deleted.
+    Locked,
+    /// No such pending code login, or it expired or was used.
+    Gone,
+}
+
+/// Columns added to existing tables after the first 0.2 schema. Applied at
+/// startup only when missing, so an existing database keeps working.
+const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
+    ("pending_logins", "method", "TEXT NOT NULL DEFAULT 'link'"),
+    ("pending_logins", "code_hash", "TEXT"),
+    ("pending_logins", "attempts", "INTEGER NOT NULL DEFAULT 0"),
+];
 
 /// A member row.
 #[derive(Debug, Clone)]
@@ -496,6 +527,16 @@ impl Db {
     fn init(conn: Connection) -> Result<Self> {
         conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;")?;
         conn.execute_batch(SCHEMA)?;
+        for (table, column, decl) in ADDED_COLUMNS {
+            let has: bool = conn
+                .prepare(&format!(
+                    "SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?1"
+                ))?
+                .exists(params![column])?;
+            if !has {
+                conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"))?;
+            }
+        }
         Ok(Db {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -1620,14 +1661,24 @@ impl Db {
     pub fn insert_pending_login(&self, token_hash: &str, p: &PendingLogin) -> Result<()> {
         self.with(|c| {
             c.execute(
-                "INSERT INTO pending_logins (token_hash, email, authz, expires_at) VALUES (?1, ?2, ?3, ?4)",
-                params![token_hash, p.email, p.authz, p.expires_at as i64],
+                "INSERT INTO pending_logins (token_hash, email, authz, expires_at, method, code_hash)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    token_hash,
+                    p.email,
+                    p.authz,
+                    p.expires_at as i64,
+                    if p.code_hash.is_some() { "code" } else { "link" },
+                    p.code_hash
+                ],
             )?;
             Ok(())
         })
     }
 
-    /// Consume a confirmation token: single use, must be unexpired.
+    /// Consume a confirmation link token: single use, must be unexpired.
+    /// Only link sign-ins match; a one-time-code sign-in is never completed
+    /// by a link.
     pub fn consume_pending_login(
         &self,
         token_hash: &str,
@@ -1635,7 +1686,8 @@ impl Db {
     ) -> Result<Option<PendingLogin>> {
         self.with(|c| {
             let n = c.execute(
-                "UPDATE pending_logins SET used = 1 WHERE token_hash = ?1 AND used = 0 AND expires_at > ?2",
+                "UPDATE pending_logins SET used = 1
+                 WHERE token_hash = ?1 AND used = 0 AND expires_at > ?2 AND method = 'link'",
                 params![token_hash, now as i64],
             )?;
             if n != 1 {
@@ -1649,10 +1701,68 @@ impl Db {
                         email: r.get(0)?,
                         authz: r.get(1)?,
                         expires_at: r.get::<_, i64>(2)? as u64,
+                        code_hash: None,
                     })
                 },
             )
             .optional()
+        })
+    }
+
+    /// Check a one-time code against the pending code login whose handle
+    /// hashes to `handle_hash`. `code_hash` is the caller's HMAC of the typed
+    /// code; it is compared in constant time. A right code consumes the login
+    /// (single use); a wrong one counts an attempt, and the `max_attempts`th
+    /// wrong one deletes the login.
+    pub fn check_pending_code(
+        &self,
+        handle_hash: &str,
+        code_hash: &str,
+        now: u64,
+        max_attempts: u32,
+    ) -> Result<CodeCheck> {
+        self.with(|c| {
+            let row: Option<(String, String, i64, Option<String>, i64)> = c
+                .query_row(
+                    "SELECT email, authz, expires_at, code_hash, attempts FROM pending_logins
+                     WHERE token_hash = ?1 AND method = 'code' AND used = 0 AND expires_at > ?2",
+                    params![handle_hash, now as i64],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                )
+                .optional()?;
+            let Some((email, authz, expires_at, Some(stored), attempts)) = row else {
+                return Ok(CodeCheck::Gone);
+            };
+            if crate::oauth::constant_time_eq(stored.as_bytes(), code_hash.as_bytes()) {
+                let n = c.execute(
+                    "UPDATE pending_logins SET used = 1 WHERE token_hash = ?1 AND used = 0",
+                    params![handle_hash],
+                )?;
+                if n != 1 {
+                    return Ok(CodeCheck::Gone);
+                }
+                return Ok(CodeCheck::Ok(PendingLogin {
+                    email,
+                    authz,
+                    expires_at: expires_at as u64,
+                    code_hash: Some(stored),
+                }));
+            }
+            let used = attempts.max(0) as u32 + 1;
+            if used >= max_attempts {
+                c.execute(
+                    "DELETE FROM pending_logins WHERE token_hash = ?1",
+                    params![handle_hash],
+                )?;
+                return Ok(CodeCheck::Locked);
+            }
+            c.execute(
+                "UPDATE pending_logins SET attempts = ?2 WHERE token_hash = ?1",
+                params![handle_hash, used as i64],
+            )?;
+            Ok(CodeCheck::Wrong {
+                left: max_attempts - used,
+            })
         })
     }
 
@@ -1943,6 +2053,7 @@ mod tests {
                 email: "e".into(),
                 authz: "{}".into(),
                 expires_at: 100,
+                code_hash: None,
             },
         )
         .unwrap();
@@ -1956,6 +2067,7 @@ mod tests {
                 email: "e".into(),
                 authz: "{}".into(),
                 expires_at: 100,
+                code_hash: None,
             },
         )
         .unwrap();
@@ -2036,5 +2148,122 @@ mod tests {
         assert_eq!(unique_bot_name("Claude Code", &taken), "Claude Code 3");
         assert_eq!(unique_bot_name("  Cursor ", &taken), "Cursor");
         assert_eq!(unique_bot_name("", &taken), "Bot");
+    }
+
+    fn code_login(code_hash: &str, expires_at: u64) -> PendingLogin {
+        PendingLogin {
+            email: "e@example.com".into(),
+            authz: "web-signin".into(),
+            expires_at,
+            code_hash: Some(code_hash.into()),
+        }
+    }
+
+    #[test]
+    fn one_time_codes_are_single_use_limited_and_never_links() {
+        let db = Db::open_in_memory().unwrap();
+        db.insert_pending_login("h1", &code_login("right", 100))
+            .unwrap();
+        assert!(
+            db.consume_pending_login("h1", 50).unwrap().is_none(),
+            "a code login is never completed by a link"
+        );
+        assert!(matches!(
+            db.check_pending_code("h1", "wrong", 50, 5).unwrap(),
+            CodeCheck::Wrong { left: 4 }
+        ));
+        assert!(matches!(
+            db.check_pending_code("other", "right", 50, 5).unwrap(),
+            CodeCheck::Gone
+        ));
+        match db.check_pending_code("h1", "right", 50, 5).unwrap() {
+            CodeCheck::Ok(p) => assert_eq!(p.email, "e@example.com"),
+            other => panic!("{other:?}"),
+        }
+        assert!(
+            matches!(
+                db.check_pending_code("h1", "right", 50, 5).unwrap(),
+                CodeCheck::Gone
+            ),
+            "single use"
+        );
+
+        // Expired.
+        db.insert_pending_login("h2", &code_login("right", 100))
+            .unwrap();
+        assert!(matches!(
+            db.check_pending_code("h2", "right", 100, 5).unwrap(),
+            CodeCheck::Gone
+        ));
+
+        // Five wrong tries kill it, even for the right code afterwards.
+        db.insert_pending_login("h3", &code_login("right", 100))
+            .unwrap();
+        for left in (1..5).rev() {
+            match db.check_pending_code("h3", "nope", 50, 5).unwrap() {
+                CodeCheck::Wrong { left: l } => assert_eq!(l, left),
+                other => panic!("{other:?}"),
+            }
+        }
+        assert!(matches!(
+            db.check_pending_code("h3", "nope", 50, 5).unwrap(),
+            CodeCheck::Locked
+        ));
+        assert!(matches!(
+            db.check_pending_code("h3", "right", 50, 5).unwrap(),
+            CodeCheck::Gone
+        ));
+
+        // A link login is never completed by a code.
+        db.insert_pending_login(
+            "l1",
+            &PendingLogin {
+                email: "e".into(),
+                authz: "web-signin".into(),
+                expires_at: 100,
+                code_hash: None,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            db.check_pending_code("l1", "", 50, 5).unwrap(),
+            CodeCheck::Gone
+        ));
+        assert!(db.consume_pending_login("l1", 50).unwrap().is_some());
+    }
+
+    #[test]
+    fn startup_adds_code_columns_to_an_existing_database() {
+        let dir = std::env::temp_dir().join(format!("bw-db-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("relay.db");
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            // The pending_logins table as 0.2.0-alpha created it.
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(
+                "CREATE TABLE pending_logins (
+                    token_hash TEXT PRIMARY KEY, email TEXT NOT NULL, authz TEXT NOT NULL,
+                    expires_at INTEGER NOT NULL, used INTEGER NOT NULL DEFAULT 0);
+                 INSERT INTO pending_logins (token_hash, email, authz, expires_at)
+                    VALUES ('old', 'e', 'web-signup', 100);",
+            )
+            .unwrap();
+        }
+        for _ in 0..2 {
+            // Idempotent: opening twice is fine.
+            let db = Db::open(&path).unwrap();
+            db.insert_pending_login("h", &code_login("x", 100)).ok();
+        }
+        let db = Db::open(&path).unwrap();
+        assert!(
+            db.consume_pending_login("old", 50).unwrap().is_some(),
+            "old rows are link logins"
+        );
+        assert!(matches!(
+            db.check_pending_code("h", "x", 50, 5).unwrap(),
+            CodeCheck::Ok(_)
+        ));
+        drop(db);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

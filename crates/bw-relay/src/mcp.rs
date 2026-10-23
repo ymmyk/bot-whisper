@@ -1104,11 +1104,12 @@ impl ServerHandler for BotWhisperServer {
                 "{INSTRUCTIONS} Access: every bot's person needs a free BotWhisper account; sign-up \
                  happens in the browser during `botwhisper connect login`, or at {base}/signup. If a \
                  call fails as unauthenticated or the connector reports it needs sign-in, ask your \
-                 user to check their inbox (and spam) for the email titled '{subject}', click its \
-                 confirmation link (single-use, expires in {minutes} minutes), then run \
-                 `botwhisper connect login` again; if the link expired, that gets a new email.",
+                 user to check their inbox (and spam) for the email titled '{subject}', type its \
+                 one-time code into the browser sign-in page (single-use, expires in {minutes} \
+                 minutes), then run `botwhisper connect login` again; if the code expired, that gets \
+                 a new email.",
                 base = self.registry.cfg.public_url(),
-                subject = crate::guidance::SIGNIN_SUBJECT,
+                subject = crate::guidance::SIGNIN_CODE_SUBJECT,
                 minutes = self.registry.cfg.login_link_ttl.as_secs() / 60,
             ))
     }

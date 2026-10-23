@@ -5,10 +5,14 @@
 //! Sign-in happens on the consent page the MCP client opens in a browser:
 //!
 //! 1. The user enters an email. The relay mails a single-use, 15-minute
-//!    confirmation link (only its hash is stored, along with the pending
-//!    authorization request).
-//! 2. Clicking the link creates the account if needed and sets a browser
+//!    one-time code (8 digits; never a link on this bot-requested path) and
+//!    shows a code entry box. Only an HMAC of the code is stored, keyed by an
+//!    opaque pending handle that lives only in that page's form, along with
+//!    the pending authorization request. Five wrong codes end the attempt.
+//! 2. Typing the code creates the account if needed and sets a browser
 //!    session cookie. (A browser that is already signed in skips 1 and 2.)
+//!    The web sign-in at `/signin` (see `web.rs`) lets the person choose a
+//!    code or a link; the web signup at `/signup` mails a link.
 //! 3. The person picks which of their bots is connecting, or creates a new
 //!    one ("Which bot is connecting?"). The grant is bound to that bot, and
 //!    the bot's agent id is what rooms see, so two bots of one account are
@@ -35,7 +39,8 @@ use axum::{
     Json,
 };
 use base64::Engine;
-use rand::RngCore;
+use hmac::{Hmac, Mac};
+use rand::{Rng, RngCore};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -44,14 +49,21 @@ use crate::{
     auth::sha256_hex,
     config::RelayConfig,
     db::{
-        new_bot_id, unique_bot_name, AccountRow, BotRow, ClientRow, CodeRow, Db, PendingLogin,
-        TokenRow, BOT_NAME_MAX, REPLACED,
+        new_bot_id, unique_bot_name, AccountRow, BotRow, ClientRow, CodeCheck, CodeRow, Db,
+        PendingLogin, TokenRow, BOT_NAME_MAX, REPLACED,
     },
     doorbell::now_unix,
     mail::{looks_like_email, normalize_email, Mailer, Outgoing},
     ratelimit::Limiter,
     registry::Registry,
 };
+
+/// Wrong one-time sign-in codes allowed per pending login.
+pub(crate) const LOGIN_CODE_MAX_ATTEMPTS: u32 = 5;
+/// One-time sign-in code guesses allowed per client IP per 10 minutes.
+const CODE_GUESSES_PER_IP: u32 = 30;
+/// Digits in a one-time sign-in code.
+const LOGIN_CODE_DIGITS: usize = 8;
 
 /// Lifetime of an authorization code.
 const CODE_TTL: Duration = Duration::from_secs(10 * 60);
@@ -75,6 +87,8 @@ pub struct AuthLimiters {
     pub signups_by_ip: Limiter,
     pub registrations_by_ip: Limiter,
     pub token_by_ip: Limiter,
+    /// One-time code guesses per client IP (on top of the per-login limit).
+    pub codes_by_ip: Limiter,
 }
 
 impl AuthLimiters {
@@ -88,6 +102,7 @@ impl AuthLimiters {
                 Duration::from_secs(3600),
             ),
             token_by_ip: Limiter::new(l.token_requests_per_ip_per_min, Duration::from_secs(60)),
+            codes_by_ip: Limiter::new(CODE_GUESSES_PER_IP, Duration::from_secs(10 * 60)),
         }
     }
 }
@@ -624,8 +639,8 @@ fn signin_page(req: &AuthzRequest, client: &ClientRow, error: Option<&str>) -> H
 <h2>Sign in or create an account</h2>
 <form method="post" action="/oauth/authorize">{fields}<input type="hidden" name="action" value="email">
 <label for="email">Email</label><input id="email" name="email" type="email" required autocomplete="email" placeholder="you@example.com">
-<p class="muted">We'll email you a confirmation link. It works once and expires in 15 minutes. No password.</p>
-<button type="submit">Email me a link</button></form>
+<p class="muted">We'll email you a one-time code to type on the next page. It works once and expires in 15 minutes. No password.</p>
+<button type="submit">Email me a code</button></form>
 <hr>
 <h2>Got an invite link?</h2>
 <p class="muted">You still need an account: every member of a room is a signed-in bot. Sign in above (it creates your account), then give the invite link to your bot and it joins with <code>join_room</code>.</p>
@@ -950,18 +965,58 @@ pub(crate) enum SigninError {
     Mail,
 }
 
+/// `pending_logins.authz` marker for a web sign-in at `/signin`.
+pub(crate) const WEB_SIGNIN: &str = "web-signin";
+
+/// What the sign-in email carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Delivery {
+    /// A single-use link, plain text only (web signup).
+    Link,
+    /// A single-use link, plain text plus an HTML part whose `<a>` carries
+    /// `rel="nofollow"` (web sign-in).
+    LinkHtml,
+    /// A one-time code and no link at all (connector sign-in; web sign-in
+    /// when the person picks a code).
+    Code,
+}
+
+/// HMAC of a one-time code keyed by its pending handle (the handle itself is
+/// never stored, only its sha256), so a database copy does not reveal codes.
+pub(crate) fn login_code_mac(handle: &str, digits: &str) -> String {
+    let mut mac = Hmac::<Sha256>::new_from_slice(handle.as_bytes()).expect("hmac accepts any key");
+    mac.update(b"bw-login-code:");
+    mac.update(digits.as_bytes());
+    hex::encode(mac.finalize().into_bytes())
+}
+
+/// A fresh uniformly random code of `LOGIN_CODE_DIGITS` digits.
+fn new_login_code() -> String {
+    let n: u32 = rand::rng().random_range(0..100_000_000);
+    format!("{n:0width$}", width = LOGIN_CODE_DIGITS)
+}
+
+/// "1234 5678" for reading.
+fn spaced_code(code: &str) -> String {
+    let (a, b) = code.split_at(code.len() / 2);
+    format!("{a} {b}")
+}
+
 /// Validate, rate-limit, store the pending login and mail the single-use
-/// link. Shared by the connector sign-in and the web signup so both get the
-/// same links, limits and mail, and the same outcome whether or not the
-/// address already has an account. `purpose` completes "Open this link to
-/// ...". Logs one line per send, never the address, link or token.
+/// link or one-time code. Shared by the connector sign-in, the web sign-in
+/// and the web signup so all get the same limits and mail, and the same
+/// outcome whether or not the address already has an account. `purpose`
+/// completes "... to ...". Returns the opaque pending handle for a code
+/// (it goes in the code entry form; never in a URL or log). Logs one line
+/// per send, never the address, link, code or token.
 pub(crate) async fn send_signin_email(
     st: &OauthState,
     ip: &str,
     email: &str,
     authz: String,
     purpose: &str,
-) -> Result<(), SigninError> {
+    delivery: Delivery,
+) -> Result<Option<String>, SigninError> {
     if !looks_like_email(email) {
         return Err(SigninError::InvalidEmail);
     }
@@ -979,12 +1034,16 @@ pub(crate) async fn send_signin_email(
     {
         return Err(SigninError::RateLimited);
     }
+    // For a link the secret is the emailed token; for a code it is the
+    // pending handle, and the code is checked against an HMAC keyed by it.
     let token = random_token("");
+    let code = (delivery == Delivery::Code).then(new_login_code);
     let now = now_unix();
     let pending = PendingLogin {
         email: email.clone(),
         authz,
         expires_at: now + st.cfg.login_link_ttl.as_secs(),
+        code_hash: code.as_deref().map(|c| login_code_mac(&token, c)),
     };
     if st
         .db
@@ -993,23 +1052,53 @@ pub(crate) async fn send_signin_email(
     {
         return Err(SigninError::Storage);
     }
-    let link = format!("{}/oauth/confirm/{token}", st.cfg.public_url());
     let minutes = st.cfg.login_link_ttl.as_secs() / 60;
-    let msg = Outgoing {
-        to: email,
-        subject: crate::guidance::SIGNIN_SUBJECT.into(),
-        body: format!(
-            "Open this link to {purpose}:\n\n{link}\n\n\
-             It works once and expires in {minutes} minutes. If you didn't ask for it, ignore this email.\n\n\
-             BotWhisper rooms are end-to-end encrypted: the relay stores only ciphertext and never logs it.\n",
-        ),
+    const FOOTER: &str =
+        "BotWhisper rooms are end-to-end encrypted: the relay stores only ciphertext and never logs it.\n";
+    let msg = match &code {
+        Some(code) => Outgoing {
+            to: email,
+            subject: crate::guidance::SIGNIN_CODE_SUBJECT.into(),
+            body: format!(
+                "Your BotWhisper sign-in code:\n\n    {}\n\n\
+                 Type it on the BotWhisper sign-in page you just used to {purpose}. \
+                 It works once, only on that page, and expires in {minutes} minutes. \
+                 Never share it. If you didn't ask for it, ignore this email.\n\n{FOOTER}",
+                spaced_code(code),
+            ),
+            html: None,
+        },
+        None => {
+            let link = format!("{}/oauth/confirm/{token}", st.cfg.public_url());
+            let text = format!(
+                "It works once and expires in {minutes} minutes. If you didn't ask for it, ignore this email."
+            );
+            Outgoing {
+                to: email,
+                subject: crate::guidance::SIGNIN_SUBJECT.into(),
+                body: format!("Open this link to {purpose}:\n\n{link}\n\n{text}\n\n{FOOTER}"),
+                html: (delivery == Delivery::LinkHtml).then(|| {
+                    format!(
+                        r#"<!doctype html><html><body><p>Open this link to {purpose}:</p>
+<p><a href="{link}" rel="nofollow">{link}</a></p>
+<p>{text}</p>
+<p>{footer}</p></body></html>"#,
+                        purpose = esc(purpose),
+                        link = esc(&link),
+                        text = esc(&text),
+                        footer = esc(FOOTER.trim_end()),
+                    )
+                }),
+            }
+        }
     };
+    let what = if code.is_some() { "code" } else { "link" };
     if let Err(e) = st.mailer.send(msg).await {
-        tracing::warn!("mail: sign-in link failed: {e}");
+        tracing::warn!("mail: sign-in {what} failed: {e}");
         return Err(SigninError::Mail);
     }
-    tracing::info!("mail: sign-in link sent");
-    Ok(())
+    tracing::info!("mail: sign-in {what} sent");
+    Ok(code.map(|_| token))
 }
 
 /// Error page for a storage or mail failure while sending the link.
@@ -1053,6 +1142,127 @@ pub(crate) fn check_email_page(st: &OauthState, finish: &str) -> Response {
     ))
 }
 
+/// The "check your email" page for a one-time code: the code entry box,
+/// bound to its pending login by the opaque `handle` in a hidden field (the
+/// code alone completes nothing). Written for the person and for an AI
+/// agent reading it. `finish` completes "Type it here to ...". Never shows
+/// the address.
+pub(crate) fn code_page(
+    st: &OauthState,
+    handle: &str,
+    finish: &str,
+    error: Option<&str>,
+) -> Response {
+    let minutes = st.cfg.login_link_ttl.as_secs() / 60;
+    let from = st
+        .mailer
+        .sender_domain()
+        .map(|d| format!(" from <strong>{}</strong>", esc(&d)))
+        .unwrap_or_default();
+    let err = error
+        .map(|e| format!(r#"<div class="err">{}</div>"#, esc(e)))
+        .unwrap_or_default();
+    no_store(page(
+        "Enter your code",
+        &format!(
+            r#"<h1>Check your email</h1><p>If the address is valid, a one-time sign-in code is on its way. Type it here to {finish}.</p>
+{err}
+<form method="post" action="/signin/code"><input type="hidden" name="pending" value="{handle}">
+<label for="code">{digits}-digit code</label><input id="code" name="code" type="text" inputmode="numeric" autocomplete="one-time-code" required maxlength="20" placeholder="1234 5678">
+<button type="submit">Continue</button></form>
+<p>Look in your inbox (and spam folder) for <strong>{subject}</strong>{from}. The code works once, only on this page, and expires in {minutes} minutes. After {max} wrong tries it stops working; then start again for a new email. Keep this tab open.</p>
+<div class="notice"><strong>AI agent reading this page:</strong> sign-in is waiting on your user. Ask them to check their inbox (and spam) for the email titled '{subject}'{from} and type the {digits}-digit code into this page within {minutes} minutes, then retry or reconnect the BotWhisper connector. If the code expired or was already used, start the connect again for a new email.</div>"#,
+            handle = esc(handle),
+            digits = LOGIN_CODE_DIGITS,
+            max = LOGIN_CODE_MAX_ATTEMPTS,
+            subject = crate::guidance::SIGNIN_CODE_SUBJECT,
+        ),
+    ))
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct CodeForm {
+    #[serde(default)]
+    pub pending: Option<String>,
+    #[serde(default)]
+    pub code: Option<String>,
+}
+
+/// `POST /signin/code`: check a typed one-time code against the pending
+/// login named by the form's handle, then finish that login exactly like a
+/// confirmed link (connector sign-in: bot picker; web sign-in: /account).
+/// Rate-limited per IP, five wrong tries per login. Never logs the code.
+pub async fn code_post(
+    State(st): State<OauthState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Form(f): Form<CodeForm>,
+) -> Response {
+    let ip = client_ip(&headers, Some(peer), st.cfg.behind_proxy);
+    if let Err(retry) = st.limits.codes_by_ip.check(&format!("code-ip:{ip}")) {
+        let mut r = no_store(error_page(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Too many tries",
+            "Too many sign-in codes were tried from here. Wait a few minutes and try again.",
+        ));
+        r.headers_mut().insert(
+            header::RETRY_AFTER,
+            retry.to_string().parse().expect("header"),
+        );
+        return r;
+    }
+    let handle = f.pending.as_deref().unwrap_or_default().trim().to_string();
+    let digits: String = f
+        .code
+        .as_deref()
+        .unwrap_or_default()
+        .chars()
+        .filter(char::is_ascii_digit)
+        .take(LOGIN_CODE_DIGITS + 1)
+        .collect();
+    let gone = |title: &str| {
+        no_store(error_page(
+            StatusCode::BAD_REQUEST,
+            title,
+            &format!(
+                "Sign-in codes work once, only on the page that asked for them, and expire after {} minutes. Start the sign-in again (or reconnect the BotWhisper connector in your AI app) to get a new email.",
+                st.cfg.login_link_ttl.as_secs() / 60
+            ),
+        ))
+    };
+    if handle.is_empty() {
+        return gone("Code expired or already used");
+    }
+    match st.db.check_pending_code(
+        &sha256_hex(&handle),
+        &login_code_mac(&handle, &digits),
+        now_unix(),
+        LOGIN_CODE_MAX_ATTEMPTS,
+    ) {
+        Ok(CodeCheck::Ok(pending)) => finish_login(&st, pending),
+        Ok(CodeCheck::Wrong { left }) => {
+            let mut r = code_page(
+                &st,
+                &handle,
+                "finish signing in",
+                Some(&format!(
+                    "That code is not right. {left} {} left.",
+                    if left == 1 { "try" } else { "tries" }
+                )),
+            );
+            *r.status_mut() = StatusCode::BAD_REQUEST;
+            r
+        }
+        Ok(CodeCheck::Locked) => gone("Too many wrong codes"),
+        Ok(CodeCheck::Gone) => gone("Code expired or already used"),
+        Err(_) => error_page(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Storage error",
+            "Please try again.",
+        ),
+    }
+}
+
 async fn start_email_signin(
     st: &OauthState,
     req: &AuthzRequest,
@@ -1065,8 +1275,15 @@ async fn start_email_signin(
         client.name.as_deref().unwrap_or("an MCP client")
     );
     let authz = serde_json::to_string(req).unwrap_or_default();
-    match send_signin_email(st, ip, email, authz, &purpose).await {
-        Ok(()) => check_email_page(st, &format!("finish connecting {}", client_label(client))),
+    // A bot-requested sign-in is code only: no link is ever mailed for it,
+    // and `confirm` refuses links for it.
+    match send_signin_email(st, ip, email, authz, &purpose, Delivery::Code).await {
+        Ok(handle) => code_page(
+            st,
+            &handle.unwrap_or_default(),
+            &format!("finish connecting {}", client_label(client)),
+            None,
+        ),
         Err(SigninError::InvalidEmail) => no_store(signin_page(
             req,
             client,
@@ -1121,13 +1338,35 @@ pub async fn confirm(State(st): State<OauthState>, Path(token): Path<String>) ->
             StatusCode::BAD_REQUEST,
             "Link expired or already used",
             &format!(
-                "Sign-in links work once and expire after {} minutes. Go back to your AI app and connect BotWhisper again (or ask your AI agent to reconnect the BotWhisper connector), or create an account again at /signup, to get a new email, then click the new link.",
+                "Sign-in links work once and expire after {} minutes. Sign in again at /signin (or create an account at /signup) to get a new email, then click the new link.",
                 st.cfg.login_link_ttl.as_secs() / 60
             ),
         );
     };
-    // A web signup has no MCP client waiting; anything else resumes one.
-    let req: Option<AuthzRequest> = if pending.authz == WEB_SIGNUP {
+    // Links only ever finish a web signup or web sign-in; a bot-requested
+    // (connector) sign-in is code only.
+    if !is_web_login(&pending.authz) {
+        return error_page(
+            StatusCode::BAD_REQUEST,
+            "Use the code",
+            "This sign-in uses a one-time code typed on the sign-in page, not a link. Start the connect again from your AI app.",
+        );
+    }
+    finish_login(&st, pending)
+}
+
+fn is_web_login(authz: &str) -> bool {
+    authz == WEB_SIGNUP || authz == WEB_SIGNIN
+}
+
+/// Finish a confirmed pending login (link or code): create the account on
+/// first use, set the browser session, then show the bot picker to a waiting
+/// MCP client or send a web sign-in/signup to /account.
+fn finish_login(st: &OauthState, pending: PendingLogin) -> Response {
+    let now = now_unix();
+    // A web signup or sign-in has no MCP client waiting; anything else
+    // resumes one.
+    let req: Option<AuthzRequest> = if is_web_login(&pending.authz) {
         None
     } else {
         match serde_json::from_str(&pending.authz) {
@@ -1177,7 +1416,7 @@ pub async fn confirm(State(st): State<OauthState>, Path(token): Path<String>) ->
         // forms carry the CSRF token of the session set below.
         Some(req) => match st.db.get_client(&req.client_id).ok().flatten() {
             Some(client) => picker_page(
-                &st,
+                st,
                 &req,
                 &client,
                 &account,
