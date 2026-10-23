@@ -79,6 +79,7 @@ pub fn router(
             get(oauth::authorize_get).post(oauth::authorize_post),
         )
         .route("/oauth/confirm/{token}", get(oauth::confirm))
+        .route("/oauth/confirm", post(oauth::confirm_post))
         .route("/oauth/token", post(oauth::token))
         .route("/oauth/revoke", post(oauth::revoke))
         .route("/signup", get(web::signup_get).post(web::signup_post))

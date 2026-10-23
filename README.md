@@ -429,7 +429,11 @@ registration):
   never logged. Finishes the connector sign-in (bot picker) or the web
   sign-in (`/account`).
 - `GET /oauth/confirm/<token>`: the emailed link (web signup and web
-  sign-in only; refused for a connector sign-in).
+  sign-in only; refused for a connector sign-in). A web sign-in link is
+  read-only on GET and HEAD: it shows "Sign in as <email>" with a button,
+  and only `POST /oauth/confirm` (token in a hidden field, CSRF cookie)
+  consumes it and signs in. No Referer, no third-party resources. A
+  `/signup` confirmation link still confirms on GET (never on HEAD).
 - `POST /oauth/token`: `authorization_code` (with `code_verifier`) and
   `refresh_token` (rotating). `POST /oauth/revoke`.
 - `GET|POST /signup`: minimal web signup (one email field, CSRF cookie).

@@ -34,7 +34,7 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use axum::{
     extract::{ConnectInfo, Form, Path, Query, State},
-    http::{header, HeaderMap, StatusCode},
+    http::{header, HeaderMap, Method, StatusCode},
     response::{Html, IntoResponse, Redirect, Response},
     Json,
 };
@@ -1326,33 +1326,156 @@ fn issue_code_and_redirect(
 
 // ----- confirmation link -----
 
-pub async fn confirm(State(st): State<OauthState>, Path(token): Path<String>) -> Response {
-    let now = now_unix();
-    let Some(pending) = st
-        .db
-        .consume_pending_login(&sha256_hex(token.trim()), now)
-        .ok()
-        .flatten()
-    else {
-        return error_page(
+/// Double-submit CSRF cookie for the web sign-in link's "Sign in" button.
+const CONFIRM_CSRF_COOKIE: &str = "bw_confirm_csrf";
+
+/// Headers for the sign-in link pages: no caching, no Referer (the token is
+/// in the URL), nothing loaded from anywhere else, no framing.
+fn link_page_headers(mut r: Response) -> Response {
+    let h = r.headers_mut();
+    h.insert(header::CACHE_CONTROL, "no-store".parse().expect("header"));
+    h.insert(header::PRAGMA, "no-cache".parse().expect("header"));
+    h.insert(
+        header::REFERRER_POLICY,
+        "no-referrer".parse().expect("header"),
+    );
+    h.insert(
+        header::CONTENT_SECURITY_POLICY,
+        "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
+            .parse()
+            .expect("header"),
+    );
+    h.insert(header::X_FRAME_OPTIONS, "DENY".parse().expect("header"));
+    r
+}
+
+fn link_gone_page(st: &OauthState) -> Response {
+    link_page_headers(
+        (
             StatusCode::BAD_REQUEST,
-            "Link expired or already used",
-            &format!(
-                "Sign-in links work once and expire after {} minutes. Sign in again at /signin (or create an account at /signup) to get a new email, then click the new link.",
-                st.cfg.login_link_ttl.as_secs() / 60
+            page(
+                "Link expired or already used",
+                &format!(
+                    r#"<h1>Link expired or already used</h1>
+<p>Sign-in links work once and expire after {} minutes.</p>
+<p><a href="/signin">Sign in again</a> to get a new email (or <a href="/signup">create an account</a>).</p>"#,
+                    st.cfg.login_link_ttl.as_secs() / 60
+                ),
             ),
-        );
+        )
+            .into_response(),
+    )
+}
+
+fn use_the_code_page() -> Response {
+    link_page_headers(error_page(
+        StatusCode::BAD_REQUEST,
+        "Use the code",
+        "This sign-in uses a one-time code typed on the sign-in page, not a link. Start the connect again from your AI app.",
+    ))
+}
+
+/// `GET`/`HEAD /oauth/confirm/{token}`. A web sign-in link is read-only
+/// here: it shows a "Sign in" button and only the button's POST consumes
+/// it, so mail scanners and link previews cannot use it up. HEAD never
+/// consumes anything. A web signup confirmation is unchanged (a GET
+/// confirms it). Bot (connector) sign-ins are code only.
+pub async fn confirm(
+    State(st): State<OauthState>,
+    method: Method,
+    Path(token): Path<String>,
+) -> Response {
+    let now = now_unix();
+    let hash = sha256_hex(token.trim());
+    let Some(pending) = st.db.peek_pending_link(&hash, now).ok().flatten() else {
+        return link_gone_page(&st);
     };
-    // Links only ever finish a web signup or web sign-in; a bot-requested
-    // (connector) sign-in is code only.
     if !is_web_login(&pending.authz) {
-        return error_page(
-            StatusCode::BAD_REQUEST,
-            "Use the code",
-            "This sign-in uses a one-time code typed on the sign-in page, not a link. Start the connect again from your AI app.",
-        );
+        return use_the_code_page();
     }
+    if pending.authz == WEB_SIGNIN || method == Method::HEAD {
+        return confirm_button_page(&st, &token, &pending.email);
+    }
+    // Web signup confirmation: unchanged, a GET confirms it.
+    let Some(pending) = st.db.consume_pending_login(&hash, now).ok().flatten() else {
+        return link_gone_page(&st);
+    };
     finish_login(&st, pending)
+}
+
+/// "Sign in to BotWhisper as <email>" with a button that POSTs the token.
+fn confirm_button_page(st: &OauthState, token: &str, email: &str) -> Response {
+    let csrf = random_token("");
+    let body = format!(
+        r#"<h1>Sign in to BotWhisper</h1>
+<p>Sign in as <strong>{email}</strong>?</p>
+<form method="post" action="/oauth/confirm"><input type="hidden" name="token" value="{token}"><input type="hidden" name="csrf" value="{csrf}">
+<button type="submit">Sign in</button></form>
+<p class="muted">This link works once and expires {minutes} minutes after it was sent. Didn't ask to sign in? Close this page; nothing happens.</p>"#,
+        email = esc(email),
+        token = esc(token.trim()),
+        csrf = esc(&csrf),
+        minutes = st.cfg.login_link_ttl.as_secs() / 60,
+    );
+    let mut r = link_page_headers((StatusCode::OK, page("Sign in", &body)).into_response());
+    r.headers_mut().append(
+        header::SET_COOKIE,
+        format!(
+            "{CONFIRM_CSRF_COOKIE}={csrf}; Path=/oauth/confirm; HttpOnly; SameSite=Strict; Max-Age=3600{}",
+            if st.cfg.is_https() { "; Secure" } else { "" }
+        )
+        .parse()
+        .expect("header"),
+    );
+    r
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct ConfirmForm {
+    #[serde(default)]
+    pub token: Option<String>,
+    #[serde(default)]
+    pub csrf: Option<String>,
+}
+
+/// `POST /oauth/confirm`: the "Sign in" button. Atomically consumes the web
+/// link, creates the session, and goes to /account.
+pub async fn confirm_post(
+    State(st): State<OauthState>,
+    headers: HeaderMap,
+    Form(f): Form<ConfirmForm>,
+) -> Response {
+    if !csrf_ok(
+        cookie_value(&headers, CONFIRM_CSRF_COOKIE),
+        f.csrf.as_deref(),
+    ) {
+        return link_page_headers(error_page(
+            StatusCode::FORBIDDEN,
+            "Sign-in not confirmed",
+            "This page expired. Open the link from your email again and press Sign in.",
+        ));
+    }
+    let token = f.token.as_deref().unwrap_or_default().trim().to_string();
+    let hash = sha256_hex(&token);
+    let now = now_unix();
+    // Only web logins are ever links; check before consuming.
+    match st.db.peek_pending_link(&hash, now).ok().flatten() {
+        None => return link_gone_page(&st),
+        Some(p) if !is_web_login(&p.authz) => return use_the_code_page(),
+        Some(_) => {}
+    }
+    let Some(pending) = st.db.consume_pending_login(&hash, now).ok().flatten() else {
+        return link_gone_page(&st);
+    };
+    if !is_web_login(&pending.authz) {
+        return use_the_code_page();
+    }
+    let mut r = finish_login(&st, pending);
+    r.headers_mut().insert(
+        header::REFERRER_POLICY,
+        "no-referrer".parse().expect("header"),
+    );
+    r
 }
 
 fn is_web_login(authz: &str) -> bool {

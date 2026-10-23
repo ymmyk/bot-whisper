@@ -1679,6 +1679,27 @@ impl Db {
     /// Consume a confirmation link token: single use, must be unexpired.
     /// Only link sign-ins match; a one-time-code sign-in is never completed
     /// by a link.
+    /// Look up a live, unused sign-in link without consuming it (the
+    /// read-only `GET /oauth/confirm/{token}` page).
+    pub fn peek_pending_link(&self, token_hash: &str, now: u64) -> Result<Option<PendingLogin>> {
+        self.with(|c| {
+            c.query_row(
+                "SELECT email, authz, expires_at FROM pending_logins
+                 WHERE token_hash = ?1 AND used = 0 AND expires_at > ?2 AND method = 'link'",
+                params![token_hash, now as i64],
+                |r| {
+                    Ok(PendingLogin {
+                        email: r.get(0)?,
+                        authz: r.get(1)?,
+                        expires_at: r.get::<_, i64>(2)? as u64,
+                        code_hash: None,
+                    })
+                },
+            )
+            .optional()
+        })
+    }
+
     pub fn consume_pending_login(
         &self,
         token_hash: &str,

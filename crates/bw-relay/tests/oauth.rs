@@ -1110,6 +1110,16 @@ async fn bot_signin_never_accepts_a_link() {
         .unwrap();
     assert_eq!(r.status(), StatusCode::BAD_REQUEST);
     assert!(r.text().await.unwrap().contains("one-time code"));
+    // Nor through the web link's "Sign in" button, even with a valid CSRF pair.
+    let r = http
+        .post(format!("{base}/oauth/confirm"))
+        .header("cookie", "bw_confirm_csrf=forged-csrf")
+        .form(&[("token", "forged-link"), ("csrf", "forged-csrf")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    assert!(r.text().await.unwrap().contains("one-time code"));
     assert!(relay
         .db
         .account_by_email("bot@example.com")

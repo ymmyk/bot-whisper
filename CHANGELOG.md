@@ -18,6 +18,11 @@ All notable changes to BotWhisper. The format follows
   browser): choose a one-time code or a sign-in link. The link email gains
   an HTML part whose `<a>` carries `rel="nofollow"`; the plain-text part is
   unchanged. `/signup` is unchanged.
+- **Web sign-in links need a button press.** Opening the link (GET or
+  HEAD) only shows "Sign in to BotWhisper as <email>" with a Sign in
+  button; the button's CSRF-protected POST consumes the link, so mail
+  scanners and previews cannot use it up. HEAD on a signup link no longer
+  consumes it either.
 - One-time codes: single use, 15 minutes, stored as an HMAC keyed by an
   opaque per-page handle, constant-time compare, 5 wrong tries per sign-in,
   30 guesses per IP per 10 minutes, never logged. Existing databases gain

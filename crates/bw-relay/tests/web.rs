@@ -833,7 +833,8 @@ async fn web_signin_with_a_nofollow_link() {
         html.contains(&format!(r#"<a href="{link}" rel="nofollow">"#)),
         "{html}"
     );
-    let r = http.get(&link).send().await.unwrap();
+    // Opening the link only shows a "Sign in" button; pressing it signs in.
+    let r = press_sign_in(&http, &base, &link).await;
     assert_eq!(r.status(), StatusCode::SEE_OTHER);
     assert_eq!(r.headers()["location"], "/account");
     let r = http.get(format!("{base}/account")).send().await.unwrap();
@@ -851,6 +852,114 @@ async fn web_signin_with_a_nofollow_link() {
     let mail = relay.mail.lock().unwrap().last().cloned().unwrap();
     assert!(mail.body.contains("/oauth/confirm/"));
     assert!(mail.html.is_none());
+    relay.shutdown().await;
+}
+
+/// Open a web sign-in link (read-only "Sign in" page) and press its button.
+async fn press_sign_in(http: &Client, base: &str, link: &str) -> reqwest::Response {
+    let r = http.get(link).send().await.unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let page = r.text().await.unwrap();
+    http.post(format!("{base}/oauth/confirm"))
+        .form(&[
+            ("token", hidden(&page, "token")),
+            ("csrf", hidden(&page, "csrf")),
+        ])
+        .send()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn web_signin_link_get_is_read_only_until_the_button() {
+    let relay = TestRelay::start().await;
+    let base = relay.base();
+    let http = browser();
+    post_signin(&http, &base, "reader@example.com", "link").await;
+    let link = last_link(&relay);
+
+    // HEAD and GET (twice) never consume it.
+    let r = browser().head(&link).send().await.unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    for _ in 0..2 {
+        let r = http.get(&link).send().await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        assert_eq!(r.headers()["referrer-policy"], "no-referrer");
+        assert_eq!(r.headers()["cache-control"], "no-store");
+        let csp = r.headers()["content-security-policy"]
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(csp.contains("default-src 'none'"), "{csp}");
+        let page = r.text().await.unwrap();
+        assert!(page.contains("Sign in as <strong>reader@example.com</strong>"));
+        assert!(page.contains(r#"<form method="post" action="/oauth/confirm">"#));
+        assert!(!page.contains("<script") && !page.contains("<img") && !page.contains("<link "));
+    }
+    assert!(relay
+        .db
+        .account_by_email("reader@example.com")
+        .unwrap()
+        .is_none());
+    let r = http.get(format!("{base}/account")).send().await.unwrap();
+    assert_eq!(r.status(), StatusCode::SEE_OTHER, "not signed in by a GET");
+
+    // The POST needs the page's CSRF cookie.
+    let page = http.get(&link).send().await.unwrap().text().await.unwrap();
+    let token = hidden(&page, "token");
+    let r = browser()
+        .post(format!("{base}/oauth/confirm"))
+        .form(&[
+            ("token", token.as_str()),
+            ("csrf", hidden(&page, "csrf").as_str()),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::FORBIDDEN);
+
+    // First press signs in; the second press fails.
+    let form = [("token", token.clone()), ("csrf", hidden(&page, "csrf"))];
+    let r = http
+        .post(format!("{base}/oauth/confirm"))
+        .form(&form)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::SEE_OTHER);
+    assert_eq!(r.headers()["location"], "/account");
+    assert!(r
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .any(|v| v.to_str().unwrap().starts_with("bw_session=")));
+    let r = http
+        .post(format!("{base}/oauth/confirm"))
+        .form(&form)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    let page = r.text().await.unwrap();
+    assert!(page.contains("expired or already used") && page.contains(r#"<a href="/signin">"#));
+    // And the link itself is now used up.
+    let r = browser().get(&link).send().await.unwrap();
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    relay.shutdown().await;
+}
+
+#[tokio::test]
+async fn web_signup_link_head_does_not_consume() {
+    let relay = TestRelay::start().await;
+    let base = relay.base();
+    post_signup(&browser(), &base, "head@example.com").await;
+    let link = last_link(&relay);
+    let r = browser().head(&link).send().await.unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    // The signup confirmation itself is unchanged: a GET confirms it.
+    let r = browser().get(&link).send().await.unwrap();
+    assert_eq!(r.status(), StatusCode::SEE_OTHER);
+    assert_eq!(r.headers()["location"], "/account");
     relay.shutdown().await;
 }
 
