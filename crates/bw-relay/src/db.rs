@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use bw_proto::TurnMode;
 use rusqlite::{params, Connection, OptionalExtension};
 
-use crate::doorbell::DoorbellConfig;
+use crate::doorbell::{DoorbellConfig, DoorbellKey, DoorbellStatus, DoorbellTarget};
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS rooms (
@@ -114,6 +114,15 @@ CREATE TABLE IF NOT EXISTS sessions (
     account_id    TEXT NOT NULL,
     expires_at    INTEGER NOT NULL
 );
+-- A bot's default doorbell: applies to every room it is in, now and later,
+-- unless a room-specific doorbell overrides it. `config` is DoorbellConfig
+-- as JSON (secrets included; never logged, never shown).
+CREATE TABLE IF NOT EXISTS bot_doorbells (
+    agent_id         TEXT PRIMARY KEY,
+    config           TEXT NOT NULL,
+    status           TEXT NOT NULL DEFAULT 'never',
+    last_delivery_at INTEGER
+);
 "#;
 
 /// Columns added after Phase 0. `ALTER TABLE ADD COLUMN` fails if the column
@@ -123,6 +132,11 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE rooms ADD COLUMN owner_account TEXT",
     "ALTER TABLE oauth_codes ADD COLUMN bot_id TEXT",
     "ALTER TABLE oauth_tokens ADD COLUMN bot_id TEXT",
+    // Phase 2: doorbell transports. `config` is DoorbellConfig as JSON; rows
+    // without it are Phase 0 webhooks described by the three legacy columns.
+    "ALTER TABLE doorbells ADD COLUMN config TEXT",
+    "ALTER TABLE doorbells ADD COLUMN status TEXT NOT NULL DEFAULT 'never'",
+    "ALTER TABLE doorbells ADD COLUMN last_delivery_at INTEGER",
 ];
 
 /// `oauth_tokens.revoked` values. `REVOKED` is a rotated or revoked token
@@ -750,19 +764,32 @@ impl Db {
                     )?;
                 }
                 Some(cfg) => {
+                    let json = serde_json::to_string(cfg).unwrap_or_default();
+                    // Legacy NOT NULL columns are kept filled for webhooks so
+                    // an older binary still reads them; empty otherwise.
+                    let (url, secret, auth) = match &cfg.target {
+                        DoorbellTarget::Webhook {
+                            url,
+                            secret,
+                            auth_header,
+                        } => (url.as_str(), secret.as_str(), auth_header.clone()),
+                        _ => ("", "", None),
+                    };
                     c.execute(
-                        "INSERT INTO doorbells (room_id, member_id, webhook_url, secret, auth_header, events)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                        "INSERT INTO doorbells (room_id, member_id, webhook_url, secret, auth_header, events, config, status, last_delivery_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'never', NULL)
                          ON CONFLICT(room_id, member_id) DO UPDATE SET
                            webhook_url = excluded.webhook_url, secret = excluded.secret,
-                           auth_header = excluded.auth_header, events = excluded.events",
+                           auth_header = excluded.auth_header, events = excluded.events,
+                           config = excluded.config, status = 'never', last_delivery_at = NULL",
                         params![
                             room_id,
                             member_id,
-                            cfg.webhook_url,
-                            cfg.secret,
-                            cfg.auth_header,
-                            cfg.events.join(",")
+                            url,
+                            secret,
+                            auth,
+                            cfg.events.join(","),
+                            json
                         ],
                     )?;
                 }
@@ -771,28 +798,206 @@ impl Db {
         })
     }
 
+    /// Build a config from a row: the JSON `config` when present, else the
+    /// Phase 0 webhook columns.
+    fn doorbell_from_row(
+        r: &rusqlite::Row<'_>,
+    ) -> rusqlite::Result<(DoorbellConfig, DoorbellStatus)> {
+        let webhook_url: String = r.get(1)?;
+        let secret: String = r.get(2)?;
+        let auth_header: Option<String> = r.get(3)?;
+        let events: String = r.get(4)?;
+        let config: Option<String> = r.get(5)?;
+        let status: String = r.get(6)?;
+        let last: Option<i64> = r.get(7)?;
+        let cfg = config
+            .as_deref()
+            .and_then(|j| serde_json::from_str::<DoorbellConfig>(j).ok())
+            .unwrap_or_else(|| DoorbellConfig {
+                target: DoorbellTarget::Webhook {
+                    url: webhook_url,
+                    secret,
+                    auth_header,
+                },
+                events: events
+                    .split(',')
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+                    .collect(),
+            });
+        Ok((
+            cfg,
+            DoorbellStatus {
+                status,
+                last_delivery_at: last.map(|v| v as u64),
+            },
+        ))
+    }
+
+    const DOORBELL_COLS: &'static str =
+        "member_id, webhook_url, secret, auth_header, events, config, status, last_delivery_at";
+
+    /// Every per-room doorbell of a room (configuration only).
     pub fn doorbells(&self, room_id: &str) -> Result<Vec<(String, DoorbellConfig)>> {
+        Ok(self
+            .doorbells_with_status(room_id)?
+            .into_iter()
+            .map(|(m, c, _)| (m, c))
+            .collect())
+    }
+
+    pub fn doorbells_with_status(
+        &self,
+        room_id: &str,
+    ) -> Result<Vec<(String, DoorbellConfig, DoorbellStatus)>> {
         self.with(|c| {
-            let mut stmt = c.prepare(
-                "SELECT member_id, webhook_url, secret, auth_header, events FROM doorbells WHERE room_id = ?1",
-            )?;
+            let mut stmt = c.prepare(&format!(
+                "SELECT {} FROM doorbells WHERE room_id = ?1",
+                Self::DOORBELL_COLS
+            ))?;
             let rows = stmt.query_map(params![room_id], |r| {
-                let events: String = r.get(4)?;
+                let member: String = r.get(0)?;
+                let (cfg, st) = Self::doorbell_from_row(r)?;
+                Ok((member, cfg, st))
+            })?;
+            rows.collect()
+        })
+    }
+
+    /// One member's per-room doorbell, with its status.
+    pub fn room_doorbell(
+        &self,
+        room_id: &str,
+        member_id: &str,
+    ) -> Result<Option<(DoorbellConfig, DoorbellStatus)>> {
+        self.with(|c| {
+            c.query_row(
+                &format!(
+                    "SELECT {} FROM doorbells WHERE room_id = ?1 AND member_id = ?2",
+                    Self::DOORBELL_COLS
+                ),
+                params![room_id, member_id],
+                Self::doorbell_from_row,
+            )
+            .optional()
+        })
+    }
+
+    /// Per-room doorbells whose destination is dead (loaded at start).
+    pub fn dead_room_doorbells(&self) -> Result<Vec<(String, String)>> {
+        self.with(|c| {
+            let mut st =
+                c.prepare("SELECT room_id, member_id FROM doorbells WHERE status = 'dead'")?;
+            let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect()
+        })
+    }
+
+    pub fn set_bot_doorbell(&self, agent_id: &str, cfg: Option<&DoorbellConfig>) -> Result<()> {
+        self.with(|c| {
+            match cfg {
+                None => {
+                    c.execute(
+                        "DELETE FROM bot_doorbells WHERE agent_id = ?1",
+                        params![agent_id],
+                    )?;
+                }
+                Some(cfg) => {
+                    c.execute(
+                        "INSERT INTO bot_doorbells (agent_id, config, status, last_delivery_at)
+                         VALUES (?1, ?2, 'never', NULL)
+                         ON CONFLICT(agent_id) DO UPDATE SET config = excluded.config,
+                           status = 'never', last_delivery_at = NULL",
+                        params![agent_id, serde_json::to_string(cfg).unwrap_or_default()],
+                    )?;
+                }
+            }
+            Ok(())
+        })
+    }
+
+    pub fn bot_doorbell(&self, agent_id: &str) -> Result<Option<(DoorbellConfig, DoorbellStatus)>> {
+        self.with(|c| {
+            c.query_row(
+                "SELECT config, status, last_delivery_at FROM bot_doorbells WHERE agent_id = ?1",
+                params![agent_id],
+                |r| {
+                    let json: String = r.get(0)?;
+                    Ok((
+                        json,
+                        DoorbellStatus {
+                            status: r.get(1)?,
+                            last_delivery_at: r.get::<_, Option<i64>>(2)?.map(|v| v as u64),
+                        },
+                    ))
+                },
+            )
+            .optional()
+            .map(|o| {
+                o.and_then(|(json, st)| {
+                    serde_json::from_str::<DoorbellConfig>(&json)
+                        .ok()
+                        .map(|c| (c, st))
+                })
+            })
+        })
+    }
+
+    /// Every bot default doorbell (loaded into the dispatcher at start).
+    pub fn all_bot_doorbells(&self) -> Result<Vec<(String, DoorbellConfig, DoorbellStatus)>> {
+        self.with(|c| {
+            let mut st =
+                c.prepare("SELECT agent_id, config, status, last_delivery_at FROM bot_doorbells")?;
+            let rows = st.query_map([], |r| {
+                let agent: String = r.get(0)?;
+                let json: String = r.get(1)?;
                 Ok((
-                    r.get(0)?,
-                    DoorbellConfig {
-                        webhook_url: r.get(1)?,
-                        secret: r.get(2)?,
-                        auth_header: r.get(3)?,
-                        events: events
-                            .split(',')
-                            .filter(|s| !s.is_empty())
-                            .map(String::from)
-                            .collect(),
+                    agent,
+                    json,
+                    DoorbellStatus {
+                        status: r.get(2)?,
+                        last_delivery_at: r.get::<_, Option<i64>>(3)?.map(|v| v as u64),
                     },
                 ))
             })?;
-            rows.collect()
+            let mut out = Vec::new();
+            for row in rows {
+                let (agent, json, st) = row?;
+                if let Ok(cfg) = serde_json::from_str::<DoorbellConfig>(&json) {
+                    out.push((agent, cfg, st));
+                }
+            }
+            Ok(out)
+        })
+    }
+
+    /// Record a delivery outcome (`ok`, `failing`, `dead`).
+    pub fn set_doorbell_status(&self, key: &DoorbellKey, status: &str, now: u64) -> Result<()> {
+        let last = if status == "ok" {
+            Some(now as i64)
+        } else {
+            None
+        };
+        self.with(|c| {
+            match key {
+                DoorbellKey::Room { room_id, member_id } => {
+                    c.execute(
+                        "UPDATE doorbells SET status = ?3,
+                           last_delivery_at = COALESCE(?4, last_delivery_at)
+                         WHERE room_id = ?1 AND member_id = ?2",
+                        params![room_id, member_id, status, last],
+                    )?;
+                }
+                DoorbellKey::Bot { agent_id } => {
+                    c.execute(
+                        "UPDATE bot_doorbells SET status = ?2,
+                           last_delivery_at = COALESCE(?3, last_delivery_at)
+                         WHERE agent_id = ?1",
+                        params![agent_id, status, last],
+                    )?;
+                }
+            }
+            Ok(())
         })
     }
 

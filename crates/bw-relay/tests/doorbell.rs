@@ -87,7 +87,12 @@ async fn doorbell_payload_is_signed_and_content_free() {
                     "events": ["thread_started", "turn", "addressed", "thread_done", "message"] }),
         )
         .await;
-    assert_eq!(set["rooms"], json!([room]));
+    assert_eq!(set["scope"], "room");
+    assert_eq!(set["room_id"], room);
+    assert_eq!(
+        set["doorbell"]["type"], "webhook",
+        "webhook_url without type is a webhook"
+    );
     assert_eq!(
         b.err(
             "set_doorbell",
@@ -161,7 +166,8 @@ async fn doorbell_payload_is_signed_and_content_free() {
     assert_eq!(contents(&got), vec![secret_text]);
 
     // Removing the doorbell stops rings.
-    b.ok("set_doorbell", json!({ "room_id": room })).await;
+    b.ok("set_doorbell", json!({ "room_id": room, "type": "none" }))
+        .await;
     b.send(&room, "reply").await;
     a.wait(&room, 2).await;
     a.send(&room, "no ring for this one").await;
@@ -192,7 +198,7 @@ async fn doorbell_retries_with_backoff_and_coalesces() {
         })
         .collect();
     assert_eq!(seqs, vec![1, 1, 1]);
-    let stats = &relay.relay.registry.bells.stats;
+    let stats = relay.relay.registry.bells.stats();
     assert_eq!(stats.delivered.load(Ordering::Relaxed), 1);
     assert_eq!(stats.failed.load(Ordering::Relaxed), 0);
     relay.shutdown().await;

@@ -91,6 +91,7 @@ pub fn router(
 
     Router::new()
         .route("/health", get(health))
+        .route("/push/vapid-public-key", get(vapid_public_key))
         .route("/i/{invite}", get(invite_page))
         .with_state(state)
         .merge(oauth)
@@ -137,7 +138,7 @@ pub(crate) fn index_text(cfg: &RelayConfig) -> String {
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
     let loaded = state.registry.loaded().await;
     let total = state.registry.db.count_rooms().unwrap_or(0);
-    let bells = &state.registry.bells.stats;
+    let bells = state.registry.bells.stats();
     Json(json!({
         "status": "ok",
         "version": env!("CARGO_PKG_VERSION"),
@@ -149,8 +150,23 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
             "delivered": bells.delivered.load(std::sync::atomic::Ordering::Relaxed),
             "failed": bells.failed.load(std::sync::atomic::Ordering::Relaxed),
             "coalesced": bells.coalesced.load(std::sync::atomic::Ordering::Relaxed),
+            "dead": bells.dead.load(std::sync::atomic::Ordering::Relaxed),
         },
     }))
+}
+
+/// The relay's VAPID public key, for Web Push subscribers
+/// (`pushManager.subscribe({ applicationServerKey })`).
+async fn vapid_public_key(State(state): State<AppState>) -> Response {
+    match state.registry.bells.vapid_public_key() {
+        Some(k) => Json(json!({
+            "vapid_public_key": k,
+            "subject": state.cfg.vapid_subject(),
+            "usage": "pass as applicationServerKey (base64url, uncompressed P-256 point) when subscribing, then give the subscription's endpoint, keys.p256dh and keys.auth to set_doorbell with type webpush",
+        }))
+        .into_response(),
+        None => (StatusCode::NOT_FOUND, "web push is not configured on this relay").into_response(),
+    }
 }
 
 /// Landing page for invite links, written for the person and for an AI

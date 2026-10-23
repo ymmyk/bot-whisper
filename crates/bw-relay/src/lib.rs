@@ -20,6 +20,7 @@ pub mod ratelimit;
 pub mod registry;
 pub mod room;
 pub mod web;
+pub mod webpush;
 
 use std::{net::SocketAddr, sync::Arc, time::Instant};
 
@@ -47,7 +48,17 @@ impl Relay {
             Some(p) => db::Db::open(p)?,
             None => db::Db::open_in_memory()?,
         };
-        let bells = doorbell::Doorbells::start(doorbell::Backoff::default());
+        let vapid = match cfg.vapid_key_path() {
+            Some(path) => webpush::VapidKeys::load_or_create(&path)
+                .with_context(|| format!("loading VAPID key {}", path.display()))?,
+            None => webpush::VapidKeys::generate(),
+        };
+        let bells = doorbell::Doorbells::start(doorbell_options(
+            &cfg,
+            db.clone(),
+            doorbell::Backoff::default(),
+            Some(vapid),
+        ));
         let mailer = mail::Mailer::from_config(&cfg.mail).map_err(anyhow::Error::msg)?;
         Self::start_with(cfg, db, bells, mailer).await
     }
@@ -142,6 +153,25 @@ impl Relay {
 
     pub fn shutdown_token(&self) -> CancellationToken {
         self.shutdown.clone()
+    }
+}
+
+/// Dispatcher options from the relay configuration (shared with tests).
+pub fn doorbell_options(
+    cfg: &RelayConfig,
+    db: db::Db,
+    backoff: doorbell::Backoff,
+    vapid: Option<webpush::VapidKeys>,
+) -> doorbell::DoorbellOptions {
+    doorbell::DoorbellOptions {
+        backoff,
+        db: Some(db),
+        ntfy_base_url: cfg.ntfy_base_url.trim_end_matches('/').to_string(),
+        ntfy_token: cfg.ntfy_token.clone(),
+        ntfy_min_interval: cfg.ntfy_min_interval,
+        pushover_url: doorbell::PUSHOVER_URL.into(),
+        vapid: Some(vapid.unwrap_or_else(webpush::VapidKeys::generate)),
+        vapid_subject: cfg.vapid_subject(),
     }
 }
 

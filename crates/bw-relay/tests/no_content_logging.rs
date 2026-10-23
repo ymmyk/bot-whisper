@@ -80,6 +80,23 @@ async fn relay_never_logs_message_content() {
         )
         .await;
     let _ = a.call("set_doorbell", json!({ "room_id": room, "webhook_url": "http://127.0.0.1:9199/x", "secret": sentinel })).await;
+    // Push doorbells: the topic and tokens are secrets too. Deliveries fail
+    // (nothing listens on 9199), which exercises the retry logging.
+    let topic = "TOPIC-CANARY-5e6f";
+    let token = "tk_TOKEN-CANARY-8a9b";
+    a.ok(
+        "set_doorbell",
+        json!({ "room_id": room, "type": "ntfy", "server": "http://127.0.0.1:9199", "topic": topic, "token": token, "events": ["message"] }),
+    )
+    .await;
+    b.ok(
+        "set_doorbell",
+        json!({ "type": "gotify", "server": "http://127.0.0.1:9199", "token": token, "events": ["message"] }),
+    )
+    .await;
+    b.send(&room, "ring alice").await;
+    a.send(&room, "ring bob").await;
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
     a.ok("close_room", json!({ "room_id": room })).await;
     relay.shutdown().await;
 
@@ -88,7 +105,15 @@ async fn relay_never_logs_message_content() {
         !logs.is_empty(),
         "the relay did log something at trace level"
     );
-    for needle in [sentinel, display, "LABEL-CANARY", &room] {
+    for needle in [
+        sentinel,
+        display,
+        "LABEL-CANARY",
+        &room,
+        "TOPIC-CANARY",
+        "TOKEN-CANARY",
+        "9199",
+    ] {
         assert!(
             !logs.contains(needle),
             "logs must not contain {needle:?}; got:\n{logs}"

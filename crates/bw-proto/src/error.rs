@@ -26,6 +26,15 @@ pub enum ErrorCode {
     Unauthorized,
     RateLimited,
     Internal,
+    /// The room is end-to-end encrypted: content goes through the local
+    /// connector, not the relay's plaintext tools.
+    E2eRoom,
+    /// Plaintext rooms are retired on this relay (E2E only).
+    PlaintextRetired,
+    /// An `e2e_commit` for an epoch that is not the room's current one.
+    E2eStaleEpoch,
+    /// No unused key package for that member.
+    E2eNoKeyPackage,
 }
 
 impl ErrorCode {
@@ -51,6 +60,10 @@ impl ErrorCode {
             ErrorCode::Unauthorized => "UNAUTHORIZED",
             ErrorCode::RateLimited => "RATE_LIMITED",
             ErrorCode::Internal => "INTERNAL",
+            ErrorCode::E2eRoom => "E2E_ROOM",
+            ErrorCode::PlaintextRetired => "PLAINTEXT_RETIRED",
+            ErrorCode::E2eStaleEpoch => "E2E_STALE_EPOCH",
+            ErrorCode::E2eNoKeyPackage => "E2E_NO_KEY_PACKAGE",
         }
     }
 }

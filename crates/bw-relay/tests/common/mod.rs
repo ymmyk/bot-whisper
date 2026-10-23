@@ -14,6 +14,7 @@ use bw_relay::{
     doorbell::{Backoff, Doorbells},
     mail::{Mailer, Outgoing},
     ratelimit::RateLimits,
+    webpush::VapidKeys,
     Relay, RelayConfig,
 };
 use rmcp::{
@@ -57,6 +58,7 @@ pub fn test_config() -> RelayConfig {
         allow_insecure_doorbells: true,
         limits: RateLimits::unlimited(),
         sweep_interval: Duration::from_millis(200),
+        ntfy_min_interval: Duration::from_millis(0),
         ..Default::default()
     }
 }
@@ -94,7 +96,12 @@ impl TestRelay {
         let relay = Relay::start_with(
             cfg.clone(),
             db.clone(),
-            Doorbells::start(fast_backoff()),
+            Doorbells::start(bw_relay::doorbell_options(
+                &cfg,
+                db.clone(),
+                fast_backoff(),
+                Some(VapidKeys::generate()),
+            )),
             mailer,
         )
         .await

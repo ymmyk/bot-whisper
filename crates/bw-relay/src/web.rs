@@ -29,7 +29,7 @@ use serde::Deserialize;
 use crate::{
     auth::sha256_hex,
     db::{unique_bot_name, AccountRow, AccountSeat, BotRow},
-    doorbell::now_unix,
+    doorbell::{now_unix, DoorbellConfig, DoorbellStatus, DoorbellTarget},
     oauth::{
         check_email_page, clean_bot_name, clear_session_cookies, client_ip, cookie_value,
         csrf_from_headers, csrf_ok, current_account, error_page, esc, no_store, page, random_token,
@@ -238,6 +238,59 @@ fn short(s: &str) -> String {
     s.chars().take(8).collect()
 }
 
+/// One doorbell as the owner may see it: type, destination host, masked
+/// secrets, status. The ntfy topic is masked and revealed on demand (this
+/// is the owner's page), together with the `listen` command; tokens are
+/// shown as an environment-variable placeholder, never their value.
+fn doorbell_html(
+    st: &OauthState,
+    label: &str,
+    cfg: &DoorbellConfig,
+    status: &DoorbellStatus,
+) -> String {
+    let base = st.registry.bells.ntfy_base_url();
+    let last = match status.last_delivery_at {
+        Some(t) => format!("last delivery {}", fmt_utc(t)),
+        None => "no delivery yet".to_string(),
+    };
+    let secret = if cfg.target.has_secret() {
+        " · token set"
+    } else {
+        ""
+    };
+    let mut html = format!(
+        r#"<p class="muted">{label}: <strong>{kind}</strong> to {host}{secret} · status <strong>{status}</strong> · {last} · events {events}"#,
+        label = esc(label),
+        kind = esc(cfg.target.kind()),
+        host = esc(&cfg.target.host(base)),
+        status = esc(&status.status),
+        events = esc(&cfg.events.join(", ")),
+    );
+    if let DoorbellTarget::Ntfy {
+        server,
+        topic,
+        token,
+    } = &cfg.target
+    {
+        let server = server.clone().unwrap_or_else(|| base.to_string());
+        let recipes = crate::doorbell::ntfy_recipes(&server, topic, token.is_some());
+        let r = |k: &str| esc(recipes[k].as_str().unwrap_or_default());
+        html.push_str(&format!(
+            r#"<br>topic <code>{masked}</code> <details><summary>reveal topic and wake commands</summary><p>Topic <code>{topic}</code> on {server}. ntfy topics are public by name: treat it like a password.</p><pre>{listen}</pre><pre>{curl}</pre><pre>{claude}</pre><pre>{cron}</pre><p>OpenClaw: <code>{openclaw}</code></p></details>"#,
+            masked = esc(&cfg.masked_topic().unwrap_or_default()),
+            topic = esc(topic),
+            server = esc(&server),
+            listen = r("listen"),
+            curl = r("curl"),
+            claude = r("claude_code"),
+            cron = r("cron"),
+            openclaw = r("openclaw"),
+        ));
+    }
+    html.push_str("</p>");
+    html
+}
+
 fn account_html(st: &OauthState, acct: &AccountRow, csrf: &str) -> String {
     let now = now_unix();
     let db = &st.db;
@@ -269,6 +322,28 @@ fn account_html(st: &OauthState, acct: &AccountRow, csrf: &str) -> String {
                 esc(b.last_client_name.as_deref().unwrap_or("an MCP client"))
             ),
         };
+        let mut bells = String::new();
+        if let Ok(Some((cfg, status))) = db.bot_doorbell(&b.agent_id) {
+            bells.push_str(&doorbell_html(
+                st,
+                "Default doorbell (all rooms)",
+                &cfg,
+                &status,
+            ));
+        }
+        for s in bot_seats(acct, b, &seats) {
+            if let Ok(Some((cfg, status))) = db.room_doorbell(&s.room_id, &s.member_id) {
+                bells.push_str(&doorbell_html(
+                    st,
+                    &format!("Doorbell in room {}", short(&s.room_id)),
+                    &cfg,
+                    &status,
+                ));
+            }
+        }
+        if bells.is_empty() {
+            bells = r#"<p class="muted">No doorbell: this bot is only woken when its app checks in. Ask it to call <code>set_doorbell</code>.</p>"#.into();
+        }
         let disconnect = if live.is_some() {
             format!(
                 r#" <form class="inline" method="post" action="/account/disconnect"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="bot_id" value="{id}"><button type="submit" class="ghost">Disconnect</button></form>"#,
@@ -284,6 +359,7 @@ fn account_html(st: &OauthState, acct: &AccountRow, csrf: &str) -> String {
 Created {created} · last used {used}<br>
 Member id <code>{agent}</code><br>
 In rooms: {seats}</p>
+{bells}
 <form method="post" action="/account/bots/rename"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="bot_id" value="{id}"><label for="name-{id}">Name</label><input id="name-{id}" name="name" type="text" maxlength="60" value="{name}"><button type="submit" class="ghost">Rename</button></form>
 {disconnect} <form class="inline" method="post" action="/account/bots/delete"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="bot_id" value="{id}"><button type="submit" class="ghost">Delete</button></form></div>"#,
             name = esc(&b.name),
@@ -296,6 +372,7 @@ In rooms: {seats}</p>
             } else {
                 my_seats.join("; ")
             },
+            bells = bells,
             csrf = esc(csrf),
         ));
     }

@@ -111,6 +111,35 @@ struct RelayArgs {
     /// crates stay at warn so raw frames are never logged.
     #[arg(long, env = "BW_LOG", default_value = "info")]
     log_level: String,
+
+    /// ntfy server for relay-generated doorbell topics (the default
+    /// doorbell). Doorbells on it follow this setting if it changes.
+    #[arg(long, env = "BW_NTFY_BASE_URL", default_value = "https://ntfy.sh")]
+    ntfy_base_url: String,
+
+    /// File holding the relay's own ntfy access token (sent for deliveries
+    /// to the default server when the bot gave none). BW_NTFY_TOKEN in the
+    /// environment works too. Never logged.
+    #[arg(long, env = "BW_NTFY_TOKEN_FILE")]
+    ntfy_token_file: Option<PathBuf>,
+
+    /// Minimum spacing between pings to one ntfy topic (e.g. 5s).
+    #[arg(long, env = "BW_NTFY_MIN_INTERVAL", default_value = "5s")]
+    ntfy_min_interval: String,
+
+    /// VAPID private key file for Web Push (created on first start, 0600).
+    /// Default: vapid.key next to the SQLite file.
+    #[arg(long, env = "BW_VAPID_PRIVATE_KEY_FILE")]
+    vapid_private_key_file: Option<PathBuf>,
+
+    /// VAPID subject (`mailto:` or `https:`). Default: the public URL.
+    #[arg(long, env = "BW_VAPID_SUBJECT")]
+    vapid_subject: Option<String>,
+
+    /// Allow plaintext (relay-readable) rooms. The E2E cutover sets this to
+    /// false; plaintext tools then answer PLAINTEXT_RETIRED.
+    #[arg(long, env = "BW_ALLOW_PLAINTEXT_ROOMS", default_value_t = true, action = clap::ArgAction::Set)]
+    allow_plaintext_rooms: bool,
 }
 
 #[tokio::main]
@@ -156,6 +185,23 @@ async fn relay(args: RelayArgs) -> anyhow::Result<()> {
         .map_err(anyhow::Error::msg)?
         .unwrap_or(Duration::ZERO);
     let mail = bw_relay::mail::MailConfig::from_env().map_err(anyhow::Error::msg)?;
+    let ntfy_min_interval = bw_relay::config::parse_expiry(&args.ntfy_min_interval)
+        .map_err(anyhow::Error::msg)?
+        .unwrap_or(Duration::ZERO);
+    // The relay's ntfy token: environment first, then the file. Never printed.
+    let ntfy_token = match std::env::var("BW_NTFY_TOKEN") {
+        Ok(t) if !t.trim().is_empty() => Some(t.trim().to_string()),
+        _ => match &args.ntfy_token_file {
+            Some(p) => Some(
+                std::fs::read_to_string(p)
+                    .map_err(|e| anyhow::anyhow!("reading BW_NTFY_TOKEN_FILE: {e}"))?
+                    .trim()
+                    .to_string(),
+            )
+            .filter(|t| !t.is_empty()),
+            None => None,
+        },
+    };
 
     let cfg = bw_relay::RelayConfig {
         bind: args.bind,
@@ -189,6 +235,12 @@ async fn relay(args: RelayArgs) -> anyhow::Result<()> {
             .into_iter()
             .filter(|h| !h.is_empty())
             .collect(),
+        ntfy_base_url: args.ntfy_base_url,
+        ntfy_token,
+        ntfy_min_interval,
+        vapid_private_key_file: args.vapid_private_key_file,
+        vapid_subject: args.vapid_subject,
+        allow_plaintext_rooms: args.allow_plaintext_rooms,
         ..Default::default()
     };
     let mail_kind = match &cfg.mail {
@@ -196,11 +248,15 @@ async fn relay(args: RelayArgs) -> anyhow::Result<()> {
         bw_relay::mail::MailConfig::Smtp { .. } => "smtp",
     };
     eprintln!(
-        "BotWhisper relay v{} on {} — MCP at /mcp (OAuth 2.1 sign-in), health at /health, mail: {}. \
-         v1 is a plaintext relay: the operator can read messages in memory.",
+        "BotWhisper relay v{} on {} — MCP at /mcp (OAuth 2.1 sign-in), health at /health, mail: {}, \
+         doorbells: ntfy default {} ({}), web push VAPID key at /push/vapid-public-key. \
+         Plaintext rooms {}: the operator can read their messages in memory.",
         env!("CARGO_PKG_VERSION"),
         cfg.bind,
         mail_kind,
+        cfg.ntfy_base_url,
+        if cfg.ntfy_token.is_some() { "relay token set" } else { "no relay token" },
+        if cfg.allow_plaintext_rooms { "allowed" } else { "retired" },
     );
     bw_relay::run(cfg).await
 }

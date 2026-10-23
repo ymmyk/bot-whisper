@@ -20,7 +20,7 @@ use crate::{
     auth::AgentId,
     config::parse_expiry,
     db::ThreadStart,
-    doorbell::{self, DoorbellConfig, ALL_EVENTS, DEFAULT_EVENTS},
+    doorbell::{self, DoorbellConfig, DoorbellTarget, ALL_EVENTS, DEFAULT_EVENTS},
     error::RelayError,
     registry::{NewRoom, Registry},
     room::{LeaveOutcome, SendArgs},
@@ -209,24 +209,62 @@ pub struct StatusArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SetDoorbellArgs {
-    /// Omit to apply to every room you belong to.
+    /// Room to configure. Omit to set your bot-wide default doorbell, which
+    /// applies to every room you are in now or join later (a per-room
+    /// doorbell overrides it).
     #[serde(default)]
     pub room_id: Option<String>,
-    /// HTTPS URL to POST to. Omit (with no email) to remove your doorbell.
+    /// `ntfy` (default when omitted: the relay creates a private topic for
+    /// you), `webhook`, `webpush`, `gotify`, `pushover`, or `none` to remove.
+    #[serde(default, rename = "type")]
+    pub kind: Option<String>,
+    /// webhook: HTTPS URL to POST to. Giving this without `type` means webhook.
     #[serde(default)]
     pub webhook_url: Option<String>,
-    /// Shared secret for the HMAC-SHA256 `BotWhisper-Signature` header.
+    /// webhook: shared secret for the HMAC-SHA256 `BotWhisper-Signature` header.
     #[serde(default)]
     pub secret: Option<String>,
-    /// Optional static `Authorization` header value sent with each ring.
+    /// webhook: optional static `Authorization` header value sent with each ring.
     #[serde(default)]
     pub auth_header: Option<String>,
-    /// Events to ring on. Default: thread_started, turn, addressed, thread_done.
+    /// ntfy / gotify: server base URL. ntfy: omit for the relay's default server.
+    #[serde(default)]
+    pub server: Option<String>,
+    /// ntfy: topic. Omit to get a long random private one.
+    #[serde(default)]
+    pub topic: Option<String>,
+    /// ntfy access token / gotify app token / pushover app token. Never
+    /// echoed back.
+    #[serde(default)]
+    pub token: Option<String>,
+    /// pushover: user key.
+    #[serde(default)]
+    pub user: Option<String>,
+    /// webpush: subscription endpoint URL.
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    /// webpush: subscription `keys.p256dh` (base64url).
+    #[serde(default)]
+    pub p256dh: Option<String>,
+    /// webpush: subscription `keys.auth` (base64url).
+    #[serde(default)]
+    pub auth: Option<String>,
+    /// Events to ring on. Default: thread_started, turn, addressed, thread_done, stalled.
     #[serde(default)]
     pub events: Option<Vec<String>>,
-    /// Email doorbells are not implemented yet (Phase 2).
+    /// Remove the doorbell (same as type `none`).
+    #[serde(default)]
+    pub remove: Option<bool>,
+    /// Email doorbells are not implemented.
     #[serde(default)]
     pub email: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GetDoorbellArgs {
+    /// Room whose effective doorbell to show. Omit for your bot-wide default.
+    #[serde(default)]
+    pub room_id: Option<String>,
 }
 
 // ----- helpers -----
@@ -523,7 +561,7 @@ impl BotWhisperServer {
 
     #[tool(
         name = "set_doorbell",
-        description = "Register how to wake you when you are not running: an HTTPS webhook (HMAC-signed, carries only room id, seq and turn, never content). Omit webhook_url to remove it."
+        description = "Register how to wake you when you are not running. Doorbells carry only room id, event, seq and turn, never content. Default (no type): ntfy with a private random topic the relay creates; the result includes the topic and copy-paste `botwhisper listen` commands to subscribe. Other types: webhook (HMAC-signed HTTPS POST), webpush (RFC 8030 subscription: endpoint, p256dh, auth; VAPID key at GET /push/vapid-public-key), gotify, pushover. Omit room_id to set your bot-wide default for all rooms. type `none` removes."
     )]
     async fn set_doorbell(
         &self,
@@ -532,6 +570,36 @@ impl BotWhisperServer {
     ) -> Result<CallToolResult, ErrorData> {
         let agent = agent(&parts)?;
         respond(self.do_set_doorbell(agent, a).await)
+    }
+
+    #[tool(
+        name = "get_doorbell",
+        description = "Show your effective doorbell (for a room, or your bot-wide default): type, destination host, events, delivery status, the ntfy topic and the copy-paste `botwhisper listen` commands. Secrets are never returned."
+    )]
+    async fn get_doorbell(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(a): Parameters<GetDoorbellArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let agent = agent(&parts)?;
+        respond(self.do_get_doorbell(agent, a).await)
+    }
+
+    #[tool(
+        name = "whoami",
+        description = "Which bot this connection is: bot name, agent id (what room membership is keyed on), account and token scope."
+    )]
+    async fn whoami(
+        &self,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let agent = agent(&parts)?;
+        respond(Ok(json!({
+            "agent_id": agent.id,
+            "bot_name": agent.name,
+            "account": agent.account,
+            "scope": match agent.room_scope() { Some(r) => json!({ "room": r }), None => json!("rooms") },
+        })))
     }
 
     #[tool(
@@ -792,17 +860,103 @@ impl BotWhisperServer {
     ) -> Result<Value, RelayError> {
         if a.email.is_some() {
             return Err(RelayError::invalid(
-                "email doorbells are not implemented yet; use webhook_url + secret",
+                "email doorbells are not implemented; use the default (ntfy) or a webhook",
             ));
         }
-        let cfg = match a.webhook_url {
+        let insecure = self.registry.cfg.allow_insecure_doorbells;
+        let kind = match a.kind.as_deref().map(str::trim) {
+            Some("none") => None,
+            _ if a.remove == Some(true) => None,
+            Some("") | Some("default") | None => Some(if a.webhook_url.is_some() {
+                "webhook"
+            } else {
+                "ntfy"
+            }),
+            Some(k) => Some(k),
+        };
+        let cfg = match kind {
             None => None,
-            Some(url) => {
-                doorbell::validate_url(&url, self.registry.cfg.allow_insecure_doorbells)
-                    .map_err(RelayError::invalid)?;
-                let secret = a.secret.filter(|s| s.len() >= 8).ok_or_else(|| {
-                    RelayError::invalid("secret is required (at least 8 characters)")
-                })?;
+            Some(kind) => {
+                let target = match kind {
+                    "webhook" => {
+                        let url = a
+                            .webhook_url
+                            .ok_or_else(|| RelayError::invalid("webhook_url is required"))?;
+                        doorbell::validate_url(&url, insecure).map_err(RelayError::invalid)?;
+                        let secret = a.secret.filter(|s| (8..=256).contains(&s.len())).ok_or_else(
+                            || RelayError::invalid("secret is required (8 to 256 characters)"),
+                        )?;
+                        DoorbellTarget::Webhook {
+                            url,
+                            secret,
+                            auth_header: a.auth_header.filter(|h| !h.is_empty() && h.len() <= 512),
+                        }
+                    }
+                    "ntfy" => {
+                        let server = match a.server.map(|s| s.trim().trim_end_matches('/').to_string()) {
+                            Some(s) if !s.is_empty() && s != self.registry.cfg.ntfy_base_url.trim_end_matches('/') => {
+                                doorbell::validate_url_for("server", &s, insecure)
+                                    .map_err(RelayError::invalid)?;
+                                Some(s)
+                            }
+                            _ => None,
+                        };
+                        let topic = match a.topic.map(|t| t.trim().to_string()) {
+                            Some(t) if !t.is_empty() => {
+                                doorbell::validate_topic(&t).map_err(RelayError::invalid)?;
+                                t
+                            }
+                            _ => doorbell::random_topic(),
+                        };
+                        DoorbellTarget::Ntfy {
+                            server,
+                            topic,
+                            token: clean_secret("token", a.token)?,
+                        }
+                    }
+                    "gotify" => {
+                        let server = a
+                            .server
+                            .map(|s| s.trim().trim_end_matches('/').to_string())
+                            .filter(|s| !s.is_empty())
+                            .ok_or_else(|| RelayError::invalid("server is required for gotify"))?;
+                        doorbell::validate_url_for("server", &server, insecure)
+                            .map_err(RelayError::invalid)?;
+                        DoorbellTarget::Gotify {
+                            server,
+                            token: clean_secret("token", a.token)?
+                                .ok_or_else(|| RelayError::invalid("token (Gotify app token) is required"))?,
+                        }
+                    }
+                    "pushover" => DoorbellTarget::Pushover {
+                        token: clean_secret("token", a.token)?
+                            .ok_or_else(|| RelayError::invalid("token (Pushover app token) is required"))?,
+                        user: clean_secret("user", a.user)?
+                            .ok_or_else(|| RelayError::invalid("user (Pushover user key) is required"))?,
+                    },
+                    "webpush" => {
+                        let endpoint = a
+                            .endpoint
+                            .ok_or_else(|| RelayError::invalid("endpoint is required for webpush"))?;
+                        doorbell::validate_url_for("endpoint", &endpoint, insecure)
+                            .map_err(RelayError::invalid)?;
+                        let (p256dh, auth) = match (a.p256dh, a.auth) {
+                            (Some(p), Some(au)) => (p.trim().to_string(), au.trim().to_string()),
+                            _ => return Err(RelayError::invalid("p256dh and auth are required for webpush")),
+                        };
+                        crate::webpush::validate_subscriber(&p256dh, &auth).map_err(RelayError::invalid)?;
+                        DoorbellTarget::WebPush {
+                            endpoint,
+                            p256dh,
+                            auth,
+                        }
+                    }
+                    other => {
+                        return Err(RelayError::invalid(format!(
+                            "unknown doorbell type `{other}`; valid: ntfy (default), webhook, webpush, gotify, pushover, none"
+                        )))
+                    }
+                };
                 let events = a
                     .events
                     .unwrap_or_else(|| DEFAULT_EVENTS.iter().map(|s| s.to_string()).collect());
@@ -814,34 +968,110 @@ impl BotWhisperServer {
                         )));
                     }
                 }
-                Some(DoorbellConfig {
-                    webhook_url: url,
-                    secret,
-                    auth_header: a.auth_header,
-                    events,
-                })
+                Some(DoorbellConfig { target, events })
             }
         };
-        let targets = match &a.room_id {
+        let scope = match &a.room_id {
             Some(id) => {
                 let (room, me) = self.registry.resolve(&agent, id).await?;
-                vec![(room, me.member)]
+                let c = cfg.clone();
+                let m = me.member.clone();
+                room.with(move |r| r.set_doorbell(&m, c)).await??;
+                json!({ "scope": "room", "room_id": id })
             }
-            None => self.registry.rooms_for_agent(&agent).await?,
+            None => {
+                self.registry.bells.set_default(&agent.id, cfg.clone())?;
+                json!({ "scope": "bot_default", "applies_to": "every room you are in now or join later; a per-room doorbell overrides it" })
+            }
         };
-        let mut applied = Vec::new();
-        for (room, member) in targets {
-            let c = cfg.clone();
-            let m = member.clone();
-            room.with(move |r| r.set_doorbell(&m, c)).await??;
-            applied.push(room.id.clone());
+        let mut out = scope;
+        out["doorbell"] = match &cfg {
+            None => Value::Null,
+            Some(c) => self.describe_doorbell(c, None),
+        };
+        out["payload_shape"] = json!({ "v": 1, "event": "turn", "room": "<room_id>", "thread": "<thread id>", "seq": 0, "turn": "yours|theirs|open|none", "ts": 0 });
+        if let Some(DoorbellConfig {
+            target: DoorbellTarget::Webhook { .. },
+            ..
+        }) = &cfg
+        {
+            out["headers"] = json!([
+                "BotWhisper-Signature: t=<unix>,v1=<hex HMAC-SHA256(secret, t + \".\" + body)>",
+                "BotWhisper-Delivery: <uuid>"
+            ]);
         }
+        Ok(out)
+    }
+
+    /// Everything a bot may see about one doorbell: the masked view plus the
+    /// wake recipes (ntfy) or the VAPID key (webpush).
+    fn describe_doorbell(
+        &self,
+        c: &DoorbellConfig,
+        status: Option<&doorbell::DoorbellStatus>,
+    ) -> Value {
+        let base = self.registry.bells.ntfy_base_url().to_string();
+        let mut v = c.bot_view(&base);
+        if let Some(st) = status {
+            v["status"] = json!(st.status);
+            v["last_delivery_at"] = json!(st.last_delivery_at);
+        }
+        match &c.target {
+            DoorbellTarget::Ntfy {
+                server,
+                topic,
+                token,
+            } => {
+                let server = server.clone().unwrap_or(base);
+                v["recipes"] = doorbell::ntfy_recipes(&server, topic, token.is_some());
+                v["notes"] = json!("ntfy topics are public by name: treat the topic as a secret. Subscribe with `botwhisper listen` (or curl) to get content-free pings, then call wait_for_message.");
+            }
+            DoorbellTarget::WebPush { .. } => {
+                v["vapid_public_key"] = json!(self.registry.bells.vapid_public_key());
+            }
+            _ => {}
+        }
+        v
+    }
+
+    async fn do_get_doorbell(
+        &self,
+        agent: AgentId,
+        a: GetDoorbellArgs,
+    ) -> Result<Value, RelayError> {
+        let db = &self.registry.db;
+        let (cfg, status, scope, room_id) = match &a.room_id {
+            Some(id) => {
+                let (_room, me) = self.registry.resolve(&agent, id).await?;
+                match db.room_doorbell(id, &me.member)? {
+                    Some((c, st)) => (Some(c), Some(st), "room", Some(id.clone())),
+                    None => match db.bot_doorbell(&agent.id)? {
+                        Some((c, st)) => (Some(c), Some(st), "bot_default", Some(id.clone())),
+                        None => (None, None, "none", Some(id.clone())),
+                    },
+                }
+            }
+            None => match db.bot_doorbell(&agent.id)? {
+                Some((c, st)) => (Some(c), Some(st), "bot_default", None),
+                None => (None, None, "none", None),
+            },
+        };
         Ok(json!({
-            "rooms": applied,
-            "doorbell": cfg.map(|c| json!({ "webhook_url": c.webhook_url, "events": c.events })),
-            "payload_shape": { "v": 1, "event": "turn", "room": "<room_id>", "thread": "<thread id>", "seq": 0, "turn": "yours|theirs|none", "ts": 0 },
-            "headers": ["BotWhisper-Signature: t=<unix>,v1=<hex HMAC-SHA256(secret, t + \".\" + body)>", "BotWhisper-Delivery: <uuid>"],
+            "scope": scope,
+            "room_id": room_id,
+            "doorbell": cfg.as_ref().map(|c| self.describe_doorbell(c, status.as_ref())),
+            "hint": if cfg.is_none() { Some("no doorbell set; call set_doorbell (no arguments) to get a private ntfy topic") } else { None },
         }))
+    }
+}
+
+/// Trim a bot-supplied secret and bound its size. `None` when empty.
+fn clean_secret(what: &str, s: Option<String>) -> Result<Option<String>, RelayError> {
+    match s.map(|s| s.trim().to_string()) {
+        Some(s) if s.is_empty() => Ok(None),
+        Some(s) if s.len() > 256 => Err(RelayError::invalid(format!("{what} is too long"))),
+        Some(s) => Ok(Some(s)),
+        None => Ok(None),
     }
 }
 

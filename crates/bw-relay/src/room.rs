@@ -25,7 +25,7 @@ use crate::{
     auth::AgentId,
     config::RelayConfig,
     db::{Db, InviteRow, MemberRow, RoomRow, ThreadStart},
-    doorbell::{self, DoorbellConfig, DoorbellPayload, Doorbells, Ring},
+    doorbell::{self, DoorbellConfig, DoorbellKey, DoorbellPayload, Doorbells, Ring},
     error::RelayError,
     ratelimit::Limiter,
     registry::NewRoom,
@@ -416,26 +416,52 @@ impl Room {
     }
 
     /// Ring one member's doorbell for `event` if they subscribed to it and
-    /// are under their hourly ring budget.
+    /// are under their hourly ring budget. A per-room doorbell wins over the
+    /// bot's default doorbell.
     fn ring(&self, member: &str, event: &str, seq: u64, turn: &str, now: u64) {
+        let Some((cfg, key)) = self.doorbell_for(member) else {
+            return;
+        };
+        if cfg.wants(event) && self.bells_per_member.check(member).is_ok() {
+            self.bells.ring(Ring {
+                room_id: self.id.clone(),
+                member_id: member.to_string(),
+                key,
+                config: cfg,
+                payload: DoorbellPayload {
+                    v: bw_proto::PROTOCOL_VERSION,
+                    event: event.to_string(),
+                    room: self.id.clone(),
+                    thread: self.thread.as_ref().map(|t| t.id.clone()),
+                    seq,
+                    turn: turn.to_string(),
+                    ts: now,
+                },
+            });
+        }
+    }
+
+    /// The doorbell that applies to a member here: the room-specific one,
+    /// else the bot's default.
+    pub fn doorbell_for(&self, member: &str) -> Option<(DoorbellConfig, DoorbellKey)> {
         if let Some(cfg) = self.doorbells.get(member) {
-            if cfg.wants(event) && self.bells_per_member.check(member).is_ok() {
-                self.bells.ring(Ring {
+            return Some((
+                cfg.clone(),
+                DoorbellKey::Room {
                     room_id: self.id.clone(),
                     member_id: member.to_string(),
-                    config: cfg.clone(),
-                    payload: DoorbellPayload {
-                        v: bw_proto::PROTOCOL_VERSION,
-                        event: event.to_string(),
-                        room: self.id.clone(),
-                        thread: self.thread.as_ref().map(|t| t.id.clone()),
-                        seq,
-                        turn: turn.to_string(),
-                        ts: now,
-                    },
-                });
-            }
+                },
+            ));
         }
+        let agent = &self.member(member).ok()?.agent_id;
+        self.bells.default_for(agent).map(|cfg| {
+            (
+                cfg,
+                DoorbellKey::Bot {
+                    agent_id: agent.clone(),
+                },
+            )
+        })
     }
 
     fn ring_all(&self, event: &str, except: Option<&str>, now: u64) {
@@ -1174,9 +1200,12 @@ impl Room {
             "thread": self.view_for(member),
             "pending_messages_for_you": pending,
             "pending_events_for_you": self.events.get(member).map(Vec::len).unwrap_or(0),
-            "doorbell": self.doorbells.get(member).map(|d| json!({
-                "webhook_url": d.webhook_url, "events": d.events, "has_auth_header": d.auth_header.is_some()
-            })),
+            "doorbell": self.doorbell_for(member).map(|(d, key)| {
+                let mut v = d.bot_view(self.bells.ntfy_base_url());
+                v["scope"] = json!(match key { DoorbellKey::Room { .. } => "room", DoorbellKey::Bot { .. } => "bot_default" });
+                v["dead"] = json!(self.bells.is_dead(&key));
+                v
+            }),
         }))
     }
 
@@ -1189,6 +1218,10 @@ impl Room {
         self.require_open()?;
         self.member(member)?;
         self.db.set_doorbell(&self.id, member, cfg.as_ref())?;
+        self.bells.revive(&DoorbellKey::Room {
+            room_id: self.id.clone(),
+            member_id: member.to_string(),
+        });
         match cfg {
             Some(c) => {
                 self.doorbells.insert(member.to_string(), c);

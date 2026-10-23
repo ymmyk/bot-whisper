@@ -59,6 +59,22 @@ pub struct RelayConfig {
     pub allowed_hosts: Vec<String>,
     /// How often the room actor sweeps TTLs and leases.
     pub sweep_interval: Duration,
+    /// Relay-default ntfy server for generated doorbell topics.
+    pub ntfy_base_url: String,
+    /// The relay's own ntfy access token, sent for deliveries to the default
+    /// server when the bot gave none. Secret: never logged.
+    pub ntfy_token: Option<String>,
+    /// Minimum spacing between pings to one ntfy topic.
+    pub ntfy_min_interval: Duration,
+    /// VAPID private key file (hex P-256 scalar, 0600). `None` means
+    /// `vapid.key` next to the SQLite file, or an ephemeral key when the
+    /// database is in memory.
+    pub vapid_private_key_file: Option<PathBuf>,
+    /// VAPID `sub` claim (`mailto:` or `https:`). Defaults from the public URL.
+    pub vapid_subject: Option<String>,
+    /// Plaintext rooms may be created and used. The E2E cutover flips this
+    /// to `false`, after which plaintext tools answer `PLAINTEXT_RETIRED`.
+    pub allow_plaintext_rooms: bool,
 }
 
 impl Default for RelayConfig {
@@ -85,6 +101,12 @@ impl Default for RelayConfig {
             allow_insecure_doorbells: false,
             allowed_hosts: Vec::new(),
             sweep_interval: Duration::from_secs(5),
+            ntfy_base_url: crate::doorbell::DEFAULT_NTFY_BASE_URL.into(),
+            ntfy_token: None,
+            ntfy_min_interval: Duration::from_secs(5),
+            vapid_private_key_file: None,
+            vapid_subject: None,
+            allow_plaintext_rooms: true,
         }
     }
 }
@@ -96,6 +118,31 @@ impl RelayConfig {
             Some(u) => u.trim_end_matches('/').to_string(),
             None => format!("http://{}", self.bind),
         }
+    }
+
+    /// VAPID subject: the configured one, else the public https origin, else
+    /// a mailto placeholder (VAPID requires `mailto:` or `https:`).
+    pub fn vapid_subject(&self) -> String {
+        if let Some(s) = &self.vapid_subject {
+            return s.clone();
+        }
+        let url = self.public_url();
+        if url.starts_with("https://") {
+            url
+        } else {
+            "mailto:botwhisper@localhost".into()
+        }
+    }
+
+    /// Where the VAPID private key lives.
+    pub fn vapid_key_path(&self) -> Option<PathBuf> {
+        self.vapid_private_key_file.clone().or_else(|| {
+            self.db_path.as_ref().map(|p| {
+                p.parent()
+                    .unwrap_or(std::path::Path::new("."))
+                    .join("vapid.key")
+            })
+        })
     }
 
     /// True when the public URL is https (cookies get `Secure`).

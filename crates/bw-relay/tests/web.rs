@@ -361,6 +361,26 @@ async fn account_page_shows_only_own_data_and_disconnect_needs_csrf() {
     let b = relay.bot(&b_tok).await;
     b.ok("create_room", json!({ "title": "Bob room" })).await;
 
+    // Alice's bot sets a default ntfy doorbell with a token, and a webhook
+    // doorbell in its room; Bob's bot sets a Gotify one.
+    let bell = a
+        .ok(
+            "set_doorbell",
+            json!({ "type": "ntfy", "token": "tk_alice_secret" }),
+        )
+        .await;
+    let topic = bell["doorbell"]["topic"].as_str().unwrap().to_string();
+    a.ok(
+        "set_doorbell",
+        json!({ "room_id": room_id, "type": "webhook", "webhook_url": "http://hooks.alice.example/path/secret-path", "secret": "alice-hmac-secret" }),
+    )
+    .await;
+    b.ok(
+        "set_doorbell",
+        json!({ "type": "gotify", "server": "http://gotify.bob.example", "token": "Abob_gotify" }),
+    )
+    .await;
+
     let page = alice
         .get(format!("{base}/account"))
         .send()
@@ -387,6 +407,32 @@ async fn account_page_shows_only_own_data_and_disconnect_needs_csrf() {
     // Never a token, a hash, or the invite secret.
     let secret = invite_url.rsplit('.').next().unwrap();
     for s in [a_tok.as_str(), "bwr_test_", secret, &sha256_hex(&a_tok)] {
+        assert!(!page.contains(s), "page leaks {s}");
+    }
+    // Doorbells: type, host, masked topic and status, never secrets, paths
+    // or other people's doorbells.
+    assert!(
+        page.contains("Default doorbell (all rooms)")
+            && page.contains("<strong>ntfy</strong> to ntfy.sh")
+    );
+    assert!(page.contains("token set") && page.contains("status <strong>never</strong>"));
+    assert!(
+        page.contains(&format!("<code>{}…</code>", &topic[..7])),
+        "masked topic"
+    );
+    assert!(
+        page.contains("<details>") && page.contains(&format!("--topic {topic}")),
+        "full topic only inside the reveal toggle"
+    );
+    assert!(page.contains("BOTWHISPER_NTFY_TOKEN=&lt;your ntfy token&gt;"));
+    assert!(page.contains("<strong>webhook</strong> to hooks.alice.example"));
+    for s in [
+        "tk_alice_secret",
+        "alice-hmac-secret",
+        "secret-path",
+        "Abob_gotify",
+        "gotify.bob.example",
+    ] {
         assert!(!page.contains(s), "page leaks {s}");
     }
 
