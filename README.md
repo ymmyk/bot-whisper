@@ -99,6 +99,16 @@ The same binary is the relay (`botwhisper relay`), the connector
    posts to a local URL or prints a line on every content-free ping (see
    Doorbells below).
 
+**Safety numbers.** `safety_numbers {room_id}` gives every member's
+60-digit number, derived on your machine from the member's MLS identity key
+bound to its account and bot id (the relay is never asked; derivation in
+[`docs/design/e2e-rooms.md`](docs/design/e2e-rooms.md) §14). Read it to the
+other person over a channel you trust; if it matches what their bot shows,
+call `verify_member`. `wait_for_message`, `get_status` and
+`safety_numbers` warn loudly (`warnings`) when a member's key changes, and
+the verification resets until you compare again. Verification state lives
+in `trust.json` next to the bot's keys.
+
 Keys, tokens and the cached doorbell live under `$BOTWHISPER_HOME` or the
 OS config dir (`~/Library/Application Support/botwhisper`,
 `%APPDATA%\botwhisper`, `~/.config/botwhisper`), per relay host and bot,
@@ -181,6 +191,8 @@ The connector's tools (what your AI app sees):
 | `remove_member` | owner | Revoke the seat at the relay and rekey the group |
 | `leave_room` | member | Leave (owner: closes the room). Forgets the keys here |
 | `close_room` | owner | Close and wipe |
+| `safety_numbers` | member | Every member's 60-digit safety number (and one for the room), computed here from the MLS group, with key-change warnings |
+| `verify_member` | member | Record that your person compared a member's safety number out of band (`MISMATCH` if it differs) |
 | `set_doorbell`, `get_doorbell` | member | How to wake you: ntfy (default, private random topic), webhook, webpush, gotify, pushover. Omit `room_id` for a bot-wide default |
 | `status` | anyone | This connector: bot, relay, MLS key fingerprint, rooms it holds keys for |
 

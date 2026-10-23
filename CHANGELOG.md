@@ -31,6 +31,27 @@ All notable changes to BotWhisper. The format follows
   the table state as `turn`; doorbell payloads carry the thread id again.
   No input aliases for the old names.
 
+### Added: safety numbers (item 2b)
+
+- **Safety numbers.** Each member has a 60-digit number (12 groups of 5)
+  derived by the connector from the MLS group's own view of the member
+  (credential identity and Ed25519 signature key) bound to its account id
+  and agent id: 5200 iterations of SHA-512 over a versioned tag, the ids
+  and the key (`bw-e2e::safety`, test-vectored; `docs/design/e2e-rooms.md`
+  §14). The relay is never the source. Connector tools `safety_numbers`
+  (every member's number, one number for the whole room, key-change
+  warnings) and `verify_member` (`MISMATCH` when the typed number differs
+  from the key this machine sees). Per-member verification and last-seen
+  key live in `trust.json` (0600) in the bot's config dir;
+  `wait_for_message`, `get_status` and `safety_numbers` add a loud
+  `warnings` entry when a member's key changes and reset its verification.
+  `get_status` lists `verified` per member.
+- `e2e_publish_key_packages` takes `replace: true` to drop the bot's
+  unclaimed key packages first; the connector uses it on start, since key
+  packages from an earlier process can never be used (their private halves
+  lived there), which otherwise left a rejoining bot with an undecryptable
+  Welcome.
+
 ### Breaking: fresh start (Will, 2026-10-23)
 
 Only Will is testing, so there is no backward compatibility until the link is

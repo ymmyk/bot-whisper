@@ -160,6 +160,33 @@ What is lost on purpose: every account, bot, grant, room, invite, doorbell and k
 
 Rewritten in Phase 3 (fresh start 0d): `site/index.html` (install steps instead of "nothing to install", the "For AI agents" block with the connector setup, no "coming soon" callout, FAQ), `site/llms.txt`, the relay's `GET /`, 401 body, `guidance::agent_setup`, invite pages, MCP `instructions`, consent and account pages, the sign-in email, and the README and DESIGN.md headers. The only remote URL handed out is the relay base for `botwhisper connect login --relay`.
 
+## 14. Safety numbers
+
+A **safety number** is a 60-digit fingerprint of one member, computed by every connector from what the MLS group on its own machine says about that member (the credential identity and the leaf's signature public key). The relay is never asked: a relay that substituted a key would produce a mismatch, which is the point. Two people read the numbers to each other over a channel they trust (a call, in person); if they match, `verify_member` records it. Shown by the connector's `safety_numbers {room_id}` (every member's number plus one number for the room) and in `get_status` (`verified` per member).
+
+**Derivation, version 1** (`bw-e2e::safety`, test-vectored):
+
+```
+account_id = agent_id up to its first ':'    (empty when there is none, e.g. dev tokens)
+input      = "BotWhisper safety number v1" || 0x00
+             || len16(account_id) || account_id
+             || len16(agent_id)   || agent_id
+             || len16(public_key) || public_key       (raw Ed25519 signature key, 32 bytes)
+h0         = SHA-512(input)
+h(i)       = SHA-512(h(i-1) || input)              for i in 1..=5200
+number     = for each of the 12 consecutive 5-byte chunks of h(5200):
+             (big-endian u40) mod 100000, printed as 5 digits
+```
+
+`len16` is the big-endian 16-bit byte length. The result is shown as 12 groups of 5 digits (`10122 07806 ...`); comparisons ignore spacing. Binding the account id and the agent id into the hash means a key copied to a different bot or account yields a different number. The iteration count is Signal's (5200), so grinding a key that reproduces a chosen number costs about 5200 hashes per attempt. The **room safety number** is the same construction with the tag `"BotWhisper room safety number v1"`, the room id, and every member's number sorted, so a group of eight can compare one number instead of 56 pairs.
+
+Test vector: agent id `acct-1:bot_a`, public key `0x01` repeated 32 times →
+`10122 07806 13543 87224 44089 86977 15310 18105 18976 91059 70776 79408`.
+
+**Local state.** Per bot, `trust.json` (0600, next to `identity.json`) remembers for every agent id the last-seen key fingerprint (SHA-256 of the public key), its safety number, `verified`, `first_seen` and `last_seen`. Every `wait_for_message`, `get_status` and `safety_numbers` compares the group's current keys with it. A **changed key** resets `verified` and adds a loud `warnings` entry to the result ("SAFETY NUMBER CHANGED in room ... member m2 (acct:bob) is using a different MLS identity key than before, which your person had VERIFIED ..."), naming the old and new fingerprints, until the person compares and verifies again. Today a key changes whenever a connector loses its config directory (MLS state is in memory, the identity file is not), which is exactly the case that deserves a second look.
+
+**Why not the epoch authenticator?** Phase 2 planned a code derived from RFC 9420 §8.7's epoch authenticator. It changes every epoch (every join, leave or update), so people would have to re-compare after every membership change; a per-member number tied to the long-lived signature key compares once per key, like Signal's. The epoch authenticator is still a fine "we are in the same group right now" check and could be added as a short, transient code later.
+
 ## 13. Milestones
 
 - **M1 (Phase 2, done):** these two design docs; push doorbells (ntfy default, webhook, Web Push, Gotify, Pushover) and `botwhisper listen`; the `e2e_*` relay surface with SQLite persistence and tests; the `bw-e2e` crate (OpenMLS wrapper) with the 3-bot test and an in-process relay integration test; `botwhisper connect` with loopback OAuth login, token storage, `status`, and create/invite/join/send/wait over E2E.

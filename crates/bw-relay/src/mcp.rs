@@ -101,6 +101,10 @@ pub struct E2ePublishArgs {
     /// Base64 MLS key packages (one-time use, at most 4 KiB each; the relay
     /// keeps your newest 20).
     pub key_packages: Vec<String>,
+    /// Drop your unclaimed key packages first (a connector that just
+    /// started has new key material; the old ones could never be used).
+    #[serde(default)]
+    pub replace: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -474,7 +478,7 @@ impl BotWhisperServer {
 
     #[tool(
         name = "e2e_publish_key_packages",
-        description = "Store your MLS key packages (base64) on the relay so an existing member can add you to a room. One-time use; the relay keeps your newest 20. Your local connector calls this."
+        description = "Store your MLS key packages (base64) on the relay so an existing member can add you to a room. One-time use; the relay keeps your newest 20; replace=true drops your unclaimed ones first. Your local connector calls this."
     )]
     async fn e2e_publish_key_packages(
         &self,
@@ -491,6 +495,9 @@ impl BotWhisperServer {
                 }
                 let now = doorbell::now_unix();
                 let mut unused = 0;
+                if a.replace == Some(true) {
+                    self.registry.db.delete_unclaimed_key_packages(&agent.id)?;
+                }
                 for kp in &a.key_packages {
                     let bytes = decode_blob("key package", kp, MAX_KEY_PACKAGE_BYTES)?;
                     unused = self.registry.db.insert_key_package(

@@ -360,3 +360,155 @@ async fn two_connectors_inner() {
     assert_eq!(v["turn"]["status"], "complete");
     relay.shutdown().await;
 }
+
+#[tokio::test]
+async fn safety_numbers_verify_and_warn_on_key_change() {
+    tokio::time::timeout(Duration::from_secs(90), safety_numbers_inner())
+        .await
+        .expect("the test must not hang");
+}
+
+async fn safety_numbers_inner() {
+    let relay = TestRelay::start().await;
+    let config = tmp_dir("trust");
+    // Alice has a config dir, so her trust store persists; Bob is in memory.
+    let a = Connector::new(
+        RelayClient::with_token(&relay.base(), TOKENS[0]),
+        None,
+        Some(&config),
+    )
+    .await
+    .unwrap();
+    let alice_id = a.agent_id().to_string();
+    let b = Connector::new(
+        RelayClient::with_token(&relay.base(), TOKENS[1]),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let bob_id = b.agent_id().to_string();
+    let alice = serve_connector(a).await;
+    let bob = serve_connector(b).await;
+    let room = call(&alice, "create_room", json!({ "title": "t" })).await["room_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let inv = call(&alice, "create_invite", json!({ "room_id": room })).await;
+    let invite_url = inv["invite_url"].as_str().unwrap().to_string();
+    let (joined, _) = tokio::join!(
+        call(&bob, "join_room", json!({ "invite_url": invite_url })),
+        async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            call(
+                &alice,
+                "wait_for_message",
+                json!({ "room_id": room, "timeout_s": 2 }),
+            )
+            .await
+        }
+    );
+    assert_eq!(joined["joined"], true, "{joined}");
+
+    // Both sides compute the same numbers from their own group view.
+    let sa = call(&alice, "safety_numbers", json!({ "room_id": room })).await;
+    let sb = call(&bob, "safety_numbers", json!({ "room_id": room })).await;
+    assert_eq!(sa["room_safety_number"], sb["room_safety_number"]);
+    let number_of = |report: &Value, agent: &str| -> String {
+        report["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["agent_id"] == agent)
+            .unwrap()["safety_number"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let bob_number = number_of(&sa, &bob_id);
+    assert_eq!(bob_number, number_of(&sb, &bob_id));
+    assert_eq!(number_of(&sa, &alice_id), sa["you"]);
+    assert_eq!(bob_number.replace(' ', "").len(), 60);
+    assert_eq!(sa["warnings"], json!([]));
+    assert_eq!(
+        sa["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["agent_id"] == bob_id)
+            .unwrap()["verified"],
+        false
+    );
+
+    // Verify: a wrong number is a MISMATCH, the right one (typed without
+    // spaces) sticks and shows in get_status.
+    let v = call(
+        &alice,
+        "verify_member",
+        json!({ "room_id": room, "member": "m2", "safety_number": "12345 ".repeat(12) }),
+    )
+    .await;
+    assert_eq!(v["error"], "MISMATCH");
+    let v = call(
+        &alice,
+        "verify_member",
+        json!({ "room_id": room, "member": "m2", "safety_number": bob_number.replace(' ', "") }),
+    )
+    .await;
+    assert_eq!(v["verified"], true, "{v}");
+    let st = call(&alice, "get_status", json!({ "room_id": room })).await;
+    assert_eq!(st["verified"][0]["agent_id"], bob_id);
+    assert_eq!(st["verified"][0]["verified"], true);
+    assert!(st.get("warnings").is_none());
+    assert!(config
+        .join(botwhisper::connect::store::relay_host(&relay.base()))
+        .join(botwhisper::paths::safe_segment(&alice_id))
+        .join("trust.json")
+        .exists());
+
+    // Bob's key changes: Alice removes him, a fresh connector with the same
+    // bot (new identity) joins again, and Alice is warned loudly, with the
+    // verification reset.
+    call(
+        &alice,
+        "remove_member",
+        json!({ "room_id": room, "member_id": "m2" }),
+    )
+    .await;
+    let b2 = Connector::new(
+        RelayClient::with_token(&relay.base(), TOKENS[1]),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(b2.agent_id(), bob_id);
+    let bob2 = serve_connector(b2).await;
+    let inv = call(&alice, "create_invite", json!({ "room_id": room })).await;
+    let invite_url = inv["invite_url"].as_str().unwrap().to_string();
+    let (joined, waited) = tokio::join!(
+        call(&bob2, "join_room", json!({ "invite_url": invite_url })),
+        async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            call(
+                &alice,
+                "wait_for_message",
+                json!({ "room_id": room, "timeout_s": 2 }),
+            )
+            .await
+        }
+    );
+    assert_eq!(joined["joined"], true, "{joined}");
+    let warning = waited["warnings"][0].as_str().unwrap_or_default();
+    assert!(
+        warning.starts_with("SAFETY NUMBER CHANGED") && warning.contains("VERIFIED"),
+        "{waited}"
+    );
+    assert!(warning.contains(&bob_id));
+    let sa = call(&alice, "safety_numbers", json!({ "room_id": room })).await;
+    assert_ne!(number_of(&sa, &bob_id), bob_number, "new key, new number");
+    let st = call(&alice, "get_status", json!({ "room_id": room })).await;
+    assert_eq!(st["verified"][0]["verified"], false, "reset");
+    let _ = std::fs::remove_dir_all(&config);
+    relay.shutdown().await;
+}

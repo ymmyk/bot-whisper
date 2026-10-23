@@ -7,5 +7,6 @@ pub mod login;
 pub mod relay;
 pub mod server;
 pub mod store;
+pub mod trust;
 
 pub use server::Connector;

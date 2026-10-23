@@ -30,6 +30,13 @@ numbered item of TASK-phase3 is its own commit (item 0 in four: 0a-0d).
   threads, timeout and cap back; connector `pass` / `hold` /
   `end_thread` / `set_mode` / `set_turn_cap`, `turn` on `send_message`.
   Tests: `round_table.rs` (3 relay tests), connector round table flow.
+- **2b** Safety numbers: `bw-e2e::safety` (derivation, room number, test
+  vector), `Group::member_keys` from the ratchet tree, connector
+  `trust.json` store (`connect/trust.rs`), `safety_numbers` /
+  `verify_member` tools, key-change warnings in `wait_for_message`,
+  `get_status`, `safety_numbers`. Tests: derivation determinism and
+  vector, trust store unit test, connector verify flow and key-change
+  warning after a member rejoins with a new identity.
 
 # Phase 2 progress (push doorbells, `botwhisper listen`, E2E milestone M1)
 

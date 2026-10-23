@@ -15,6 +15,8 @@ use openmls_rust_crypto::OpenMlsRustCrypto;
 use openmls_traits::types::SignatureScheme;
 use sha2::{Digest, Sha256};
 
+pub mod safety;
+
 /// The one ciphersuite BotWhisper uses.
 pub const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
 
@@ -95,6 +97,16 @@ impl Identity {
     /// (`f=`) so a joiner can verify who sent its Welcome.
     pub fn fingerprint(&self) -> String {
         hex::encode(Sha256::digest(self.signer.public()))
+    }
+
+    /// The raw Ed25519 public signature key (32 bytes).
+    pub fn public_key(&self) -> Vec<u8> {
+        self.signer.public().to_vec()
+    }
+
+    /// This bot's own safety number (see [`safety`]).
+    pub fn safety_number(&self) -> String {
+        safety::safety_number(&self.agent_id, &self.public_key())
     }
 
     /// Serialize for the config directory (contains the private key).
@@ -185,6 +197,14 @@ fn private_key_of(signer: &SignatureKeyPair) -> Vec<u8> {
     serde_json::from_value(v["private"].clone()).expect("private key bytes")
 }
 
+/// A member's identity as the group sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberKey {
+    pub agent_id: String,
+    /// Raw Ed25519 public signature key.
+    pub public_key: Vec<u8>,
+}
+
 /// Who sent a Welcome.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Inviter {
@@ -250,6 +270,18 @@ impl Group {
         self.group
             .members()
             .map(|m| identity_of(&m.credential))
+            .collect()
+    }
+
+    /// Current members with their signature public keys, straight from the
+    /// MLS ratchet tree (the relay is not involved), in leaf order.
+    pub fn member_keys(&self) -> Vec<MemberKey> {
+        self.group
+            .members()
+            .map(|m| MemberKey {
+                agent_id: identity_of(&m.credential),
+                public_key: m.signature_key.clone(),
+            })
             .collect()
     }
 

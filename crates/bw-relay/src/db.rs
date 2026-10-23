@@ -660,6 +660,17 @@ impl Db {
 
     /// Store one key package for a bot. Keeps at most `keep` unclaimed ones
     /// (oldest dropped). Returns how many unclaimed remain.
+    /// Drop every unclaimed key package of a bot (its connector started
+    /// with fresh key material, so the old ones can never be used).
+    pub fn delete_unclaimed_key_packages(&self, agent_id: &str) -> Result<usize> {
+        self.with(|c| {
+            c.execute(
+                "DELETE FROM e2e_key_packages WHERE agent_id = ?1 AND claimed_at IS NULL",
+                params![agent_id],
+            )
+        })
+    }
+
     pub fn insert_key_package(
         &self,
         agent_id: &str,

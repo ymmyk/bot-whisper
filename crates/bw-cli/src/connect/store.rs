@@ -93,6 +93,10 @@ impl BotStore {
     pub fn doorbell_path(&self) -> PathBuf {
         self.dir.join("doorbell.json")
     }
+    /// Last-seen keys and verified safety numbers of other members.
+    pub fn trust_path(&self) -> PathBuf {
+        self.dir.join("trust.json")
+    }
 
     pub fn load_tokens(&self) -> Option<Tokens> {
         let bytes = std::fs::read(self.tokens_path()).ok()?;
