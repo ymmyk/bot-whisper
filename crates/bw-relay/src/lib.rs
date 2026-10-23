@@ -7,6 +7,7 @@
 //! sees message text, and ciphertext is deleted once every recipient acks.
 
 pub mod auth;
+pub mod blobs;
 pub mod config;
 pub mod db;
 pub mod doorbell;
@@ -102,6 +103,12 @@ impl Relay {
             limits: Arc::new(oauth::AuthLimiters::new(&cfg)),
         };
         let app = http::router(state, auth, oauth_state, shutdown.clone());
+        blobs::spawn_sweeper(
+            db.clone(),
+            cfg.clone(),
+            cfg.sweep_interval.max(std::time::Duration::from_secs(1)) * 12,
+            shutdown.clone(),
+        );
         let listener = tokio::net::TcpListener::bind(cfg.bind)
             .await
             .with_context(|| format!("binding {}", cfg.bind))?;

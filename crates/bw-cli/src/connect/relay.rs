@@ -74,19 +74,29 @@ impl RelayClient {
         )
     }
 
-    async fn service(&self) -> anyhow::Result<Arc<RunningService<RoleClient, ()>>> {
-        // Refresh when the access token is about to expire.
-        {
-            let mut t = self.tokens.lock().await;
-            if t.expires_at != u64::MAX && t.expires_at <= bw_relay::doorbell::now_unix() + 60 {
-                let fresh = login::refresh(&self.relay, &t).await?;
-                if let Some(s) = &self.store {
-                    s.save_tokens(&fresh)?;
-                }
-                *t = fresh;
-                *self.svc.lock().await = None;
+    /// A current access token (refreshed first when about to expire), for
+    /// the relay's plain HTTP routes (file blobs).
+    pub async fn bearer(&self) -> anyhow::Result<String> {
+        self.ensure_fresh().await?;
+        Ok(self.tokens.lock().await.access_token.clone())
+    }
+
+    /// Refresh when the access token is about to expire.
+    async fn ensure_fresh(&self) -> anyhow::Result<()> {
+        let mut t = self.tokens.lock().await;
+        if t.expires_at != u64::MAX && t.expires_at <= bw_relay::doorbell::now_unix() + 60 {
+            let fresh = login::refresh(&self.relay, &t).await?;
+            if let Some(s) = &self.store {
+                s.save_tokens(&fresh)?;
             }
+            *t = fresh;
+            *self.svc.lock().await = None;
         }
+        Ok(())
+    }
+
+    async fn service(&self) -> anyhow::Result<Arc<RunningService<RoleClient, ()>>> {
+        self.ensure_fresh().await?;
         let mut svc = self.svc.lock().await;
         if let Some(s) = &*svc {
             return Ok(s.clone());

@@ -72,6 +72,13 @@ pub struct RelayConfig {
     pub vapid_private_key_file: Option<PathBuf>,
     /// VAPID `sub` claim (`mailto:` or `https:`). Defaults from the public URL.
     pub vapid_subject: Option<String>,
+    /// Largest encrypted file blob accepted. Default 10 MiB.
+    pub max_file_bytes: usize,
+    /// How long an unfetched file blob is kept. Default 7 days.
+    pub file_ttl: Duration,
+    /// Where file blobs are stored. `None` means `blobs/` next to the SQLite
+    /// file (a temporary directory when the database is in memory).
+    pub blob_dir: Option<PathBuf>,
 }
 
 impl Default for RelayConfig {
@@ -103,6 +110,9 @@ impl Default for RelayConfig {
             ntfy_min_interval: Duration::from_secs(5),
             vapid_private_key_file: None,
             vapid_subject: None,
+            max_file_bytes: crate::blobs::DEFAULT_MAX_FILE_BYTES,
+            file_ttl: Duration::from_secs(crate::blobs::DEFAULT_FILE_TTL_SECS),
+            blob_dir: None,
         }
     }
 }

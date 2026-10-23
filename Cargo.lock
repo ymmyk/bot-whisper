@@ -336,6 +336,7 @@ dependencies = [
 name = "botwhisper"
 version = "0.1.1-alpha"
 dependencies = [
+ "aes-gcm",
  "anyhow",
  "axum",
  "base64 0.22.1",

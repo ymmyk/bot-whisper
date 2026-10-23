@@ -57,7 +57,8 @@ pub fn router(
     let mcp = Router::new()
         .route_service("/mcp", mcp_service)
         .route_layer(middleware::from_fn(delete_is_204))
-        .route_layer(middleware::from_fn_with_state(auth, require_bearer));
+        .route_layer(middleware::from_fn_with_state(auth.clone(), require_bearer));
+    let blobs = crate::blobs::router(state.clone(), auth);
 
     let oauth = Router::new()
         .route(
@@ -96,6 +97,7 @@ pub fn router(
         .with_state(state)
         .merge(oauth)
         .merge(mcp)
+        .merge(blobs)
 }
 
 /// MCP: a client ending its session with `DELETE /mcp` gets `204 No Content`
@@ -146,6 +148,8 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
         "version": env!("CARGO_PKG_VERSION"),
         "protocol": bw_proto::PROTOCOL_VERSION,
         "encryption": crate::room::ENCRYPTION_LABEL,
+        "max_file_bytes": state.cfg.max_file_bytes,
+        "file_ttl_s": state.cfg.file_ttl.as_secs(),
         "uptime_s": state.started.elapsed().as_secs(),
         "rooms": { "loaded": loaded, "total": total },
         "doorbells": {

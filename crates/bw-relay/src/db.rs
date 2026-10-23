@@ -149,6 +149,20 @@ CREATE TABLE IF NOT EXISTS e2e_handshakes (
     created_at    INTEGER NOT NULL,
     PRIMARY KEY (room_id, seq)
 );
+-- Encrypted file blobs (ciphertext on disk under the data directory; this
+-- row is the index). `pending` is the JSON list of members who have not
+-- fetched and acked it yet; the row and file go when it is empty or the
+-- TTL passes. Keys, names, sizes and hashes travel inside the MLS message.
+CREATE TABLE IF NOT EXISTS e2e_blobs (
+    id            TEXT PRIMARY KEY,
+    room_id       TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+    uploader      TEXT NOT NULL,
+    size          INTEGER NOT NULL,
+    created_at    INTEGER NOT NULL,
+    expires_at    INTEGER NOT NULL,
+    pending       TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS e2e_blobs_by_room ON e2e_blobs(room_id);
 -- A bot's default doorbell: applies to every room it is in, now and later,
 -- unless a room-specific doorbell overrides it. `config` is DoorbellConfig
 -- as JSON (secrets included; never logged, never shown).
@@ -187,6 +201,19 @@ impl SeatState {
             SeatState::Pending
         }
     }
+}
+
+/// An encrypted file blob's index row.
+#[derive(Debug, Clone)]
+pub struct BlobRow {
+    pub id: String,
+    pub room_id: String,
+    pub uploader: String,
+    pub size: u64,
+    pub created_at: u64,
+    pub expires_at: u64,
+    /// Members who still have to fetch and ack it.
+    pub pending: Vec<String>,
 }
 
 /// A persisted E2E handshake message (commit or Welcome).
@@ -820,6 +847,101 @@ impl Db {
             )?;
             let rows = stmt.query_map(params![agent_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
             rows.collect()
+        })
+    }
+
+    // ----- file blobs -----
+
+    pub fn insert_blob(&self, b: &BlobRow) -> Result<()> {
+        self.with(|c| {
+            c.execute(
+                "INSERT INTO e2e_blobs (id, room_id, uploader, size, created_at, expires_at, pending)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    b.id,
+                    b.room_id,
+                    b.uploader,
+                    b.size as i64,
+                    b.created_at as i64,
+                    b.expires_at as i64,
+                    serde_json::to_string(&b.pending).unwrap_or_default()
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn get_blob(&self, id: &str) -> Result<Option<BlobRow>> {
+        self.with(|c| {
+            c.query_row(
+                "SELECT id, room_id, uploader, size, created_at, expires_at, pending FROM e2e_blobs WHERE id = ?1",
+                params![id],
+                |r| {
+                    Ok(BlobRow {
+                        id: r.get(0)?,
+                        room_id: r.get(1)?,
+                        uploader: r.get(2)?,
+                        size: r.get::<_, i64>(3)? as u64,
+                        created_at: r.get::<_, i64>(4)? as u64,
+                        expires_at: r.get::<_, i64>(5)? as u64,
+                        pending: serde_json::from_str(&r.get::<_, String>(6)?).unwrap_or_default(),
+                    })
+                },
+            )
+            .optional()
+        })
+    }
+
+    /// Remove `member` from a blob's pending set. Returns how many are left.
+    pub fn ack_blob(&self, id: &str, member: &str) -> Result<usize> {
+        self.with(|c| {
+            let pending: Option<String> = c
+                .query_row(
+                    "SELECT pending FROM e2e_blobs WHERE id = ?1",
+                    params![id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let Some(pending) = pending else {
+                return Ok(0);
+            };
+            let mut list: Vec<String> = serde_json::from_str(&pending).unwrap_or_default();
+            list.retain(|m| m != member);
+            c.execute(
+                "UPDATE e2e_blobs SET pending = ?2 WHERE id = ?1",
+                params![id, serde_json::to_string(&list).unwrap_or_default()],
+            )?;
+            Ok(list.len())
+        })
+    }
+
+    pub fn delete_blob(&self, id: &str) -> Result<()> {
+        self.with(|c| {
+            c.execute("DELETE FROM e2e_blobs WHERE id = ?1", params![id])?;
+            Ok(())
+        })
+    }
+
+    pub fn room_blob_ids(&self, room_id: &str) -> Result<Vec<String>> {
+        self.with(|c| {
+            let mut st = c.prepare("SELECT id FROM e2e_blobs WHERE room_id = ?1")?;
+            let rows = st.query_map(params![room_id], |r| r.get(0))?;
+            rows.collect()
+        })
+    }
+
+    pub fn expired_blob_ids(&self, now: u64) -> Result<Vec<String>> {
+        self.with(|c| {
+            let mut st = c.prepare("SELECT id FROM e2e_blobs WHERE expires_at <= ?1")?;
+            let rows = st.query_map(params![now as i64], |r| r.get(0))?;
+            rows.collect()
+        })
+    }
+
+    pub fn count_blobs(&self) -> Result<usize> {
+        self.with(|c| {
+            c.query_row("SELECT COUNT(*) FROM e2e_blobs", [], |r| r.get::<_, i64>(0))
+                .map(|n| n as usize)
         })
     }
 

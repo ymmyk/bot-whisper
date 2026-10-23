@@ -362,6 +362,150 @@ async fn two_connectors_inner() {
 }
 
 #[tokio::test]
+async fn files_round_trip_encrypted() {
+    tokio::time::timeout(Duration::from_secs(90), files_inner())
+        .await
+        .expect("the test must not hang");
+}
+
+async fn files_inner() {
+    let relay = TestRelay::start().await;
+    let config = tmp_dir("files");
+    let a = Connector::new(
+        RelayClient::with_token(&relay.base(), TOKENS[0]),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let alice_id = a.agent_id().to_string();
+    let b = Connector::new(
+        RelayClient::with_token(&relay.base(), TOKENS[1]),
+        None,
+        Some(&config),
+    )
+    .await
+    .unwrap();
+    let alice = serve_connector(a).await;
+    let bob = serve_connector(b).await;
+    let room = call(&alice, "create_room", json!({ "title": "files" })).await["room_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let inv = call(&alice, "create_invite", json!({ "room_id": room })).await;
+    let invite_url = inv["invite_url"].as_str().unwrap().to_string();
+    let (joined, _) = tokio::join!(
+        call(&bob, "join_room", json!({ "invite_url": invite_url })),
+        async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            call(
+                &alice,
+                "wait_for_message",
+                json!({ "room_id": room, "timeout_s": 2 }),
+            )
+            .await
+        }
+    );
+    assert_eq!(joined["joined"], true, "{joined}");
+
+    // Alice sends a file from disk; the relay holds only ciphertext.
+    let secret = b"SECRET-FILE-CONTENT-0x9a8b7c
+"
+    .repeat(40);
+    let src = config.join("notes.txt");
+    std::fs::write(&src, &secret).unwrap();
+    let sent = call(
+        &alice,
+        "send_file",
+        json!({ "room_id": room, "path": src.display().to_string(), "mime": "text/plain" }),
+    )
+    .await;
+    assert_eq!(sent["name"], "notes.txt", "{sent}");
+    assert_eq!(sent["size"], secret.len());
+    let file_id = sent["file_id"].as_str().unwrap().to_string();
+    let blob = std::fs::read(bw_relay::blobs::blob_dir(&relay.cfg).join(&file_id)).unwrap();
+    assert!(
+        !blob.windows(12).any(|w| w == b"SECRET-FILE-"),
+        "ciphertext only"
+    );
+    assert_eq!(relay.db.count_blobs().unwrap(), 1);
+
+    // Bob sees a file message, fetches, decrypts, verifies and acks.
+    let got = call(
+        &bob,
+        "wait_for_message",
+        json!({ "room_id": room, "timeout_s": 5 }),
+    )
+    .await;
+    let m = &got["messages"][0];
+    assert_eq!(m["kind"], "file");
+    assert_eq!(m["file_id"], file_id);
+    assert_eq!(m["name"], "notes.txt");
+    assert_eq!(m["mime"], "text/plain");
+    let f = call(
+        &bob,
+        "get_file",
+        json!({ "room_id": room, "file_id": file_id }),
+    )
+    .await;
+    assert_eq!(f["size"], secret.len(), "{f}");
+    assert_eq!(f["acked"], true);
+    assert_eq!(f["from"], alice_id);
+    let path = f["path"].as_str().unwrap();
+    assert_eq!(std::fs::read(path).unwrap(), secret);
+    assert!(path.contains("downloads"));
+    let inline = base64::Engine::decode(
+        &base64::engine::general_purpose::STANDARD,
+        f["content_base64"].as_str().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(inline, secret);
+    assert_eq!(
+        relay.db.count_blobs().unwrap(),
+        0,
+        "deleted after the only recipient acked"
+    );
+    // Fetching it again fails (gone), and an unknown id is refused.
+    let f = call(
+        &bob,
+        "get_file",
+        json!({ "room_id": room, "file_id": file_id }),
+    )
+    .await;
+    assert!(f["error"].is_string(), "{f}");
+
+    // Inline content, to a chosen destination.
+    let dest = config.join("out").join("hello.bin");
+    let sent = call(
+        &bob,
+        "send_file",
+        json!({ "room_id": room, "content_base64": "aGVsbG8=", "name": "hello.bin" }),
+    )
+    .await;
+    let id2 = sent["file_id"].as_str().unwrap().to_string();
+    let got = call(
+        &alice,
+        "wait_for_message",
+        json!({ "room_id": room, "timeout_s": 5 }),
+    )
+    .await;
+    assert_eq!(got["messages"][0]["file_id"], id2);
+    let f = call(
+        &alice,
+        "get_file",
+        json!({ "room_id": room, "file_id": id2, "dest": dest.display().to_string() }),
+    )
+    .await;
+    assert_eq!(std::fs::read(&dest).unwrap(), b"hello");
+    assert!(
+        f["content_base64"].is_null(),
+        "not inline when dest is given"
+    );
+    let _ = std::fs::remove_dir_all(&config);
+    relay.shutdown().await;
+}
+
+#[tokio::test]
 async fn safety_numbers_verify_and_warn_on_key_change() {
     tokio::time::timeout(Duration::from_secs(90), safety_numbers_inner())
         .await

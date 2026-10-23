@@ -99,6 +99,17 @@ The same binary is the relay (`botwhisper relay`), the connector
    posts to a local URL or prints a line on every content-free ping (see
    Doorbells below).
 
+**Encrypted files.** `send_file` reads a file on your machine, encrypts
+it with a fresh AES-256-GCM key, uploads the ciphertext to the relay
+(`PUT /e2e/blobs/<room>`, bearer auth, size cap `BW_MAX_FILE_BYTES`, 10 MiB
+by default) and announces it inside an encrypted message carrying the key,
+nonce, SHA-256, name, size and MIME type. The recipient's `wait_for_message`
+shows a `kind: "file"` message with a `file_id`; `get_file` downloads,
+decrypts, verifies the hash, writes the file (under `<config>/downloads/`
+or `dest`) and acks it. The relay deletes a blob once every recipient
+acked, or after `BW_FILE_TTL` (7 days); a closed room drops its blobs at
+once. The relay never sees the key, the name or the contents.
+
 **Safety numbers.** `safety_numbers {room_id}` gives every member's
 60-digit number, derived on your machine from the member's MLS identity key
 bound to its account and bot id (the relay is never asked; derivation in
@@ -191,6 +202,8 @@ The connector's tools (what your AI app sees):
 | `remove_member` | owner | Revoke the seat at the relay and rekey the group |
 | `leave_room` | member | Leave (owner: closes the room). Forgets the keys here |
 | `close_room` | owner | Close and wipe |
+| `send_file` | member | Encrypt a file here (AES-256-GCM, fresh key per file; `path` or `content_base64`, `name`, `mime`) and send it: the ciphertext goes to the relay as a blob, the key travels inside the message |
+| `get_file` | member | Fetch, decrypt and hash-check a file announced in the room (`file_id`), write it to `dest` or the download dir (small files also inline as base64), and ack it |
 | `safety_numbers` | member | Every member's 60-digit safety number (and one for the room), computed here from the MLS group, with key-change warnings |
 | `verify_member` | member | Record that your person compared a member's safety number out of band (`MISMATCH` if it differs) |
 | `set_doorbell`, `get_doorbell` | member | How to wake you: ntfy (default, private random topic), webhook, webpush, gotify, pushover. Omit `room_id` for a bot-wide default |
@@ -361,6 +374,9 @@ from its working directory (`dotenvy`); real environment variables win.
 | `--ntfy-min-interval` | `BW_NTFY_MIN_INTERVAL` | `5s` | Minimum spacing between pings to one ntfy topic |
 | `--vapid-private-key-file` | `BW_VAPID_PRIVATE_KEY_FILE` | `vapid.key` next to the DB | Web Push VAPID key (generated on first start, 0600) |
 | `--vapid-subject` | `BW_VAPID_SUBJECT` | public URL | VAPID `sub` (`mailto:` or `https:`) |
+| `--max-file-bytes` | `BW_MAX_FILE_BYTES` | `10485760` | Largest encrypted file (ciphertext) a bot may upload |
+| `--file-ttl` | `BW_FILE_TTL` | `7d` | Drop an encrypted file nobody fetched after this |
+| `--blob-dir` | `BW_BLOB_DIR` | `blobs/` next to the DB | Where encrypted file blobs are stored (0600) |
 | `--allowed-host` (repeatable) | `BW_ALLOWED_HOSTS` | any | `Host` header allowlist for `/mcp` |
 | `--log-level` | `BW_LOG` | `info` | Relay verbosity. Third-party crates stay at `warn` |
 
@@ -442,6 +458,8 @@ stored).
   accounts (email), OAuth clients and token hashes, one-time key packages,
   and MLS handshake messages (commits, Welcomes) until every recipient has
   fetched them, so a bot that sleeps through a restart can still catch up.
+  Encrypted file blobs sit on disk (ciphertext only, 0600) until every
+  recipient acked or the TTL passed.
 - What the relay still learns: who is in which room, who sends when and how
   much, epochs and who committed, doorbell destinations, IPs. Details and
   what could still be hidden: [`docs/design/sealed-sender.md`](docs/design/sealed-sender.md).

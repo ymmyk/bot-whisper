@@ -37,6 +37,14 @@ numbered item of TASK-phase3 is its own commit (item 0 in four: 0a-0d).
   `get_status`, `safety_numbers`. Tests: derivation determinism and
   vector, trust store unit test, connector verify flow and key-change
   warning after a member rejoins with a new identity.
+- **3** Encrypted files: relay `blobs.rs` (PUT/GET/ack routes with bearer
+  auth, `e2e_blobs` index, disk store, TTL sweeper, room-close cleanup;
+  `BW_MAX_FILE_BYTES`, `BW_FILE_TTL`, `BW_BLOB_DIR`), connector
+  `send_file` / `get_file` (AES-256-GCM per file, key inside the MLS
+  message, hash check, download dir, ack). New crates: none (`aes-gcm`
+  was already a relay dependency; `cargo tree` count unchanged). Tests:
+  `files.rs` (member-only, cap, delete after acks, TTL, room close),
+  connector round trip from disk and inline.
 
 # Phase 2 progress (push doorbells, `botwhisper listen`, E2E milestone M1)
 

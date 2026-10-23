@@ -636,6 +636,7 @@ impl Room {
         self.e2e.clear();
         self.events.clear();
         self.thread = None;
+        crate::blobs::delete_room_blobs(&self.db, &crate::blobs::blob_dir(&self.cfg), &self.id);
         if let Err(e) = self.db.delete_room(&self.id) {
             tracing::warn!("failed to delete room metadata: {e}");
         }

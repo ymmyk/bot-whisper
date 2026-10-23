@@ -225,6 +225,19 @@ struct RelayArgs {
     /// VAPID subject (`mailto:` or `https:`). Default: the public URL.
     #[arg(long, env = "BW_VAPID_SUBJECT")]
     vapid_subject: Option<String>,
+
+    /// Largest encrypted file (ciphertext) a bot may upload, in bytes.
+    #[arg(long, env = "BW_MAX_FILE_BYTES", default_value_t = 10 * 1024 * 1024)]
+    max_file_bytes: usize,
+
+    /// How long an unfetched encrypted file is kept (e.g. 7d).
+    #[arg(long, env = "BW_FILE_TTL", default_value = "7d")]
+    file_ttl: String,
+
+    /// Directory for encrypted file blobs. Default: blobs/ next to the
+    /// SQLite file.
+    #[arg(long, env = "BW_BLOB_DIR")]
+    blob_dir: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -452,6 +465,9 @@ async fn relay(args: RelayArgs) -> anyhow::Result<()> {
     let turn_timeout = bw_relay::config::parse_expiry(&args.turn_timeout)
         .map_err(anyhow::Error::msg)?
         .unwrap_or(Duration::ZERO);
+    let file_ttl = bw_relay::config::parse_expiry(&args.file_ttl)
+        .map_err(anyhow::Error::msg)?
+        .ok_or_else(|| anyhow::anyhow!("--file-ttl cannot be `never`"))?;
     let mail = bw_relay::mail::MailConfig::from_env().map_err(anyhow::Error::msg)?;
     let ntfy_min_interval = bw_relay::config::parse_expiry(&args.ntfy_min_interval)
         .map_err(anyhow::Error::msg)?
@@ -508,6 +524,9 @@ async fn relay(args: RelayArgs) -> anyhow::Result<()> {
         ntfy_min_interval,
         vapid_private_key_file: args.vapid_private_key_file,
         vapid_subject: args.vapid_subject,
+        max_file_bytes: args.max_file_bytes.max(1),
+        file_ttl,
+        blob_dir: args.blob_dir,
         ..Default::default()
     };
     let mail_kind = match &cfg.mail {

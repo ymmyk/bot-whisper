@@ -31,6 +31,27 @@ All notable changes to BotWhisper. The format follows
   the table state as `turn`; doorbell payloads carry the thread id again.
   No input aliases for the old names.
 
+### Added: encrypted files (item 3)
+
+- **`send_file` / `get_file`** on the connector. A file is encrypted on the
+  bot's machine with a fresh AES-256-GCM key and nonce (the `aes-gcm`,
+  `rand` and `sha2` crates already in the tree: no new dependencies), the
+  ciphertext is uploaded to the relay as a blob, and the key, nonce,
+  SHA-256, name, size and MIME type travel inside the MLS message. The
+  recipient sees a `kind: "file"` message with a `file_id`; `get_file`
+  downloads, decrypts, verifies the hash, writes the file under the
+  connector's `downloads/` directory (or `dest`; files up to 64 KiB are
+  also returned inline as base64) and acks it.
+- **Relay blob store:** `PUT /e2e/blobs/{room}` (raw ciphertext, bearer
+  auth, active members only), `GET /e2e/blobs/{room}/{id}`,
+  `POST /e2e/blobs/{room}/{id}/ack`. Size cap `BW_MAX_FILE_BYTES` /
+  `--max-file-bytes` (10 MiB), TTL `BW_FILE_TTL` / `--file-ttl` (7 days),
+  location `BW_BLOB_DIR` / `--blob-dir` (`blobs/` next to the SQLite file,
+  0600). A blob is deleted once every recipient acked, when the TTL passes
+  (background sweeper), or when its room closes. `/health` reports the cap
+  and TTL. Nothing about a blob is logged; the index row holds only ids,
+  the uploader, size and times.
+
 ### Added: safety numbers (item 2b)
 
 - **Safety numbers.** Each member has a 60-digit number (12 groups of 5)
