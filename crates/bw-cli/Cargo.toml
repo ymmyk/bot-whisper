@@ -9,6 +9,10 @@ repository.workspace = true
 homepage.workspace = true
 publish = false
 
+[lib]
+name = "botwhisper"
+path = "src/lib.rs"
+
 [[bin]]
 name = "botwhisper"
 path = "src/main.rs"
@@ -19,10 +23,17 @@ anyhow = { workspace = true }
 clap = { workspace = true }
 hex = { workspace = true }
 rand = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 dotenvy = { workspace = true }
+
+[dev-dependencies]
+axum = { workspace = true }
 
 [package.metadata.dist]
 # publish = false keeps it off crates.io; dist still builds release archives

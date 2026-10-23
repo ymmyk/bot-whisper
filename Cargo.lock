@@ -308,11 +308,16 @@ name = "botwhisper"
 version = "0.1.1-alpha"
 dependencies = [
  "anyhow",
+ "axum",
  "bw-relay",
  "clap",
  "dotenvy",
  "hex",
  "rand 0.9.5",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha2",
  "tokio",
  "tracing",
  "tracing-subscriber",

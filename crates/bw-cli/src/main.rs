@@ -1,4 +1,5 @@
-//! `botwhisper` binary. v1 has one subcommand: `relay`.
+//! `botwhisper` binary: `relay` (the server) and `listen` (turn doorbell
+//! pings into action on the bot's machine).
 
 use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
@@ -20,6 +21,57 @@ struct Cli {
 enum Command {
     /// Run the relay (remote MCP endpoint + OAuth + doorbells + SQLite metadata).
     Relay(Box<RelayArgs>),
+    /// Subscribe to your bot's ntfy doorbell topic and run a command, post to
+    /// a local URL or print a JSON line on every content-free ping.
+    Listen(Box<ListenArgs>),
+}
+
+#[derive(Args, Debug)]
+struct ListenArgs {
+    /// ntfy server.
+    #[arg(
+        long,
+        env = "BOTWHISPER_NTFY_SERVER",
+        default_value = "https://ntfy.sh"
+    )]
+    server: String,
+
+    /// Topic to subscribe to (from set_doorbell / get_doorbell). Treat it as
+    /// a secret: ntfy topics are public by name.
+    #[arg(long, env = "BOTWHISPER_NTFY_TOPIC")]
+    topic: Option<String>,
+
+    /// Name of the environment variable holding the topic's access token.
+    /// Tokens are never accepted as flag values.
+    #[arg(long, default_value = "BOTWHISPER_NTFY_TOKEN")]
+    token_env: String,
+
+    /// Run this command (via sh -c / cmd /C) on each ping, with
+    /// BOTWHISPER_ROOM, BOTWHISPER_EVENT, BOTWHISPER_SEQ (and
+    /// BOTWHISPER_THREAD) in its environment. Coalesced per room.
+    #[arg(long)]
+    exec: Option<String>,
+
+    /// POST the content-free ping JSON to this URL on each ping.
+    #[arg(long)]
+    post: Option<String>,
+
+    /// Environment variable whose value is sent as `Authorization: Bearer`.
+    #[arg(long)]
+    post_bearer_env: Option<String>,
+
+    /// Body template for --post with {room}, {event}, {seq}, {thread}.
+    #[arg(long)]
+    post_body: Option<String>,
+
+    /// Print one JSON line per ping (default when neither --exec nor --post).
+    #[arg(long)]
+    print: bool,
+
+    /// Poll once (for cron): handle pings since the last run, store the
+    /// cursor in the config dir, exit 0 if there were any, 3 if none.
+    #[arg(long)]
+    once: bool,
 }
 
 #[derive(Args, Debug)]
@@ -152,7 +204,57 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Relay(args) => relay(*args).await,
+        Command::Listen(args) => {
+            let code = listen(*args).await?;
+            std::process::exit(code);
+        }
     }
+}
+
+async fn listen(args: ListenArgs) -> anyhow::Result<i32> {
+    use botwhisper::listen::{Action, ListenOpts};
+    let Some(topic) = args.topic.filter(|t| !t.trim().is_empty()) else {
+        anyhow::bail!(
+            "no topic. Pass --topic <topic> (from your bot's set_doorbell / get_doorbell result) \
+             or set BOTWHISPER_NTFY_TOPIC. Zero-config lookup after `botwhisper connect login` \
+             is coming in M2."
+        );
+    };
+    let action = match (&args.exec, &args.post) {
+        (Some(_), Some(_)) => anyhow::bail!("use either --exec or --post, not both"),
+        (Some(cmd), None) => Action::Exec {
+            command: cmd.clone(),
+        },
+        (None, Some(url)) => Action::Post {
+            url: url.clone(),
+            bearer: match &args.post_bearer_env {
+                Some(var) => Some(std::env::var(var).map_err(|_| {
+                    anyhow::anyhow!("--post-bearer-env: environment variable {var} is not set")
+                })?),
+                None => None,
+            },
+            body_template: args.post_body.clone(),
+        },
+        (None, None) => Action::Print,
+    };
+    let mut opts = ListenOpts::new(
+        &args.server,
+        topic.trim(),
+        action,
+        botwhisper::paths::config_dir(),
+    );
+    opts.token = std::env::var(&args.token_env)
+        .ok()
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty());
+    opts.once = args.once;
+    if !opts.once {
+        eprintln!(
+            "botwhisper listen: subscribed (topic {}), waiting for pings…",
+            opts.topic_hash()
+        );
+    }
+    botwhisper::listen::run(opts).await
 }
 
 async fn relay(args: RelayArgs) -> anyhow::Result<()> {
