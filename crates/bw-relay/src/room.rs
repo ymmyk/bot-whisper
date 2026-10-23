@@ -1,8 +1,8 @@
 //! One actor per room. All operations on a room run on its actor task, so
-//! membership, delivery and rate limiting are serialized with no locks in
-//! the hot path. Every room is an MLS group: the relay holds opaque
-//! ciphertext and handshake blobs only (see `room/e2e.rs`); metadata changes
-//! go to SQLite.
+//! membership, delivery, the round table and rate limiting are serialized
+//! with no locks in the hot path. Every room is an MLS group: the relay
+//! holds opaque ciphertext and handshake blobs only (see `room/e2e.rs`);
+//! metadata changes go to SQLite.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -13,7 +13,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use bw_proto::{ErrorCode, MemberId};
+use bw_proto::{
+    ErrorCode, MemberId, Roster, StallReason, ThreadState, TimeoutOutcome, TurnMode, TurnView,
+};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -23,14 +25,14 @@ use tokio::sync::{mpsc, oneshot, watch};
 mod e2e;
 
 pub use e2e::{
-    E2eItem, E2eItemKind, E2eState, MAX_CIPHERTEXT_BYTES, MAX_HANDSHAKE_BYTES, MAX_KEY_PACKAGES,
-    MAX_KEY_PACKAGE_BYTES,
+    E2eItem, E2eItemKind, E2eState, TurnArgs, MAX_CIPHERTEXT_BYTES, MAX_HANDSHAKE_BYTES,
+    MAX_KEY_PACKAGES, MAX_KEY_PACKAGE_BYTES,
 };
 
 use crate::{
     auth::AgentId,
     config::RelayConfig,
-    db::{Db, InviteRow, MemberRow, RoomRow, SeatState},
+    db::{Db, InviteRow, MemberRow, RoomRow, SeatState, ThreadStart},
     doorbell::{self, DoorbellConfig, DoorbellKey, DoorbellPayload, Doorbells, Ring},
     error::RelayError,
     ratelimit::Limiter,
@@ -85,6 +87,37 @@ impl Member {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum MemberEvent {
+    /// A thread opened (someone sent into an idle room).
+    ThreadStarted {
+        thread: String,
+    },
+    /// The owner sent `done`.
+    ThreadDone {
+        thread: String,
+    },
+    ThreadCapped {
+        thread: String,
+        turn_cap: u32,
+    },
+    /// The turn timeout paused the thread.
+    ThreadStalled {
+        thread: String,
+        reason: StallReason,
+    },
+    /// Members whose turn it was stayed silent past the turn timeout. With
+    /// `skipped: false` they were only warned (and rung).
+    TurnTimeout {
+        thread: String,
+        members: Vec<MemberId>,
+        skipped: bool,
+    },
+    LeaseExpired {
+        thread: String,
+    },
+    /// The owner switched the room mode.
+    ModeChanged {
+        mode: TurnMode,
+    },
     MembersChanged {
         members: Vec<MemberId>,
     },
@@ -109,10 +142,18 @@ pub struct Room {
     pub created_at: u64,
     pub expires_at: Option<u64>,
     pub max_members: u32,
+    /// `free` or `round_table`.
+    pub mode: TurnMode,
+    /// Who may open a new thread after the owner's `done`.
+    pub thread_start: ThreadStart,
     /// Epoch and the queued ciphertext / handshake items.
     e2e: E2eState,
     next_member_n: u32,
     members: Vec<Member>,
+    thread: Option<ThreadState>,
+    thread_counter: u32,
+    /// The owner ended a thread; the reopen policy now applies.
+    owner_ended_thread: bool,
     events: HashMap<MemberId, Vec<MemberEvent>>,
     doorbells: HashMap<MemberId, DoorbellConfig>,
     version: watch::Sender<u64>,
@@ -150,6 +191,8 @@ impl Room {
             next_member_n: 2,
             owner_account: Some(agent.limit_key().to_string()),
             e2e_epoch: 0,
+            mode: opts.mode,
+            thread_start: opts.thread_start,
         };
         db.insert_room(&row)?;
         let owner = Member {
@@ -226,9 +269,14 @@ impl Room {
             created_at: row.created_at,
             expires_at: row.expires_at,
             max_members: row.max_members,
+            mode: row.mode,
+            thread_start: row.thread_start,
             e2e: E2eState::load(row.e2e_epoch, handshakes),
             next_member_n: row.next_member_n,
             members,
+            thread: None,
+            thread_counter: 0,
+            owner_ended_thread: false,
             events: HashMap::new(),
             doorbells: doorbells.into_iter().collect(),
             version,
@@ -280,6 +328,24 @@ impl Room {
 
     fn member_ids(&self) -> Vec<MemberId> {
         self.members.iter().map(|m| m.member.clone()).collect()
+    }
+
+    fn roster(&self) -> Roster {
+        Roster {
+            owner: self.owner.clone(),
+            members: self.member_ids(),
+        }
+    }
+
+    /// The current thread's turn view for `member`, if a thread is open.
+    pub(super) fn view_for(&self, member: &str) -> Option<TurnView> {
+        let roster = self.roster();
+        self.thread.as_ref().map(|t| t.view(&roster, member))
+    }
+
+    /// The id of the open thread, for doorbell payloads.
+    fn thread_id(&self) -> Option<String> {
+        self.thread.as_ref().map(|t| t.id.clone())
     }
 
     pub fn members(&self) -> &[Member] {
@@ -343,7 +409,7 @@ impl Room {
                     v: bw_proto::PROTOCOL_VERSION,
                     event: event.to_string(),
                     room: self.id.clone(),
-                    thread: None,
+                    thread: self.thread_id(),
                     seq,
                     turn: turn.to_string(),
                     ts: now,
@@ -539,6 +605,10 @@ impl Room {
         self.doorbells.remove(member);
         self.events.remove(member);
         self.e2e_forget_member(member)?;
+        let roster = self.roster();
+        if let Some(t) = &mut self.thread {
+            t.member_left(&roster, member, now);
+        }
         let ids = self.member_ids();
         self.broadcast_event(MemberEvent::MembersChanged { members: ids }, None);
         self.ring_all("members_changed", None, now);
@@ -565,6 +635,7 @@ impl Room {
         self.closed_at = Some(Instant::now());
         self.e2e.clear();
         self.events.clear();
+        self.thread = None;
         if let Err(e) = self.db.delete_room(&self.id) {
             tracing::warn!("failed to delete room metadata: {e}");
         }
@@ -577,6 +648,103 @@ impl Room {
         }
         self.doorbells.clear();
         self.touch();
+    }
+
+    // ----- the round table -----
+
+    /// May `member` open a new thread right now?
+    fn may_start_thread(&self, member: &str) -> Result<(), RelayError> {
+        if member == self.owner {
+            return Ok(());
+        }
+        match self.thread_start {
+            ThreadStart::Anyone => Ok(()),
+            // Members may open the first thread of a fresh room; once the
+            // owner has ended one, the room is the owner's to reopen.
+            ThreadStart::Owner if !self.owner_ended_thread => Ok(()),
+            ThreadStart::Owner => Err(RelayError::owner_only(
+                "start a new thread after `done` (room setting thread_start=owner)",
+            )
+            .with_data(json!({ "thread_start": "owner" }))),
+        }
+    }
+
+    /// Open an implicit thread when someone sends into an idle room. The
+    /// sender speaks first.
+    pub(super) fn ensure_thread(&mut self, sender: &str, now: u64) -> Result<(), RelayError> {
+        let active = self.thread.as_ref().is_some_and(|t| !t.is_complete());
+        if active {
+            return Ok(());
+        }
+        self.may_start_thread(sender)?;
+        self.thread_counter += 1;
+        let id = format!("adhoc-{}", self.thread_counter);
+        let roster = self.roster();
+        self.thread = Some(ThreadState::new(
+            id.clone(),
+            self.mode,
+            self.cfg.default_turn_cap,
+            &roster,
+            Some(sender.to_string()),
+            now,
+        ));
+        self.broadcast_event(MemberEvent::ThreadStarted { thread: id }, Some(sender));
+        Ok(())
+    }
+
+    /// A thread stalled: tell everyone, ring the owner.
+    pub(super) fn on_stalled(&mut self, thread_id: &str, reason: StallReason, now: u64) {
+        self.broadcast_event(
+            MemberEvent::ThreadStalled {
+                thread: thread_id.to_string(),
+                reason,
+            },
+            None,
+        );
+        let owner = self.owner.clone();
+        self.ring(&owner, "stalled", self.e2e.last_seq(), "yours", now);
+    }
+
+    /// Owner switches between `free` and `round_table`. Applies to the open
+    /// thread at once (round table: the owner takes the floor).
+    pub fn set_mode(&mut self, by: &str, mode: TurnMode, now: u64) -> Result<TurnView, RelayError> {
+        self.require_open()?;
+        self.require_owner(by, "change the room mode")?;
+        if mode != self.mode {
+            self.db.set_room_mode(&self.id, mode)?;
+            self.mode = mode;
+            let roster = self.roster();
+            if let Some(t) = &mut self.thread {
+                t.set_mode(&roster, mode, now);
+            }
+            self.broadcast_event(MemberEvent::ModeChanged { mode }, Some(by));
+            self.touch();
+        }
+        Ok(self.view_for(by).unwrap_or_else(|| {
+            // No thread yet: a view of what the next one will look like.
+            ThreadState::new(
+                "",
+                mode,
+                self.cfg.default_turn_cap,
+                &self.roster(),
+                None,
+                now,
+            )
+            .view(&self.roster(), by)
+        }))
+    }
+
+    /// Owner changes the open thread's cap.
+    pub fn set_turn_cap(&mut self, by: &str, cap: u32, now: u64) -> Result<TurnView, RelayError> {
+        self.require_open()?;
+        self.require_owner(by, "change the turn cap")?;
+        let roster = self.roster();
+        let Some(thread) = self.thread.as_mut().filter(|t| !t.is_complete()) else {
+            return Err(RelayError::new(ErrorCode::NoThread, "no open thread"));
+        };
+        thread.set_cap(&roster, cap, now);
+        self.touch();
+        Ok(self.view_for(by).expect("thread exists"))
     }
 
     // ----- status and doorbells -----
@@ -594,6 +762,10 @@ impl Room {
             "created_at": self.created_at,
             "expires_at": self.expires_at,
             "encryption": ENCRYPTION_LABEL,
+            "mode": self.mode,
+            "round_table": self.mode.enforces_turns(),
+            "thread_start": self.thread_start,
+            "thread": self.view_for(member),
             "e2e": self.e2e_status(member),
             "pending_events_for_you": self.events.get(member).map(Vec::len).unwrap_or(0),
             "doorbell": self.doorbell_for(member).map(|(d, key)| {
@@ -631,7 +803,8 @@ impl Room {
 
     // ----- housekeeping -----
 
-    /// Periodic sweep: ciphertext TTL and room expiry.
+    /// Periodic sweep: ciphertext TTL, room expiry, lease expiry and the
+    /// turn timeout.
     pub fn sweep(&mut self, now: u64) {
         if self.closed {
             return;
@@ -643,7 +816,73 @@ impl Room {
                 return;
             }
         }
-        if self.e2e.expire(self.cfg.unacked_ttl) {
+        let mut changed = self.e2e.expire(self.cfg.unacked_ttl);
+        let roster = self.roster();
+        if let Some(t) = &mut self.thread {
+            if t.expire_lease(&roster, now) {
+                let id = t.id.clone();
+                let speaking = t.now_speaking(&roster);
+                self.broadcast_event(MemberEvent::LeaseExpired { thread: id }, None);
+                for m in speaking {
+                    self.ring(&m, "lease_expired", self.e2e.last_seq(), "yours", now);
+                }
+                changed = true;
+            }
+        }
+        let timeout_s = self.cfg.turn_timeout.as_secs();
+        let seq = self.e2e.last_seq();
+        if let Some(t) = &mut self.thread {
+            let thread_id = t.id.clone();
+            match t.check_timeout(&roster, now, timeout_s) {
+                TimeoutOutcome::None => {}
+                TimeoutOutcome::Warned(members) => {
+                    for m in &members {
+                        self.ring(m, "turn", seq, "yours", now);
+                    }
+                    self.broadcast_event(
+                        MemberEvent::TurnTimeout {
+                            thread: thread_id,
+                            members,
+                            skipped: false,
+                        },
+                        None,
+                    );
+                    changed = true;
+                }
+                TimeoutOutcome::Skipped(members) => {
+                    self.broadcast_event(
+                        MemberEvent::TurnTimeout {
+                            thread: thread_id,
+                            members,
+                            skipped: true,
+                        },
+                        None,
+                    );
+                    let speaking = self
+                        .thread
+                        .as_ref()
+                        .map(|t| t.now_speaking(&roster))
+                        .unwrap_or_default();
+                    if speaking.len() == 1 {
+                        self.ring(&speaking[0], "turn", seq, "yours", now);
+                    }
+                    changed = true;
+                }
+                TimeoutOutcome::Stalled(members) => {
+                    self.broadcast_event(
+                        MemberEvent::TurnTimeout {
+                            thread: thread_id.clone(),
+                            members,
+                            skipped: false,
+                        },
+                        None,
+                    );
+                    self.on_stalled(&thread_id, StallReason::Timeout, now);
+                    changed = true;
+                }
+            }
+        }
+        if changed {
             self.touch();
         }
     }

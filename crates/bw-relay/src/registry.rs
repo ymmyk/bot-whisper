@@ -2,14 +2,14 @@
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
-use bw_proto::{ErrorCode, MemberId};
+use bw_proto::{ErrorCode, MemberId, TurnMode};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
 use crate::{
     auth::AgentId,
     config::RelayConfig,
-    db::Db,
+    db::{Db, ThreadStart},
     doorbell::{self, Doorbells},
     error::RelayError,
     room::{Member, Room, RoomHandle},
@@ -28,6 +28,8 @@ pub struct Registry {
 pub struct NewRoom {
     pub expires_in: Option<Duration>,
     pub max_members: u32,
+    pub mode: TurnMode,
+    pub thread_start: ThreadStart,
 }
 
 impl Registry {

@@ -146,9 +146,19 @@ struct RelayArgs {
     #[arg(long, env = "BW_UNACKED_TTL", default_value = "72h")]
     unacked_ttl: String,
 
+    /// Round table: how long the floor holder may stay silent (e.g. 30m)
+    /// before being rung once, then skipped (groups) or the thread stalls
+    /// (two parties). `0s` disables.
+    #[arg(long, env = "BW_TURN_TIMEOUT", default_value = "30m")]
+    turn_timeout: String,
+
     /// Members per room cap.
     #[arg(long, env = "BW_MAX_MEMBERS", default_value_t = 8)]
     max_members: u32,
+
+    /// Default message cap per thread.
+    #[arg(long, env = "BW_TURN_CAP", default_value_t = 40)]
+    turn_cap: u32,
 
     /// Rate limit: content messages per member per minute (0 = unlimited).
     #[arg(long, env = "BW_RATE_MSGS_PER_MEMBER", default_value_t = 10)]
@@ -439,6 +449,9 @@ async fn relay(args: RelayArgs) -> anyhow::Result<()> {
     let unacked_ttl = bw_relay::config::parse_expiry(&args.unacked_ttl)
         .map_err(anyhow::Error::msg)?
         .ok_or_else(|| anyhow::anyhow!("--unacked-ttl cannot be `never`"))?;
+    let turn_timeout = bw_relay::config::parse_expiry(&args.turn_timeout)
+        .map_err(anyhow::Error::msg)?
+        .unwrap_or(Duration::ZERO);
     let mail = bw_relay::mail::MailConfig::from_env().map_err(anyhow::Error::msg)?;
     let ntfy_min_interval = bw_relay::config::parse_expiry(&args.ntfy_min_interval)
         .map_err(anyhow::Error::msg)?
@@ -480,8 +493,10 @@ async fn relay(args: RelayArgs) -> anyhow::Result<()> {
             min_turn_interval_s: args.min_turn_interval,
             ..Default::default()
         },
+        turn_timeout,
         unacked_ttl,
         max_members: args.max_members,
+        default_turn_cap: args.turn_cap,
         allow_insecure_doorbells: args.allow_insecure_doorbells,
         allowed_hosts: args
             .allowed_hosts

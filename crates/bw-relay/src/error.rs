@@ -1,6 +1,6 @@
 //! Errors returned to agents as tool-level errors.
 
-use bw_proto::ErrorCode;
+use bw_proto::{ErrorCode, TurnError};
 use serde_json::{json, Value};
 
 /// A domain error with a stable code, a human message and optional data.
@@ -70,6 +70,49 @@ impl std::fmt::Display for RelayError {
 }
 
 impl std::error::Error for RelayError {}
+
+impl From<TurnError> for RelayError {
+    fn from(e: TurnError) -> Self {
+        match e {
+            TurnError::NotYourTurn {
+                holder,
+                order,
+                lease_expires,
+                stalled_by,
+            } => {
+                let who = match &holder {
+                    Some(h) => format!("{h} has the floor; wait for your turn or use your one interrupt"),
+                    None => "the floor is not yours right now".to_string(),
+                };
+                RelayError::new(ErrorCode::NotYourTurn, format!("not your turn: {who}")).with_data(
+                    json!({
+                        "holder": holder,
+                        "order": order,
+                        "lease_expires": lease_expires,
+                        "stalled_by": stalled_by,
+                    }),
+                )
+            }
+            TurnError::OwnerOnly => RelayError::new(
+                ErrorCode::OwnerOnly,
+                "only the room owner can end the thread (`done`); use `pass` or leave the room",
+            ),
+            TurnError::TurnCap { cap } => RelayError::new(
+                ErrorCode::TurnCap,
+                format!("turn cap {cap} reached; the owner can raise it (set_turn_cap) or end the thread"),
+            )
+            .with_data(json!({ "turn_cap": cap })),
+            TurnError::ThreadComplete => {
+                RelayError::new(ErrorCode::ThreadComplete, "this thread is complete")
+            }
+            TurnError::NotAMember => RelayError::not_a_member(),
+            TurnError::InterruptUsed => RelayError::new(
+                ErrorCode::InterruptUsed,
+                "you already used your one interrupt in this thread",
+            ),
+        }
+    }
+}
 
 impl From<anyhow::Error> for RelayError {
     fn from(e: anyhow::Error) -> Self {

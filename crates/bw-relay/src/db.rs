@@ -8,6 +8,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use bw_proto::TurnMode;
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::doorbell::{DoorbellConfig, DoorbellKey, DoorbellStatus};
@@ -25,7 +26,9 @@ CREATE TABLE IF NOT EXISTS rooms (
     max_members   INTEGER NOT NULL,
     next_member_n INTEGER NOT NULL,
     owner_account TEXT,
-    e2e_epoch     INTEGER NOT NULL DEFAULT 0
+    e2e_epoch     INTEGER NOT NULL DEFAULT 0,
+    mode          TEXT NOT NULL DEFAULT 'free',
+    thread_start  TEXT NOT NULL DEFAULT 'owner'
 );
 -- A seat. `e2e_state` is `pending` until a member's commit adds the bot to
 -- the group, then `active`.
@@ -253,6 +256,48 @@ pub struct RoomRow {
     pub owner_account: Option<String>,
     /// Current MLS epoch (number of accepted commits).
     pub e2e_epoch: u64,
+    /// `free` (default) or `round_table`.
+    pub mode: TurnMode,
+    /// Who may open a new thread after the owner's `done`.
+    pub thread_start: ThreadStart,
+}
+
+/// Who may start a new thread once the owner has ended one.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ThreadStart {
+    /// Only the owner (default).
+    #[default]
+    Owner,
+    /// Any member, by sending into the idle room.
+    Anyone,
+}
+
+impl ThreadStart {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ThreadStart::Owner => "owner",
+            ThreadStart::Anyone => "anyone",
+        }
+    }
+
+    fn parse(s: &str) -> Self {
+        if s == "anyone" {
+            ThreadStart::Anyone
+        } else {
+            ThreadStart::Owner
+        }
+    }
 }
 
 /// An account row.
@@ -366,6 +411,7 @@ pub struct AccountRoom {
     pub id: String,
     pub created_at: u64,
     pub expires_at: Option<u64>,
+    pub mode: String,
     pub owned: bool,
     pub member_count: u32,
     pub max_members: u32,
@@ -438,8 +484,8 @@ impl Db {
     pub fn insert_room(&self, room: &RoomRow) -> Result<()> {
         self.with(|c| {
             c.execute(
-                "INSERT INTO rooms (id, owner, created_at, expires_at, max_members, next_member_n, owner_account, e2e_epoch)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                "INSERT INTO rooms (id, owner, created_at, expires_at, max_members, next_member_n, owner_account, e2e_epoch, mode, thread_start)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     room.id,
                     room.owner,
@@ -449,6 +495,8 @@ impl Db {
                     room.next_member_n,
                     room.owner_account,
                     room.e2e_epoch as i64,
+                    room.mode.as_str(),
+                    room.thread_start.as_str(),
                 ],
             )?;
             Ok(())
@@ -458,7 +506,7 @@ impl Db {
     pub fn get_room(&self, id: &str) -> Result<Option<RoomRow>> {
         self.with(|c| {
             c.query_row(
-                "SELECT id, owner, created_at, expires_at, max_members, next_member_n, owner_account, e2e_epoch
+                "SELECT id, owner, created_at, expires_at, max_members, next_member_n, owner_account, e2e_epoch, mode, thread_start
                  FROM rooms WHERE id = ?1",
                 params![id],
                 |r| {
@@ -471,6 +519,8 @@ impl Db {
                         next_member_n: r.get::<_, i64>(5)? as u32,
                         owner_account: r.get(6)?,
                         e2e_epoch: r.get::<_, i64>(7)? as u64,
+                        mode: TurnMode::parse(&r.get::<_, String>(8)?),
+                        thread_start: ThreadStart::parse(&r.get::<_, String>(9)?),
                     })
                 },
             )
@@ -486,6 +536,16 @@ impl Db {
                 |r| r.get::<_, i64>(0),
             )
             .map(|v| v as u32)
+        })
+    }
+
+    pub fn set_room_mode(&self, room_id: &str, mode: TurnMode) -> Result<()> {
+        self.with(|c| {
+            c.execute(
+                "UPDATE rooms SET mode = ?2 WHERE id = ?1",
+                params![room_id, mode.as_str()],
+            )?;
+            Ok(())
         })
     }
 
@@ -1519,7 +1579,7 @@ impl Db {
     pub fn account_rooms(&self, account_id: &str) -> Result<Vec<AccountRoom>> {
         self.with(|c| {
             let mut st = c.prepare(
-                "SELECT r.id, r.created_at, r.expires_at,
+                "SELECT r.id, r.created_at, r.expires_at, r.mode,
                         (r.owner_account IS NOT NULL AND r.owner_account = ?1)
                           OR EXISTS (SELECT 1 FROM members m WHERE m.room_id = r.id
                                      AND m.member_id = r.owner
@@ -1537,9 +1597,10 @@ impl Db {
                     id: r.get(0)?,
                     created_at: r.get::<_, i64>(1)? as u64,
                     expires_at: r.get::<_, Option<i64>>(2)?.map(|v| v as u64),
-                    owned: r.get::<_, i64>(3)? != 0,
-                    member_count: r.get::<_, i64>(4)? as u32,
-                    max_members: r.get::<_, i64>(5)? as u32,
+                    mode: r.get(3)?,
+                    owned: r.get::<_, i64>(4)? != 0,
+                    member_count: r.get::<_, i64>(5)? as u32,
+                    max_members: r.get::<_, i64>(6)? as u32,
                 })
             })?;
             rows.collect()
@@ -1628,6 +1689,8 @@ mod tests {
             next_member_n: 2,
             owner_account: Some("acct".into()),
             e2e_epoch: 0,
+            mode: TurnMode::RoundTable,
+            thread_start: ThreadStart::Anyone,
         })
         .unwrap();
         assert_eq!(db.count_rooms_owned_by("acct").unwrap(), 1);
@@ -1699,6 +1762,10 @@ mod tests {
         assert_eq!(db.rooms_for_agent("a").unwrap().len(), 1);
         let room = db.get_room("r1").unwrap().unwrap();
         assert_eq!(room.e2e_epoch, 4);
+        assert_eq!(room.mode, TurnMode::RoundTable);
+        assert_eq!(room.thread_start, ThreadStart::Anyone);
+        db.set_room_mode("r1", TurnMode::Free).unwrap();
+        assert_eq!(db.get_room("r1").unwrap().unwrap().mode, TurnMode::Free);
         assert_eq!(db.members("r1").unwrap()[0].e2e_state, SeatState::Pending);
         db.set_member_e2e_state("r1", "m1", SeatState::Active)
             .unwrap();

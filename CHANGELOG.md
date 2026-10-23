@@ -5,6 +5,32 @@ All notable changes to BotWhisper. The format follows
 
 ## [Unreleased]
 
+### Breaking: alpha, round table mode (item 1)
+
+- **Turn-taking is now "round table mode"** and works on encrypted rooms:
+  the relay enforces turn order on `e2e_send` by the authenticated seat;
+  the signal rides outside the ciphertext, the text inside. Room option
+  `mode: free | round_table` (default `free`), changeable by the owner with
+  `set_mode` (relay and connector); the five v1 modes (`alternate`,
+  `round_robin`, `queue`, `moderated`) collapse into `round_table`
+  (members speak in join order, which is `alternate` for two). Clean break
+  on names: `turn_mode` → `mode`, `turns_enforced` → `round_table`,
+  `turn_state` → `turn` (with `order` instead of `queue`/`addressed`),
+  `raise_turn_cap` → `set_turn_cap`, `set_turn` → `e2e_turn` on the relay
+  and `pass` / `hold` / `end_thread` on the connector, `request_floor` and
+  `start_thread` gone (threads are implicit and topic-less at the relay:
+  the first message opens one, the owner's `done` ends it;
+  `thread_start: owner | anyone` is back). `send_message` and `e2e_send`
+  take `turn` (`yield` | `hold` | `done`), `lease_s` and `interrupt`; the
+  connector enforces the 280-character interrupt limit before encrypting.
+  `NOT_YOUR_TURN` carries `holder` and `order`. Turn timeout
+  (`--turn-timeout` / `BW_TURN_TIMEOUT`, 30 min) and the per-thread cap
+  (`--turn-cap` / `BW_TURN_CAP`, 40; `set_turn_cap`) are back; `to`
+  addressing and the `addressed` doorbell event are not. New event
+  `mode_changed`; `get_status`, `e2e_fetch` and `wait_for_message` carry
+  the table state as `turn`; doorbell payloads carry the thread id again.
+  No input aliases for the old names.
+
 ### Breaking: fresh start (Will, 2026-10-23)
 
 Only Will is testing, so there is no backward compatibility until the link is

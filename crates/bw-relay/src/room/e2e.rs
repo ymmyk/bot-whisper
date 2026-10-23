@@ -11,7 +11,7 @@ use std::{
 };
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
-use bw_proto::{ErrorCode, MemberId};
+use bw_proto::{ErrorCode, MemberId, SendIntent, ThreadStatus, TurnSignal};
 use serde::Serialize;
 use serde_json::{json, Value};
 
@@ -71,6 +71,14 @@ pub struct E2eItem {
     pub payload: Vec<u8>,
     pub pending: BTreeSet<MemberId>,
     created: Instant,
+}
+
+/// The turn part of a send: the signal that rides outside the ciphertext.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TurnArgs {
+    pub signal: TurnSignal,
+    pub lease_s: Option<u32>,
+    pub interrupt: bool,
 }
 
 /// Per-room E2E state owned by the actor.
@@ -325,36 +333,125 @@ impl Room {
         }))
     }
 
-    /// Queue application ciphertext for every active member but the sender.
+    /// Queue application ciphertext for every active member but the sender,
+    /// after the round table has accepted the send. With `ciphertext`
+    /// `None` this is a content-free turn signal (`pass`, `hold`, `done`).
     pub fn e2e_send(
         &mut self,
         by: &str,
-        ciphertext: Vec<u8>,
+        ciphertext: Option<Vec<u8>>,
+        turn: TurnArgs,
         now: u64,
     ) -> Result<Value, RelayError> {
         self.require_open()?;
         self.require_e2e_active(by)?;
-        if ciphertext.is_empty() || ciphertext.len() > MAX_CIPHERTEXT_BYTES {
-            return Err(RelayError::new(
-                ErrorCode::BodyTooLarge,
-                format!("ciphertext must be 1 to {MAX_CIPHERTEXT_BYTES} bytes"),
-            ));
+        let has_content = ciphertext.is_some();
+        if let Some(ct) = &ciphertext {
+            if ct.is_empty() || ct.len() > MAX_CIPHERTEXT_BYTES {
+                return Err(RelayError::new(
+                    ErrorCode::BodyTooLarge,
+                    format!("ciphertext must be 1 to {MAX_CIPHERTEXT_BYTES} bytes"),
+                ));
+            }
         }
-        self.check_send_limits(by)?;
-        let recipients = self.active_members_except(by);
-        let seq = self.push_e2e_item(
-            E2eItemKind::Application,
-            by,
-            self.e2e.epoch,
-            ciphertext,
-            recipients.clone(),
+        if turn.interrupt && !has_content {
+            return Err(RelayError::invalid("an interrupt needs a message"));
+        }
+        if turn.signal == TurnSignal::Done && by != self.owner {
+            return Err(bw_proto::TurnError::OwnerOnly.into());
+        }
+        // Check the turn before the rate limits so a refused send does not
+        // burn the member's allowance.
+        self.ensure_thread(by, now)?;
+        let roster = self.roster();
+        let intent = SendIntent {
+            from: by,
+            signal: turn.signal,
+            lease_s: turn.lease_s,
+            has_content,
+            interrupt: turn.interrupt,
             now,
-        )?;
-        for m in &recipients {
-            self.ring(m, "message", seq, "open", now);
+        };
+        let thread = self.thread.as_ref().expect("ensure_thread");
+        thread.check(&roster, &intent)?;
+        if has_content {
+            self.check_send_limits(by)?;
+        }
+        let thread = self.thread.as_mut().expect("ensure_thread");
+        let thread_id = thread.id.clone();
+        let outcome = thread.apply(&roster, &intent)?;
+        let enforced = thread.mode.enforces_turns();
+        // The view as of this send (a completed thread is dropped below).
+        let turn_view = self.view_for(by);
+
+        let recipients = self.active_members_except(by);
+        let mut seq = None;
+        if let Some(ct) = ciphertext {
+            let s = self.push_e2e_item(
+                E2eItemKind::Application,
+                by,
+                self.e2e.epoch,
+                ct,
+                recipients.clone(),
+                now,
+            )?;
+            seq = Some(s);
+            for m in &recipients {
+                let (event, hint) = if !enforced {
+                    ("message", "open")
+                } else if outcome.now_speaking.contains(m) {
+                    ("turn", "yours")
+                } else {
+                    ("message", "theirs")
+                };
+                self.ring(m, event, s, hint, now);
+            }
+        } else {
+            // Content-free signal: nothing queued, but waiters should see the
+            // new turn state and whoever gained the floor should be rung.
+            for m in &outcome.now_speaking {
+                if m != by && outcome.now_speaking.len() == 1 {
+                    self.ring(m, "turn", self.e2e.last_seq(), "yours", now);
+                }
+            }
+        }
+
+        match outcome.status {
+            ThreadStatus::Complete => {
+                self.broadcast_event(
+                    MemberEvent::ThreadDone {
+                        thread: thread_id.clone(),
+                    },
+                    Some(by),
+                );
+                self.ring_all("thread_done", Some(by), now);
+                self.thread = None;
+                self.owner_ended_thread = true;
+            }
+            ThreadStatus::Capped => {
+                let cap = self.thread.as_ref().map(|t| t.turn_cap).unwrap_or_default();
+                let owner = self.owner.clone();
+                self.push_event(
+                    &owner,
+                    MemberEvent::ThreadCapped {
+                        thread: thread_id.clone(),
+                        turn_cap: cap,
+                    },
+                );
+                self.ring(&owner, "turn", self.e2e.last_seq(), "yours", now);
+            }
+            _ => {}
         }
         self.touch();
-        Ok(json!({ "seq": seq, "epoch": self.e2e.epoch, "delivered_to": recipients }))
+        Ok(json!({
+            "seq": seq,
+            "epoch": self.e2e.epoch,
+            "delivered_to": if has_content { recipients.into_iter().collect() } else { Vec::<MemberId>::new() },
+            "thread": thread_id,
+            "counted_toward_cap": outcome.counted,
+            "interrupt": outcome.interrupt,
+            "turn": turn_view,
+        }))
     }
 
     /// Everything pending for a member, in seq order. Acks on return unless
@@ -370,6 +467,14 @@ impl Room {
             return Err(RelayError::room_closed());
         }
         self.member(member)?;
+        // Lazy lease expiry, so a waiter sees the floor move.
+        let roster = self.roster();
+        if let Some(t) = &mut self.thread {
+            if t.expire_lease(&roster, crate::doorbell::now_unix()) {
+                let id = t.id.clone();
+                self.broadcast_event(MemberEvent::LeaseExpired { thread: id }, None);
+            }
+        }
         let mut items = Vec::new();
         for i in &mut self.e2e.items {
             if i.pending.contains(member) {
@@ -399,6 +504,8 @@ impl Room {
             "items": items,
             "events": events,
             "epoch": self.e2e.epoch,
+            "mode": self.mode,
+            "turn": self.view_for(member),
             "you": self.member(member).ok().map(|m| m.e2e_state),
             "members": self.members.iter().map(|m| json!({ "member": m.member, "e2e_state": m.e2e_state })).collect::<Vec<_>>(),
         }))

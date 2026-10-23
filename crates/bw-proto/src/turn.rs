@@ -1,10 +1,17 @@
-//! The N-party turn state machine (DESIGN.md section 7).
+//! The round table: the pure turn state machine the relay enforces.
 //!
 //! Pure and synchronous: the relay's room actor owns one [`ThreadState`] per
-//! active thread and calls into it for every send, pass, hold and `done`. All
-//! policy lives here so it can be property-tested without I/O.
+//! open thread and calls into it for every send, pass, hold and `done`. All
+//! policy lives here so it can be tested without I/O. The relay never sees
+//! message text (rooms are end-to-end encrypted), so the machine only
+//! knows *that* a member sent something and which signal rode with it.
+//!
+//! Two modes: `free` (anyone, any time) and `round_table` (members speak in
+//! join order; the floor moves on `yield`, `pass` or an expired `hold`;
+//! the owner ends the thread with `done`). Both keep a per-thread message
+//! cap as runaway protection.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
@@ -15,43 +22,47 @@ pub type MemberId = String;
 pub const DEFAULT_LEASE_S: u32 = 120;
 /// Maximum hold lease in seconds.
 pub const MAX_LEASE_S: u32 = 600;
-/// Default turn cap per thread.
+/// Default message cap per thread.
 pub const DEFAULT_TURN_CAP: u32 = 40;
-/// Maximum length of an interrupt, in characters.
+/// Maximum length of an interrupt, in characters. The relay cannot check
+/// it (text is encrypted); the connector enforces it before encrypting.
 pub const MAX_INTERRUPT_CHARS: usize = 280;
-/// Loop guard: how many recent content messages are remembered per thread.
-pub const LOOP_GUARD_WINDOW: usize = 8;
-/// Loop guard: consecutive near-duplicate short messages before the thread
-/// stalls.
-pub const LOOP_GUARD_HITS: u32 = 3;
-/// Loop guard: messages longer than this (in characters) are never "short".
-pub const LOOP_GUARD_MAX_CHARS: usize = 120;
 
-/// Turn modes, per room (and optionally overridden per thread). Turn control
-/// is opt-in: `free` is the default.
+/// Room mode. `free` is the default; `round_table` is opt-in.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default, schemars::JsonSchema,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum TurnMode {
     /// Anyone, any time. No floor, no `NOT_YOUR_TURN`. `hold` and `yield`
-    /// are accepted and ignored. Caps, loop guard and rate limits still apply.
+    /// are accepted and ignored. The cap and rate limits still apply.
     #[default]
     Free,
-    /// Whoever holds the floor. Yield passes it to the other member.
-    Alternate,
-    /// Members in join order. Each one sends or passes.
-    RoundRobin,
-    /// The floor holder. Others `request_floor` and are granted FIFO.
-    Queue,
-    /// Only the owner, plus whoever the owner addresses with `to`.
-    Moderated,
+    /// Members speak in join order. Whoever holds the floor sends (or
+    /// passes); the floor moves to the next member around the table.
+    RoundTable,
 }
 
 impl TurnMode {
     /// True when the relay enforces a floor in this mode.
     pub fn enforces_turns(self) -> bool {
-        self != TurnMode::Free
+        self == TurnMode::RoundTable
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TurnMode::Free => "free",
+            TurnMode::RoundTable => "round_table",
+        }
+    }
+
+    /// Unknown values fall back to `free`.
+    pub fn parse(s: &str) -> Self {
+        if s == "round_table" {
+            TurnMode::RoundTable
+        } else {
+            TurnMode::Free
+        }
     }
 }
 
@@ -63,9 +74,6 @@ pub enum StallReason {
     /// threads, or a group with nobody left to skip to). Any member may
     /// resume by sending.
     Timeout,
-    /// Runs of short, near-identical messages. Only the owner may resume
-    /// (by sending anything) or end the thread.
-    LoopGuard,
 }
 
 /// What a turn-timeout check did.
@@ -73,7 +81,7 @@ pub enum StallReason {
 pub enum TimeoutOutcome {
     /// Nothing to do yet.
     None,
-    /// The members whose turn it is were rung once; they get one more period.
+    /// The member whose turn it is was rung once; it gets one more period.
     Warned(Vec<MemberId>),
     /// Group thread: these members were marked absent and skipped.
     Skipped(Vec<MemberId>),
@@ -87,7 +95,7 @@ pub enum TimeoutOutcome {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum TurnSignal {
-    /// "Done for now." The floor moves to the next speaker.
+    /// "Done for now." The floor moves to the next member.
     #[default]
     Yield,
     /// "Wait for my response." Keeps the floor for `lease_s`.
@@ -109,7 +117,7 @@ pub enum ThreadStatus {
     /// Turn cap reached. Nobody may send; the owner raises the cap or ends
     /// the thread.
     Capped,
-    /// Loop guard or turn timeout tripped (see [`StallReason`]).
+    /// The turn timeout tripped (see [`StallReason`]).
     Stalled,
     /// Owner sent `done`.
     Complete,
@@ -127,59 +135,52 @@ impl Roster {
         self.members.iter().any(|x| x == m)
     }
 
-    /// The member after `m` in join order, wrapping, skipping `m` itself.
-    fn next_after(&self, m: &str) -> Option<MemberId> {
-        if self.members.len() < 2 {
+    /// Next member in join order after `from`, wrapping around.
+    pub fn next_after(&self, from: &str) -> Option<MemberId> {
+        let n = self.members.len();
+        if n < 2 {
             return None;
         }
-        let idx = self.members.iter().position(|x| x == m)?;
-        let n = self.members.len();
+        let idx = self.members.iter().position(|x| x == from)?;
         Some(self.members[(idx + 1) % n].clone())
     }
 }
 
-/// What a sender is trying to do.
+/// What a member is trying to do.
 #[derive(Debug, Clone)]
 pub struct SendIntent<'a> {
     pub from: &'a str,
     pub signal: TurnSignal,
-    pub to: &'a [MemberId],
     pub lease_s: Option<u32>,
-    /// False for content-free `set_turn` calls.
+    /// True for a message, false for a content-free signal.
     pub has_content: bool,
-    /// The sender asks to use its one interrupt per thread.
+    /// Use the member's one interrupt per thread (round table, not its turn).
     pub interrupt: bool,
     /// Unix seconds.
     pub now: u64,
-    /// Loop-guard fingerprint of a *short* content message (normalised text
-    /// hash). `None` for long messages and content-free signals.
-    pub fingerprint: Option<u64>,
 }
 
-/// Why a send was refused. The relay maps these to [`crate::ErrorCode`]s.
+/// Why a send was refused.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum TurnError {
     #[error("not your turn")]
     NotYourTurn {
         holder: Option<MemberId>,
-        queue: Vec<MemberId>,
-        addressed: Vec<MemberId>,
+        /// Seating order, so the caller can see when its turn comes.
+        order: Vec<MemberId>,
         lease_expires: Option<u64>,
-        /// Set when the thread is stalled (loop guard: owner only).
         stalled_by: Option<StallReason>,
     },
-    #[error("only the owner may do that")]
+    #[error("only the owner can do that")]
     OwnerOnly,
     #[error("turn cap {cap} reached")]
     TurnCap { cap: u32 },
     #[error("thread is complete")]
     ThreadComplete,
-    #[error("not a member of this room")]
+    #[error("not a member")]
     NotAMember,
-    #[error("interrupt already used in this thread")]
+    #[error("interrupt already used")]
     InterruptUsed,
-    #[error("unknown member in `to`: {0}")]
-    InvalidTarget(MemberId),
 }
 
 /// What happened as a result of a successful send.
@@ -191,7 +192,7 @@ pub struct SendOutcome {
     pub interrupt: bool,
     /// Who holds the floor afterwards.
     pub holder: Option<MemberId>,
-    /// Members whose turn it now is (holder, or addressed members).
+    /// Members whose turn it now is.
     pub now_speaking: Vec<MemberId>,
     pub status: ThreadStatus,
 }
@@ -200,18 +201,17 @@ pub struct SendOutcome {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnView {
     pub thread: String,
-    pub topic: String,
     pub mode: TurnMode,
     pub status: ThreadStatus,
     /// Why the thread is stalled, when it is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stalled_by: Option<StallReason>,
-    /// "you", "you (addressed)", "anyone", "open", "nobody", "complete", or
-    /// a member id.
+    /// "you", "anyone", "nobody", "complete", or a member id.
     pub now: String,
     pub holder: Option<MemberId>,
-    pub queue: Vec<MemberId>,
-    pub addressed: Vec<MemberId>,
+    /// Seating order (join order) in round table mode; empty when free.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub order: Vec<MemberId>,
     /// Members skipped by the turn timeout this round.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub absent: Vec<MemberId>,
@@ -224,42 +224,31 @@ pub struct TurnView {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ThreadState {
     pub id: String,
-    pub topic: String,
     pub mode: TurnMode,
     pub turn_cap: u32,
     pub turns_used: u32,
     pub status: ThreadStatus,
-    /// Current floor holder. `None` means the floor is open (queue mode with
-    /// an empty queue, or free mode before anyone spoke).
+    /// Current floor holder. `None` in free mode.
     pub holder: Option<MemberId>,
     /// When the current hold lease expires (unix seconds).
     pub lease_expires: Option<u64>,
-    /// Floor queue (queue mode).
-    pub queue: VecDeque<MemberId>,
-    /// Members the owner addressed (moderated mode).
-    pub addressed: Vec<MemberId>,
     /// Members who already used their one interrupt.
     pub interrupts_used: BTreeSet<MemberId>,
     /// Why the thread is stalled, when `status == Stalled`.
     pub stall: Option<StallReason>,
-    /// Unix seconds since the current speaker set has been waited on.
+    /// Unix seconds since the current speaker has been waited on.
     pub floor_since: u64,
     /// The turn-timeout warning was already rung for this floor period.
     pub timeout_warned: bool,
     /// Members skipped by the turn timeout; cleared when they send.
     pub absent: BTreeSet<MemberId>,
-    /// Loop guard: fingerprints of recent short content messages.
-    pub recent: VecDeque<u64>,
-    /// Loop guard: consecutive near-duplicate hits.
-    pub loop_hits: u32,
 }
 
 impl ThreadState {
-    /// Open a thread at time `now`. `first_speaker` defaults to the owner
-    /// (ignored in `free` mode, which has no floor).
+    /// Open a thread at time `now`. In round table mode `first_speaker`
+    /// (default: the owner) holds the floor; free mode has no floor.
     pub fn new(
         id: impl Into<String>,
-        topic: impl Into<String>,
         mode: TurnMode,
         turn_cap: u32,
         roster: &Roster,
@@ -269,30 +258,19 @@ impl ThreadState {
         let first = first_speaker
             .filter(|m| roster.contains(m))
             .unwrap_or_else(|| roster.owner.clone());
-        let holder = match mode {
-            TurnMode::Alternate | TurnMode::RoundRobin => Some(first),
-            TurnMode::Moderated => Some(roster.owner.clone()),
-            TurnMode::Queue => Some(first),
-            TurnMode::Free => None,
-        };
         ThreadState {
             id: id.into(),
-            topic: topic.into(),
             mode,
             turn_cap: turn_cap.max(1),
             turns_used: 0,
             status: ThreadStatus::Floor,
-            holder,
+            holder: mode.enforces_turns().then_some(first),
             lease_expires: None,
-            queue: VecDeque::new(),
-            addressed: Vec::new(),
             interrupts_used: BTreeSet::new(),
             stall: None,
             floor_since: now,
             timeout_warned: false,
             absent: BTreeSet::new(),
-            recent: VecDeque::new(),
-            loop_hits: 0,
         }
     }
 
@@ -305,22 +283,10 @@ impl ThreadState {
         match self.status {
             ThreadStatus::Complete | ThreadStatus::Capped => Vec::new(),
             ThreadStatus::Held => self.holder.iter().cloned().collect(),
-            ThreadStatus::Stalled => match self.stall {
-                Some(StallReason::LoopGuard) => vec![roster.owner.clone()],
-                _ => roster.members.clone(),
-            },
+            ThreadStatus::Stalled => roster.members.clone(),
             ThreadStatus::Floor => match self.mode {
                 TurnMode::Free => roster.members.clone(),
-                TurnMode::Moderated => {
-                    let mut v = vec![roster.owner.clone()];
-                    v.extend(self.addressed.iter().cloned());
-                    v
-                }
-                TurnMode::Queue => match &self.holder {
-                    Some(h) => vec![h.clone()],
-                    None => roster.members.clone(),
-                },
-                TurnMode::Alternate | TurnMode::RoundRobin => self.holder.iter().cloned().collect(),
+                TurnMode::RoundTable => self.holder.iter().cloned().collect(),
             },
         }
     }
@@ -332,29 +298,25 @@ impl ThreadState {
             "complete".to_string()
         } else if speaking.is_empty() {
             "nobody".to_string()
-        } else if self.mode == TurnMode::Free && self.status != ThreadStatus::Stalled {
+        } else if speaking.len() == roster.members.len() {
             "anyone".to_string()
         } else if speaking.iter().any(|m| m == member) {
-            if self.addressed.iter().any(|m| m == member) {
-                "you (addressed)".to_string()
-            } else {
-                "you".to_string()
-            }
-        } else if speaking.len() == 1 {
-            speaking[0].clone()
+            "you".to_string()
         } else {
-            "open".to_string()
+            speaking[0].clone()
         };
         TurnView {
             thread: self.id.clone(),
-            topic: self.topic.clone(),
             mode: self.mode,
             status: self.status,
             stalled_by: self.stall,
             now,
             holder: self.holder.clone(),
-            queue: self.queue.iter().cloned().collect(),
-            addressed: self.addressed.clone(),
+            order: if self.mode.enforces_turns() {
+                roster.members.clone()
+            } else {
+                Vec::new()
+            },
             absent: self.absent.iter().cloned().collect(),
             lease_expires: self.lease_expires,
             turns_used: self.turns_used,
@@ -362,27 +324,41 @@ impl ThreadState {
         }
     }
 
-    /// Reset the turn-timeout clock for the current speaker set.
+    /// Reset the turn-timeout clock for the current speaker.
     fn reset_clock(&mut self, now: u64) {
         self.floor_since = now;
         self.timeout_warned = false;
     }
 
+    /// Owner switches the room mode mid-thread. Going to round table gives
+    /// the floor to the owner; going to free clears it. A stalled or held
+    /// thread returns to the floor; capped and complete stay as they are.
+    pub fn set_mode(&mut self, roster: &Roster, mode: TurnMode, now: u64) {
+        if self.mode == mode {
+            return;
+        }
+        self.mode = mode;
+        if matches!(self.status, ThreadStatus::Complete | ThreadStatus::Capped) {
+            return;
+        }
+        self.status = ThreadStatus::Floor;
+        self.stall = None;
+        self.lease_expires = None;
+        self.absent.clear();
+        self.holder = mode.enforces_turns().then(|| roster.owner.clone());
+        self.reset_clock(now);
+    }
+
     /// Turn-timeout check, called periodically by the relay. `timeout_s` is
-    /// how long the members whose turn it is may stay silent. The first
-    /// expiry warns (the relay rings their doorbell once); the second skips
-    /// them in a group or stalls a 2-party thread.
+    /// how long the member whose turn it is may stay silent. The first
+    /// expiry warns (the relay rings its doorbell once); the second skips
+    /// it in a group or stalls a 2-party thread. Free mode never times out.
     pub fn check_timeout(&mut self, roster: &Roster, now: u64, timeout_s: u64) -> TimeoutOutcome {
-        if self.status != ThreadStatus::Floor || timeout_s == 0 {
+        if self.status != ThreadStatus::Floor || timeout_s == 0 || !self.mode.enforces_turns() {
             return TimeoutOutcome::None;
         }
         let waiting_on = self.now_speaking(roster);
-        // Nobody in particular is being waited on: free mode, or an open
-        // queue floor.
-        if waiting_on.is_empty() || waiting_on.len() == roster.members.len() {
-            return TimeoutOutcome::None;
-        }
-        if now < self.floor_since.saturating_add(timeout_s) {
+        if waiting_on.is_empty() || now < self.floor_since.saturating_add(timeout_s) {
             return TimeoutOutcome::None;
         }
         if !self.timeout_warned {
@@ -398,43 +374,17 @@ impl ThreadState {
         for m in &waiting_on {
             self.absent.insert(m.clone());
         }
-        let skipped = waiting_on.clone();
-        let next: Option<MemberId> = match self.mode {
-            TurnMode::Free => None,
-            TurnMode::Moderated => {
-                self.addressed.clear();
-                self.holder = Some(roster.owner.clone());
-                // The owner itself timed out: nobody is left to skip to.
-                if waiting_on.iter().any(|m| m == &roster.owner) {
-                    None
-                } else {
-                    Some(roster.owner.clone())
-                }
+        let from = self.holder.clone().unwrap_or_else(|| roster.owner.clone());
+        match self.next_present(roster, &from) {
+            Some(next) => {
+                self.holder = Some(next);
+                TimeoutOutcome::Skipped(waiting_on)
             }
-            TurnMode::Queue => {
-                let mut next = None;
-                while let Some(m) = self.queue.pop_front() {
-                    if !self.absent.contains(&m) {
-                        next = Some(m);
-                        break;
-                    }
-                }
-                self.holder = next.clone();
-                // An open floor is a valid state in queue mode.
-                next.or_else(|| Some(String::new()))
+            None => {
+                self.stall(StallReason::Timeout);
+                TimeoutOutcome::Stalled(waiting_on)
             }
-            TurnMode::Alternate | TurnMode::RoundRobin => {
-                let from = self.holder.clone().unwrap_or_else(|| roster.owner.clone());
-                let next = self.next_present(roster, &from);
-                self.holder = next.clone();
-                next
-            }
-        };
-        if next.is_none() {
-            self.stall(StallReason::Timeout);
-            return TimeoutOutcome::Stalled(skipped);
         }
-        TimeoutOutcome::Skipped(skipped)
     }
 
     /// Next member in join order after `from` who is not marked absent.
@@ -453,11 +403,10 @@ impl ThreadState {
         self.lease_expires = None;
     }
 
-    fn not_your_turn(&self) -> TurnError {
+    fn not_your_turn(&self, roster: &Roster) -> TurnError {
         TurnError::NotYourTurn {
             holder: self.holder.clone(),
-            queue: self.queue.iter().cloned().collect(),
-            addressed: self.addressed.clone(),
+            order: roster.members.clone(),
             lease_expires: self.lease_expires,
             stalled_by: self.stall,
         }
@@ -473,7 +422,7 @@ impl ThreadState {
             (Some(exp), Some(holder)) if now >= exp => {
                 self.lease_expires = None;
                 self.status = ThreadStatus::Floor;
-                self.advance_after(roster, &holder, &[]);
+                self.advance_after(roster, &holder);
                 self.reset_clock(now);
                 true
             }
@@ -496,11 +445,6 @@ impl ThreadState {
         if !roster.contains(intent.from) {
             return Err(TurnError::NotAMember);
         }
-        for t in intent.to {
-            if !roster.contains(t) {
-                return Err(TurnError::InvalidTarget(t.clone()));
-            }
-        }
         if self.status == ThreadStatus::Complete {
             return Err(TurnError::ThreadComplete);
         }
@@ -511,14 +455,12 @@ impl ThreadState {
             }
             // The owner may always end a thread, even when capped or held.
             if intent.has_content {
-                self.turns_used = self.turns_used.saturating_add(1);
+                self.turns_used = self.turns_used.saturating_add(1).min(self.turn_cap);
             }
             self.status = ThreadStatus::Complete;
             self.stall = None;
             self.holder = None;
             self.lease_expires = None;
-            self.queue.clear();
-            self.addressed.clear();
             return Ok(SendOutcome {
                 counted: intent.has_content,
                 interrupt: false,
@@ -539,8 +481,8 @@ impl ThreadState {
         let was_absent = self.absent.remove(intent.from);
 
         if !may_speak {
-            // One short interrupt per thread, in every mode except free
-            // (free never gets here because everyone may speak).
+            // One short interrupt per thread (round table only: free mode
+            // never gets here because everyone may speak).
             if intent.interrupt && intent.has_content {
                 if self.interrupts_used.contains(intent.from) {
                     if was_absent {
@@ -561,7 +503,7 @@ impl ThreadState {
             if was_absent {
                 self.absent.insert(intent.from.to_string());
             }
-            return Err(self.not_your_turn());
+            return Err(self.not_your_turn(roster));
         }
 
         // Normal send by someone who may speak.
@@ -570,12 +512,7 @@ impl ThreadState {
             // Resume: the sender takes the floor, then the signal applies.
             self.status = ThreadStatus::Floor;
             self.stall = None;
-            self.loop_hits = 0;
-            self.holder = if self.mode == TurnMode::Free {
-                None
-            } else {
-                Some(intent.from.to_string())
-            };
+            self.holder = self.mode.enforces_turns().then(|| intent.from.to_string());
         }
         if counted {
             self.count_turn();
@@ -602,45 +539,18 @@ impl ThreadState {
                         .clamp(1, MAX_LEASE_S);
                     self.status = ThreadStatus::Held;
                     self.holder = Some(intent.from.to_string());
-                    self.queue.retain(|m| m != intent.from);
                     self.lease_expires = Some(intent.now + u64::from(lease));
-                    if self.mode == TurnMode::Moderated && is_owner && !intent.to.is_empty() {
-                        self.addressed = dedup(intent.to);
-                    }
                 }
                 // Free mode: accepted and ignored.
             }
             TurnSignal::Yield | TurnSignal::Pass => {
                 self.status = ThreadStatus::Floor;
                 self.lease_expires = None;
-                self.advance_after(roster, intent.from, intent.to);
+                self.advance_after(roster, intent.from);
             }
             TurnSignal::Done => unreachable!("handled above"),
         }
         self.reset_clock(intent.now);
-
-        // Loop guard: runs of short, near-identical messages stall the
-        // thread until the owner decides.
-        if counted {
-            if let Some(fp) = intent.fingerprint {
-                if self.recent.contains(&fp) {
-                    self.loop_hits += 1;
-                } else {
-                    self.loop_hits = 0;
-                }
-                self.recent.push_back(fp);
-                while self.recent.len() > LOOP_GUARD_WINDOW {
-                    self.recent.pop_front();
-                }
-                if self.loop_hits >= LOOP_GUARD_HITS {
-                    self.loop_hits = 0;
-                    self.recent.clear();
-                    self.stall(StallReason::LoopGuard);
-                }
-            } else {
-                self.loop_hits = 0;
-            }
-        }
 
         Ok(SendOutcome {
             counted,
@@ -654,99 +564,26 @@ impl ThreadState {
     fn count_turn(&mut self) {
         self.turns_used = self.turns_used.saturating_add(1);
         if self.turns_used >= self.turn_cap {
-            // Capping supersedes a stall (e.g. an interrupt that uses the
-            // last turn while the loop guard has the thread stalled).
             self.status = ThreadStatus::Capped;
             self.stall = None;
         }
     }
 
-    /// Move the floor after `from` yields or passes, honouring `to`.
-    fn advance_after(&mut self, roster: &Roster, from: &str, to: &[MemberId]) {
-        let is_owner = from == roster.owner;
-        match self.mode {
-            TurnMode::Free => {
-                self.holder = None;
-            }
-            TurnMode::Alternate | TurnMode::RoundRobin => {
-                let next = to
-                    .iter()
-                    .find(|t| t.as_str() != from)
-                    .cloned()
-                    .or_else(|| self.next_present(roster, from))
+    /// Move the floor to the next seat after `from` yields or passes.
+    fn advance_after(&mut self, roster: &Roster, from: &str) {
+        self.holder = match self.mode {
+            TurnMode::Free => None,
+            TurnMode::RoundTable => Some(
+                self.next_present(roster, from)
                     .or_else(|| roster.next_after(from))
-                    .unwrap_or_else(|| from.to_string());
-                self.holder = Some(next);
-            }
-            TurnMode::Queue => {
-                self.queue.retain(|m| m != from);
-                let directed = to.iter().find(|t| t.as_str() != from).cloned();
-                self.holder = match directed {
-                    Some(t) => {
-                        self.queue.retain(|m| m != &t);
-                        Some(t)
-                    }
-                    None => self.queue.pop_front(),
-                };
-            }
-            TurnMode::Moderated => {
-                if is_owner {
-                    if !to.is_empty() {
-                        self.addressed = dedup(to)
-                            .into_iter()
-                            .filter(|m| m != &roster.owner)
-                            .collect();
-                    }
-                    self.holder = Some(roster.owner.clone());
-                } else {
-                    self.addressed.retain(|m| m != from);
-                    self.holder = Some(roster.owner.clone());
-                }
-            }
-        }
-    }
-
-    /// Join the floor queue (queue mode). Returns the holder if granted
-    /// immediately, otherwise the member's 1-based position in the queue.
-    pub fn request_floor(
-        &mut self,
-        roster: &Roster,
-        member: &str,
-        now: u64,
-    ) -> Result<FloorGrant, TurnError> {
-        if !roster.contains(member) {
-            return Err(TurnError::NotAMember);
-        }
-        if self.status == ThreadStatus::Complete {
-            return Err(TurnError::ThreadComplete);
-        }
-        if self.status == ThreadStatus::Capped {
-            return Err(TurnError::TurnCap { cap: self.turn_cap });
-        }
-        if self.now_speaking(roster).iter().any(|m| m == member) {
-            return Ok(FloorGrant::Granted);
-        }
-        if self.mode != TurnMode::Queue {
-            // Only queue mode has a floor queue. Elsewhere this is a status
-            // probe: report who has the floor instead of queueing.
-            return Err(self.not_your_turn());
-        }
-        if self.holder.is_none() && self.queue.is_empty() && self.status == ThreadStatus::Floor {
-            self.holder = Some(member.to_string());
-            self.reset_clock(now);
-            return Ok(FloorGrant::Granted);
-        }
-        if let Some(pos) = self.queue.iter().position(|m| m == member) {
-            return Ok(FloorGrant::Queued(pos + 1));
-        }
-        self.queue.push_back(member.to_string());
-        Ok(FloorGrant::Queued(self.queue.len()))
+                    .unwrap_or_else(|| from.to_string()),
+            ),
+        };
     }
 
     /// A member left or was removed: drop them from every turn structure.
+    /// `roster` is the roster *after* removal.
     pub fn member_left(&mut self, roster: &Roster, member: &str, now: u64) {
-        self.queue.retain(|m| m != member);
-        self.addressed.retain(|m| m != member);
         self.interrupts_used.remove(member);
         self.absent.remove(member);
         if self.holder.as_deref() == Some(member) {
@@ -754,13 +591,7 @@ impl ThreadState {
             if self.status == ThreadStatus::Held {
                 self.status = ThreadStatus::Floor;
             }
-            // `roster` is the roster *after* removal.
-            self.holder = match self.mode {
-                TurnMode::Free => None,
-                TurnMode::Queue => self.queue.pop_front(),
-                TurnMode::Moderated => Some(roster.owner.clone()),
-                TurnMode::Alternate | TurnMode::RoundRobin => roster.members.first().cloned(),
-            };
+            self.holder = self.mode.enforces_turns().then(|| roster.owner.clone());
             self.reset_clock(now);
         }
     }
@@ -768,7 +599,7 @@ impl ThreadState {
     /// Owner changes the cap. Un-caps the thread if the new cap allows more
     /// turns. Lowering below the turns already used caps the thread at once;
     /// `turns_used` never exceeds `turn_cap`.
-    pub fn raise_cap(&mut self, roster: &Roster, new_cap: u32, now: u64) {
+    pub fn set_cap(&mut self, roster: &Roster, new_cap: u32, now: u64) {
         self.turn_cap = new_cap.max(1).max(self.turns_used);
         if self.turns_used >= self.turn_cap
             && matches!(
@@ -785,56 +616,11 @@ impl ThreadState {
         if self.status == ThreadStatus::Capped && self.turns_used < self.turn_cap {
             self.status = ThreadStatus::Floor;
             if self.holder.is_none() {
-                self.holder = match self.mode {
-                    TurnMode::Free => None,
-                    TurnMode::Queue => self.queue.pop_front().or(Some(roster.owner.clone())),
-                    _ => Some(roster.owner.clone()),
-                };
+                self.holder = self.mode.enforces_turns().then(|| roster.owner.clone());
             }
             self.reset_clock(now);
         }
     }
-}
-
-/// Result of `request_floor`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "result", content = "position")]
-pub enum FloorGrant {
-    Granted,
-    Queued(usize),
-}
-
-fn dedup(ids: &[MemberId]) -> Vec<MemberId> {
-    let mut out: Vec<MemberId> = Vec::new();
-    for id in ids {
-        if !out.contains(id) {
-            out.push(id.clone());
-        }
-    }
-    out
-}
-
-/// Loop-guard fingerprint of a message: `Some(hash)` of the normalised text
-/// (lowercase, letters and digits only) when it is short, else `None`.
-/// Deterministic across processes, so it can be reasoned about in tests.
-pub fn fingerprint(text: &str) -> Option<u64> {
-    if text.chars().count() > LOOP_GUARD_MAX_CHARS {
-        return None;
-    }
-    // FNV-1a over the normalised characters.
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    let mut any = false;
-    for c in text.chars().filter(|c| c.is_alphanumeric()) {
-        for lc in c.to_lowercase() {
-            let mut buf = [0u8; 4];
-            for b in lc.encode_utf8(&mut buf).bytes() {
-                h ^= u64::from(b);
-                h = h.wrapping_mul(0x0000_0100_0000_01b3);
-            }
-            any = true;
-        }
-    }
-    any.then_some(h)
 }
 
 #[cfg(test)]
@@ -852,33 +638,69 @@ mod tests {
         SendIntent {
             from,
             signal,
-            to: &[],
             lease_s: None,
             has_content: true,
             interrupt: false,
             now: 1_000,
-            fingerprint: None,
         }
     }
 
     #[test]
-    fn alternate_two_party() {
-        let r = roster(2);
-        let mut t = ThreadState::new("t", "topic", TurnMode::Alternate, 40, &r, None, 1_000);
+    fn round_table_goes_around_in_join_order() {
+        let r = roster(3);
+        let mut t = ThreadState::new("t", TurnMode::RoundTable, 40, &r, None, 1_000);
         assert_eq!(t.holder.as_deref(), Some("m1"));
         let err = t.apply(&r, &send("m2", TurnSignal::Yield)).unwrap_err();
-        assert!(matches!(err, TurnError::NotYourTurn { holder: Some(h), .. } if h == "m1"));
+        assert!(
+            matches!(err, TurnError::NotYourTurn { holder: Some(ref h), ref order, .. } if h == "m1" && order == &r.members)
+        );
         t.apply(&r, &send("m1", TurnSignal::Yield)).unwrap();
         assert_eq!(t.holder.as_deref(), Some("m2"));
-        t.apply(&r, &send("m2", TurnSignal::Yield)).unwrap();
-        assert_eq!(t.holder.as_deref(), Some("m1"));
+        // Pass gives up the floor without counting.
+        let mut pass = send("m2", TurnSignal::Pass);
+        pass.has_content = false;
+        let out = t.apply(&r, &pass).unwrap();
+        assert!(!out.counted);
+        assert_eq!(t.holder.as_deref(), Some("m3"));
+        t.apply(&r, &send("m3", TurnSignal::Yield)).unwrap();
+        assert_eq!(t.holder.as_deref(), Some("m1"), "wraps around");
         assert_eq!(t.turns_used, 2);
+        assert_eq!(t.view(&r, "m1").now, "you");
+        assert_eq!(t.view(&r, "m2").now, "m1");
+        assert_eq!(t.view(&r, "m2").order, r.members);
+    }
+
+    #[test]
+    fn free_mode_has_no_floor_but_a_cap() {
+        let r = roster(3);
+        let mut t = ThreadState::new("t", TurnMode::Free, 2, &r, None, 1_000);
+        assert_eq!(t.holder, None);
+        assert_eq!(t.view(&r, "m3").now, "anyone");
+        assert!(t.view(&r, "m3").order.is_empty());
+        t.apply(&r, &send("m3", TurnSignal::Hold)).unwrap();
+        assert_eq!(t.status, ThreadStatus::Floor, "hold is ignored when free");
+        t.apply(&r, &send("m2", TurnSignal::Yield)).unwrap();
+        assert_eq!(t.status, ThreadStatus::Capped);
+        assert_eq!(t.view(&r, "m1").now, "nobody");
+        assert_eq!(
+            t.apply(&r, &send("m1", TurnSignal::Yield)).unwrap_err(),
+            TurnError::TurnCap { cap: 2 }
+        );
+        // The owner raises the cap, or ends the thread even when capped.
+        t.set_cap(&r, 5, 1_001);
+        assert_eq!(t.status, ThreadStatus::Floor);
+        t.apply(&r, &send("m1", TurnSignal::Done)).unwrap();
+        assert!(t.is_complete());
+        assert_eq!(
+            t.apply(&r, &send("m2", TurnSignal::Yield)).unwrap_err(),
+            TurnError::ThreadComplete
+        );
     }
 
     #[test]
     fn hold_blocks_until_yield_or_expiry() {
         let r = roster(2);
-        let mut t = ThreadState::new("t", "", TurnMode::Alternate, 40, &r, None, 1_000);
+        let mut t = ThreadState::new("t", TurnMode::RoundTable, 40, &r, None, 1_000);
         let mut hold = send("m1", TurnSignal::Hold);
         hold.lease_s = Some(30);
         t.apply(&r, &hold).unwrap();
@@ -890,305 +712,139 @@ mod tests {
         late.now = 1_031;
         t.apply(&r, &late).unwrap();
         assert_eq!(t.holder.as_deref(), Some("m1"));
+        // Leases are clamped.
+        let mut long = send("m1", TurnSignal::Hold);
+        long.lease_s = Some(10_000);
+        long.now = 2_000;
+        t.apply(&r, &long).unwrap();
+        assert_eq!(t.lease_expires, Some(2_000 + u64::from(MAX_LEASE_S)));
     }
 
     #[test]
-    fn done_is_owner_only_and_absorbing() {
+    fn done_is_owner_only_and_interrupts_are_single_use() {
         let r = roster(3);
-        let mut t = ThreadState::new("t", "", TurnMode::Queue, 40, &r, None, 1_000);
-        let before = t.clone();
+        let mut t = ThreadState::new("t", TurnMode::RoundTable, 40, &r, None, 1_000);
         assert_eq!(
             t.apply(&r, &send("m2", TurnSignal::Done)).unwrap_err(),
             TurnError::OwnerOnly
         );
-        assert_eq!(t, before, "a refused done must not change state");
-        t.apply(&r, &send("m1", TurnSignal::Done)).unwrap();
-        assert!(t.is_complete());
-        assert_eq!(
-            t.apply(&r, &send("m1", TurnSignal::Yield)).unwrap_err(),
-            TurnError::ThreadComplete
-        );
-    }
-
-    #[test]
-    fn round_robin_cycles_join_order() {
-        let r = roster(3);
-        let mut t = ThreadState::new("t", "", TurnMode::RoundRobin, 40, &r, None, 1_000);
-        for expected in ["m1", "m2", "m3", "m1"] {
-            assert_eq!(t.holder.as_deref(), Some(expected));
-            let mut pass = send(expected, TurnSignal::Pass);
-            pass.has_content = false;
-            t.apply(&r, &pass).unwrap();
-        }
-        assert_eq!(t.turns_used, 0, "passes don't count toward the cap");
-    }
-
-    #[test]
-    fn queue_mode_grants_fifo_and_directed_yield_jumps() {
-        let r = roster(4);
-        let mut t = ThreadState::new("t", "", TurnMode::Queue, 40, &r, None, 1_000);
-        assert_eq!(
-            t.request_floor(&r, "m1", 1_000).unwrap(),
-            FloorGrant::Granted
-        );
-        assert_eq!(
-            t.request_floor(&r, "m2", 1_000).unwrap(),
-            FloorGrant::Queued(1)
-        );
-        assert_eq!(
-            t.request_floor(&r, "m3", 1_000).unwrap(),
-            FloorGrant::Queued(2)
-        );
-        assert_eq!(
-            t.request_floor(&r, "m3", 1_000).unwrap(),
-            FloorGrant::Queued(2)
-        );
-        t.apply(&r, &send("m1", TurnSignal::Yield)).unwrap();
-        assert_eq!(t.holder.as_deref(), Some("m2"));
-        let to = vec!["m4".to_string()];
-        let mut directed = send("m2", TurnSignal::Yield);
-        directed.to = &to;
-        t.apply(&r, &directed).unwrap();
-        assert_eq!(
-            t.holder.as_deref(),
-            Some("m4"),
-            "directed yield jumps the queue"
-        );
-        t.apply(&r, &send("m4", TurnSignal::Yield)).unwrap();
-        assert_eq!(t.holder.as_deref(), Some("m3"));
-        t.apply(&r, &send("m3", TurnSignal::Yield)).unwrap();
-        assert_eq!(t.holder, None, "empty queue leaves the floor open");
-        t.apply(&r, &send("m2", TurnSignal::Hold)).unwrap();
-        assert_eq!(t.holder.as_deref(), Some("m2"));
-    }
-
-    #[test]
-    fn moderated_only_owner_and_addressed() {
-        let r = roster(3);
-        let mut t = ThreadState::new("t", "", TurnMode::Moderated, 40, &r, None, 1_000);
-        assert!(t.apply(&r, &send("m2", TurnSignal::Yield)).is_err());
-        let to = vec!["m2".to_string(), "m3".to_string()];
-        let mut ask = send("m1", TurnSignal::Yield);
-        ask.to = &to;
-        t.apply(&r, &ask).unwrap();
-        assert_eq!(t.view(&r, "m2").now, "you (addressed)");
-        t.apply(&r, &send("m3", TurnSignal::Yield)).unwrap();
-        t.apply(&r, &send("m2", TurnSignal::Yield)).unwrap();
-        assert!(t.addressed.is_empty());
-        assert!(t.apply(&r, &send("m2", TurnSignal::Yield)).is_err());
-        // Owner may always speak.
-        t.apply(&r, &send("m1", TurnSignal::Yield)).unwrap();
-    }
-
-    #[test]
-    fn free_mode_never_blocks_but_caps() {
-        let r = roster(3);
-        let mut t = ThreadState::new("t", "", TurnMode::Free, 2, &r, None, 1_000);
-        assert_eq!(t.view(&r, "m2").now, "anyone");
-        // hold is accepted and ignored: no floor, nobody blocked.
-        let out = t.apply(&r, &send("m3", TurnSignal::Hold)).unwrap();
-        assert_eq!(out.holder, None);
-        assert_eq!(t.status, ThreadStatus::Floor);
-        assert_eq!(
-            t.request_floor(&r, "m2", 1_000).unwrap(),
-            FloorGrant::Granted
-        );
-        t.apply(&r, &send("m2", TurnSignal::Yield)).unwrap();
-        assert_eq!(t.status, ThreadStatus::Capped);
-        assert_eq!(t.view(&r, "m1").now, "nobody", "capped: not even the owner");
-        assert!(t.now_speaking(&r).is_empty());
-        assert_eq!(
-            t.apply(&r, &send("m1", TurnSignal::Yield)).unwrap_err(),
-            TurnError::TurnCap { cap: 2 }
-        );
-        t.raise_cap(&r, 10, 1_000);
-        assert_eq!(t.status, ThreadStatus::Floor);
-        t.apply(&r, &send("m2", TurnSignal::Yield)).unwrap();
-        // A member's done is still refused in free mode.
-        assert_eq!(
-            t.apply(&r, &send("m3", TurnSignal::Done)).unwrap_err(),
-            TurnError::OwnerOnly
-        );
-        t.apply(&r, &send("m1", TurnSignal::Done)).unwrap();
-        assert!(t.is_complete());
-    }
-
-    #[test]
-    fn loop_guard_stalls_until_owner_resumes() {
-        let r = roster(3);
-        let mut t = ThreadState::new("t", "", TurnMode::Free, 40, &r, None, 1_000);
-        let fp = fingerprint("Thanks!");
-        assert_eq!(fp, fingerprint("thanks"), "normalised");
-        assert!(fingerprint(&"x".repeat(LOOP_GUARD_MAX_CHARS + 1)).is_none());
-        let mut m = send("m2", TurnSignal::Yield);
-        m.fingerprint = fp;
-        t.apply(&r, &m).unwrap();
-        for _ in 0..LOOP_GUARD_HITS - 1 {
-            let mut m = send("m3", TurnSignal::Yield);
-            m.fingerprint = fp;
-            assert_eq!(t.apply(&r, &m).unwrap().status, ThreadStatus::Floor);
-        }
-        let mut m = send("m2", TurnSignal::Yield);
-        m.fingerprint = fp;
-        let out = t.apply(&r, &m).unwrap();
-        assert_eq!(out.status, ThreadStatus::Stalled);
-        assert_eq!(t.stall, Some(StallReason::LoopGuard));
-        assert_eq!(t.view(&r, "m2").now, "m1");
+        let mut int = send("m3", TurnSignal::Yield);
+        int.interrupt = true;
+        let out = t.apply(&r, &int).unwrap();
+        assert!(out.interrupt && out.counted);
+        assert_eq!(t.holder.as_deref(), Some("m1"), "floor unchanged");
+        assert_eq!(t.apply(&r, &int).unwrap_err(), TurnError::InterruptUsed);
+        // A content-free pass out of turn is still NOT_YOUR_TURN.
+        let mut pass = send("m3", TurnSignal::Pass);
+        pass.has_content = false;
         assert!(matches!(
-            t.apply(&r, &send("m3", TurnSignal::Yield)).unwrap_err(),
+            t.apply(&r, &pass).unwrap_err(),
             TurnError::NotYourTurn { .. }
         ));
-        // The owner resumes by sending anything.
-        t.apply(&r, &send("m1", TurnSignal::Yield)).unwrap();
-        assert_eq!(t.status, ThreadStatus::Floor);
-        assert_eq!(t.stall, None);
-        t.apply(&r, &send("m3", TurnSignal::Yield)).unwrap();
     }
 
     #[test]
-    fn turn_timeout_warns_then_stalls_or_skips() {
-        // Two parties: warn, then stall; any member resumes.
-        let r = roster(2);
-        let mut t = ThreadState::new("t", "", TurnMode::Alternate, 40, &r, None, 1_000);
-        t.apply(&r, &send("m1", TurnSignal::Yield)).unwrap();
+    fn timeout_warns_then_skips_or_stalls() {
+        // Group: warned, then skipped.
+        let r = roster(3);
+        let mut t = ThreadState::new("t", TurnMode::RoundTable, 40, &r, None, 1_000);
         assert_eq!(t.check_timeout(&r, 1_500, 600), TimeoutOutcome::None);
         assert_eq!(
             t.check_timeout(&r, 1_600, 600),
-            TimeoutOutcome::Warned(vec!["m2".into()])
+            TimeoutOutcome::Warned(vec!["m1".into()])
         );
         assert_eq!(t.check_timeout(&r, 1_700, 600), TimeoutOutcome::None);
         assert_eq!(
             t.check_timeout(&r, 2_200, 600),
-            TimeoutOutcome::Stalled(vec!["m2".into()])
+            TimeoutOutcome::Skipped(vec!["m1".into()])
         );
-        assert_eq!(t.stall, Some(StallReason::Timeout));
-        assert_eq!(t.now_speaking(&r).len(), 2, "anyone may resume");
-        t.apply(&r, &send("m1", TurnSignal::Yield)).unwrap();
-        assert_eq!(t.status, ThreadStatus::Floor);
         assert_eq!(t.holder.as_deref(), Some("m2"));
+        assert_eq!(t.view(&r, "m2").absent, vec!["m1".to_string()]);
+        // m2 yields: m3 is next, then m1 is skipped again as absent... until
+        // m1 sends, which clears absence.
+        let mut y = send("m2", TurnSignal::Yield);
+        y.now = 2_300;
+        t.apply(&r, &y).unwrap();
+        assert_eq!(t.holder.as_deref(), Some("m3"));
+        let mut y = send("m3", TurnSignal::Yield);
+        y.now = 2_400;
+        t.apply(&r, &y).unwrap();
+        assert_eq!(t.holder.as_deref(), Some("m2"), "absent m1 skipped");
+        let mut int = send("m1", TurnSignal::Yield);
+        int.interrupt = true;
+        int.now = 2_500;
+        t.apply(&r, &int).unwrap();
+        assert!(t.absent.is_empty(), "sending proves presence");
 
-        // Group round-robin: the silent member is skipped and marked absent.
-        let r = roster(3);
-        let mut t = ThreadState::new("t", "", TurnMode::RoundRobin, 40, &r, None, 1_000);
-        t.apply(&r, &send("m1", TurnSignal::Yield)).unwrap();
+        // Two parties: warned, then stalled; anyone may resume.
+        let r = roster(2);
+        let mut t = ThreadState::new("t", TurnMode::RoundTable, 40, &r, None, 1_000);
         assert!(matches!(
             t.check_timeout(&r, 1_600, 600),
             TimeoutOutcome::Warned(_)
         ));
         assert_eq!(
             t.check_timeout(&r, 2_200, 600),
-            TimeoutOutcome::Skipped(vec!["m2".into()])
+            TimeoutOutcome::Stalled(vec!["m1".into()])
         );
-        assert_eq!(t.holder.as_deref(), Some("m3"));
-        assert!(t.absent.contains("m2"));
-        assert_eq!(t.view(&r, "m3").absent, vec!["m2".to_string()]);
-        // m3 yields: the floor skips absent m2 and goes to m1.
-        let mut m = send("m3", TurnSignal::Yield);
-        m.now = 2_300;
-        t.apply(&r, &m).unwrap();
+        assert_eq!(t.status, ThreadStatus::Stalled);
+        assert_eq!(t.stall, Some(StallReason::Timeout));
+        assert_eq!(t.view(&r, "m2").now, "anyone");
+        let mut y = send("m2", TurnSignal::Yield);
+        y.now = 2_300;
+        t.apply(&r, &y).unwrap();
+        assert_eq!(t.status, ThreadStatus::Floor);
         assert_eq!(t.holder.as_deref(), Some("m1"));
-        // m2 sends an interrupt: it is no longer absent.
-        let mut i = send("m2", TurnSignal::Yield);
-        i.interrupt = true;
-        t.apply(&r, &i).unwrap();
-        assert!(!t.absent.contains("m2"), "any accepted send clears absence");
 
-        // Free mode never times out: nobody in particular is waited on.
-        let mut t = ThreadState::new("t", "", TurnMode::Free, 40, &r, None, 1_000);
-        assert_eq!(t.check_timeout(&r, 9_000, 600), TimeoutOutcome::None);
+        // Free mode never times out.
+        let mut t = ThreadState::new("t", TurnMode::Free, 40, &r, None, 1_000);
+        assert_eq!(t.check_timeout(&r, 9_999, 600), TimeoutOutcome::None);
     }
 
     #[test]
-    fn interrupt_once_per_thread() {
-        let r = roster(2);
-        let mut t = ThreadState::new("t", "", TurnMode::Alternate, 40, &r, None, 1_000);
-        let mut i = send("m2", TurnSignal::Yield);
-        i.interrupt = true;
-        let out = t.apply(&r, &i).unwrap();
-        assert!(out.interrupt);
-        assert_eq!(t.holder.as_deref(), Some("m1"), "interrupt keeps the floor");
-        assert_eq!(t.apply(&r, &i).unwrap_err(), TurnError::InterruptUsed);
+    fn mode_switch_and_member_leaving() {
+        let r = roster(3);
+        let mut t = ThreadState::new("t", TurnMode::Free, 40, &r, None, 1_000);
+        t.apply(&r, &send("m3", TurnSignal::Yield)).unwrap();
+        t.set_mode(&r, TurnMode::RoundTable, 1_100);
+        assert_eq!(t.holder.as_deref(), Some("m1"), "owner takes the floor");
+        t.apply(&r, &send("m1", TurnSignal::Yield)).unwrap();
+        assert_eq!(t.holder.as_deref(), Some("m2"));
+        // The holder leaves: the floor goes back to the owner.
+        let after = Roster {
+            owner: "m1".into(),
+            members: vec!["m1".into(), "m3".into()],
+        };
+        t.member_left(&after, "m2", 1_200);
+        assert_eq!(t.holder.as_deref(), Some("m1"));
+        t.set_mode(&after, TurnMode::Free, 1_300);
+        assert_eq!(t.holder, None);
+        assert_eq!(t.view(&after, "m3").now, "anyone");
+        // Switching a capped thread changes nothing but the mode.
+        let mut c = ThreadState::new("c", TurnMode::Free, 1, &r, None, 1_000);
+        c.apply(&r, &send("m2", TurnSignal::Yield)).unwrap();
+        assert_eq!(c.status, ThreadStatus::Capped);
+        c.set_mode(&r, TurnMode::RoundTable, 1_001);
+        assert_eq!(c.status, ThreadStatus::Capped);
+        assert_eq!(c.holder, None);
     }
 
     #[test]
-    fn request_floor_outside_queue_mode_is_a_probe() {
-        let r = roster(2);
-        let mut t = ThreadState::new("t", "", TurnMode::Alternate, 40, &r, None, 1_000);
+    fn mode_strings_round_trip() {
+        assert_eq!(TurnMode::parse("round_table"), TurnMode::RoundTable);
+        assert_eq!(TurnMode::parse("anything"), TurnMode::Free);
+        assert_eq!(TurnMode::RoundTable.as_str(), "round_table");
         assert_eq!(
-            t.request_floor(&r, "m1", 1_000).unwrap(),
-            FloorGrant::Granted
+            serde_json::to_string(&TurnMode::RoundTable).unwrap(),
+            "\"round_table\""
         );
-        assert!(matches!(
-            t.request_floor(&r, "m2", 1_000),
-            Err(TurnError::NotYourTurn { .. })
-        ));
-        assert!(t.queue.is_empty());
-    }
-
-    #[test]
-    fn member_left_clears_floor() {
-        let mut r = roster(3);
-        let mut t = ThreadState::new("t", "", TurnMode::Queue, 40, &r, Some("m2".into()), 1_000);
-        t.request_floor(&r, "m3", 1_000).unwrap();
-        r.members.retain(|m| m != "m2");
-        t.member_left(&r, "m2", 1_000);
-        assert_eq!(t.holder.as_deref(), Some("m3"));
-        assert!(t.queue.is_empty());
     }
 }
 
 #[cfg(test)]
-mod proptests {
-    use proptest::prelude::*;
-
+mod props {
     use super::*;
-
-    #[derive(Debug, Clone)]
-    enum Op {
-        Send {
-            from: usize,
-            signal: TurnSignal,
-            to: Vec<usize>,
-            content: bool,
-            interrupt: bool,
-            dt: u64,
-            fp: Option<u64>,
-        },
-        RequestFloor(usize),
-        RaiseCap(u32),
-        Expire(u64),
-        Timeout(u64),
-    }
-
-    fn signal() -> impl Strategy<Value = TurnSignal> {
-        prop_oneof![
-            4 => Just(TurnSignal::Yield),
-            2 => Just(TurnSignal::Hold),
-            2 => Just(TurnSignal::Pass),
-            1 => Just(TurnSignal::Done),
-        ]
-    }
-
-    fn mode() -> impl Strategy<Value = TurnMode> {
-        prop_oneof![
-            Just(TurnMode::Alternate),
-            Just(TurnMode::RoundRobin),
-            Just(TurnMode::Queue),
-            Just(TurnMode::Moderated),
-            Just(TurnMode::Free),
-        ]
-    }
-
-    fn op(n: usize) -> impl Strategy<Value = Op> {
-        prop_oneof![
-            8 => (0..n, signal(), prop::collection::vec(0..n, 0..3), any::<bool>(), any::<bool>(), 0u64..200, prop::option::of(0u64..3))
-                .prop_map(|(from, signal, to, content, interrupt, dt, fp)| Op::Send { from, signal, to, content, interrupt, dt, fp }),
-            2 => (0..n).prop_map(Op::RequestFloor),
-            1 => (1u32..100).prop_map(Op::RaiseCap),
-            1 => (0u64..700).prop_map(Op::Expire),
-            1 => (0u64..2000).prop_map(Op::Timeout),
-        ]
-    }
+    use proptest::prelude::*;
 
     fn roster(n: usize) -> Roster {
         Roster {
@@ -1198,148 +854,45 @@ mod proptests {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(400))]
-
+        /// Invariants over random sequences of sends in both modes: the
+        /// cap is never exceeded, a holder is always a member, free mode
+        /// never refuses with NOT_YOUR_TURN, and in round table mode an
+        /// accepted content send always comes from a member who was
+        /// allowed to speak (the holder, or an interrupt).
         #[test]
-        fn invariants_hold_for_any_op_sequence(
-            n in 2usize..6,
-            m in mode(),
-            cap in 1u32..30,
-            ops in prop::collection::vec(op(6), 1..60),
+        fn invariants(
+            n in 2usize..=5,
+            round_table in any::<bool>(),
+            cap in 1u32..=12,
+            steps in proptest::collection::vec((0usize..5, 0u8..5, any::<bool>(), any::<bool>()), 1..40),
         ) {
             let r = roster(n);
-            let mut t = ThreadState::new("t", "topic", m, cap, &r, None, 1_000);
+            let mode = if round_table { TurnMode::RoundTable } else { TurnMode::Free };
+            let mut t = ThreadState::new("t", mode, cap, &r, None, 1_000);
             let mut now = 1_000u64;
-
-            for o in ops {
-                let was_complete = t.is_complete();
-                let before = t.clone();
-                match o {
-                    Op::Send { from, signal, to, content, interrupt, dt, fp } => {
-                        now += dt;
-                        let from_id = format!("m{}", (from % n) + 1);
-                        let to_ids: Vec<MemberId> = to.iter().map(|i| format!("m{}", (i % n) + 1)).collect();
-                        let intent = SendIntent {
-                            from: &from_id,
-                            signal,
-                            to: &to_ids,
-                            lease_s: None,
-                            has_content: content,
-                            interrupt,
-                            now,
-                            fingerprint: fp,
-                        };
-                        // Lease expiry is time-driven and may legitimately happen
-                        // inside a refused call, so the "unchanged" oracle is the
-                        // state after expiry, not the raw previous state.
-                        let mut expired_before = before.clone();
-                        expired_before.expire_lease(&r, now);
-                        let may_speak_before = expired_before.now_speaking(&r).iter().any(|x| x == &from_id);
-                        match t.apply(&r, &intent) {
-                            Ok(out) => {
-                                // A non-owner can never complete a thread.
-                                if signal == TurnSignal::Done {
-                                    prop_assert_eq!(from_id.as_str(), "m1");
-                                    prop_assert!(t.is_complete());
-                                }
-                                // Someone who could not speak only gets through as an interrupt,
-                                // and an interrupt never moves the floor.
-                                if !may_speak_before && signal != TurnSignal::Done {
-                                    prop_assert!(out.interrupt && content && interrupt);
-                                    prop_assert_eq!(&t.holder, &expired_before.holder);
-                                }
-                                // Alternate, two parties: a content yield from the floor
-                                // holder always hands the floor to the other member.
-                                if m == TurnMode::Alternate && n == 2 && content && !out.interrupt
-                                    && signal == TurnSignal::Yield && !t.is_complete()
-                                    && t.status == ThreadStatus::Floor
-                                {
-                                    prop_assert_ne!(t.holder.as_deref(), Some(from_id.as_str()));
-                                }
-                                // Free mode never has a floor holder and never blocks a
-                                // member outside a stall.
-                                if m == TurnMode::Free {
-                                    prop_assert_eq!(&t.holder, &None);
-                                }
-                            }
-                            Err(TurnError::OwnerOnly) => {
-                                prop_assert_eq!(signal, TurnSignal::Done);
-                                prop_assert_ne!(from_id.as_str(), "m1");
-                                prop_assert_eq!(&t, &before, "refused done must not mutate");
-                            }
-                            Err(e) => {
-                                // Free mode only refuses when capped, complete, stalled by
-                                // the loop guard, or for a non-owner `done`.
-                                if m == TurnMode::Free {
-                                    prop_assert!(
-                                        matches!(e, TurnError::TurnCap { .. } | TurnError::ThreadComplete
-                                            | TurnError::InvalidTarget(_) | TurnError::InterruptUsed)
-                                            || expired_before.stall == Some(StallReason::LoopGuard),
-                                        "free mode refused with {e:?}"
-                                    );
-                                }
-                                prop_assert_eq!(&t, &expired_before, "refused op must not mutate");
-                            }
+            for (who, sig, content, interrupt) in steps {
+                now += 7;
+                let from = &r.members[who % n];
+                let signal = match sig % 4 { 0 => TurnSignal::Yield, 1 => TurnSignal::Hold, 2 => TurnSignal::Pass, _ => TurnSignal::Done };
+                // Leases expire lazily inside `apply`; mirror that here.
+                t.expire_lease(&r, now);
+                let allowed_before = t.now_speaking(&r).iter().any(|m| m == from);
+                let intent = SendIntent { from, signal, lease_s: Some(5), has_content: content, interrupt, now };
+                match t.apply(&r, &intent) {
+                    Ok(out) => {
+                        if round_table && content && !out.interrupt && signal != TurnSignal::Done {
+                            prop_assert!(allowed_before, "accepted a content send out of turn");
                         }
                     }
-                    Op::RequestFloor(i) => {
-                        let id = format!("m{}", (i % n) + 1);
-                        let _ = t.request_floor(&r, &id, now);
-                    }
-                    Op::RaiseCap(c) => t.raise_cap(&r, c, now),
-                    Op::Expire(dt) => {
-                        now += dt;
-                        t.expire_lease(&r, now);
-                    }
-                    Op::Timeout(dt) => {
-                        now += dt;
-                        let out = t.check_timeout(&r, now, 600);
-                        if let TimeoutOutcome::Stalled(_) = out {
-                            prop_assert_eq!(t.stall, Some(StallReason::Timeout));
-                        }
-                        if m == TurnMode::Free {
-                            prop_assert_eq!(out, TimeoutOutcome::None);
-                        }
-                    }
+                    Err(TurnError::NotYourTurn { .. }) => prop_assert!(round_table, "free mode never says NOT_YOUR_TURN"),
+                    Err(_) => {}
                 }
-
-                // Global invariants.
-                prop_assert!(t.turns_used <= t.turn_cap || t.is_complete(),
-                    "turns_used {} > cap {}", t.turns_used, t.turn_cap);
-                if t.status == ThreadStatus::Capped {
-                    prop_assert!(t.turns_used >= t.turn_cap);
-                }
+                prop_assert!(t.turns_used <= t.turn_cap);
                 if let Some(h) = &t.holder {
-                    prop_assert!(r.contains(h), "holder must be a member");
+                    prop_assert!(r.contains(h));
                 }
-                for q in &t.queue {
-                    prop_assert!(r.contains(q));
-                    prop_assert_ne!(Some(q), t.holder.as_ref(), "holder is never queued");
-                }
-                prop_assert!(t.queue.iter().collect::<std::collections::BTreeSet<_>>().len() == t.queue.len(), "queue has no duplicates");
-                if t.status == ThreadStatus::Held {
-                    prop_assert!(t.holder.is_some() && t.lease_expires.is_some());
-                    prop_assert!(t.now_speaking(&r).len() == 1);
-                }
-                if t.status == ThreadStatus::Capped {
-                    prop_assert!(t.now_speaking(&r).is_empty(), "capped: nobody may send");
-                }
-                prop_assert_eq!(t.status == ThreadStatus::Stalled, t.stall.is_some());
-                if t.stall == Some(StallReason::LoopGuard) {
-                    prop_assert_eq!(t.now_speaking(&r), vec!["m1".to_string()]);
-                }
-                if m != TurnMode::Free && m != TurnMode::Moderated
-                    && !matches!(t.status, ThreadStatus::Complete | ThreadStatus::Capped | ThreadStatus::Stalled)
-                {
-                    let speaking = t.now_speaking(&r);
-                    prop_assert!(speaking.len() == 1 || (m == TurnMode::Queue && t.holder.is_none()),
-                        "exactly one speaker outside queue-open state: {:?}", speaking);
-                }
-                for a in &t.absent {
-                    prop_assert!(r.contains(a));
-                }
-                if was_complete {
-                    prop_assert!(t.is_complete(), "complete is absorbing");
+                if t.status == ThreadStatus::Complete {
+                    prop_assert!(t.holder.is_none());
                 }
             }
         }

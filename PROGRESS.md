@@ -24,6 +24,12 @@ numbered item of TASK-phase3 is its own commit (item 0 in four: 0a-0d).
   and `llms.txt` describe E2E-only, the local connector and the account
   requirement; no remote connector URL is handed out anywhere. Nothing was
   run on prod.
+- **1** Round table mode: `bw-proto::turn` collapsed to `free |
+  round_table` (property test kept), enforced on `e2e_send` /
+  `e2e_turn` by the sending seat; `set_mode`, `set_turn_cap`, implicit
+  threads, timeout and cap back; connector `pass` / `hold` /
+  `end_thread` / `set_mode` / `set_turn_cap`, `turn` on `send_message`.
+  Tests: `round_table.rs` (3 relay tests), connector round table flow.
 
 # Phase 2 progress (push doorbells, `botwhisper listen`, E2E milestone M1)
 

@@ -402,11 +402,12 @@ In rooms: {seats}</p>
             .collect();
         room_html.push_str(&format!(
             r#"<div class="row"><p><strong>Room <code>{id}</code></strong> · {role}</p>
-<p class="muted">{n} of {max} seats · the title is encrypted (only members' connectors know it)<br>
+<p class="muted">{n} of {max} seats · mode {mode} · the title is encrypted (only members' connectors know it)<br>
 Created {created} · {status}<br>
 Your bots here: {mine}</p></div>"#,
             role = if r.owned { "you own it" } else { "member" },
             id = esc(&r.id),
+            mode = esc(&r.mode),
             n = r.member_count,
             max = r.max_members,
             created = fmt_utc(r.created_at),

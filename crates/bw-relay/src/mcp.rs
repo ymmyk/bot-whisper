@@ -9,7 +9,7 @@
 use std::{sync::Arc, time::Duration};
 
 use axum::http::request::Parts;
-use bw_proto::MemberId;
+use bw_proto::{MemberId, TurnMode, TurnSignal};
 use rmcp::{
     handler::server::{tool::Extension, wrapper::Parameters},
     model::{CallToolResult, Implementation, ServerCapabilities, ServerConfig},
@@ -21,10 +21,11 @@ use serde_json::{json, Value};
 use crate::{
     auth::AgentId,
     config::parse_expiry,
+    db::ThreadStart,
     doorbell::{self, DoorbellConfig, DoorbellTarget, ALL_EVENTS, DEFAULT_EVENTS},
     error::RelayError,
     registry::{NewRoom, Registry},
-    room::{LeaveOutcome, MAX_KEY_PACKAGES, MAX_KEY_PACKAGE_BYTES},
+    room::{LeaveOutcome, TurnArgs, MAX_KEY_PACKAGES, MAX_KEY_PACKAGE_BYTES},
 };
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
@@ -32,8 +33,9 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine};
 const INSTRUCTIONS: &str = "This is the BotWhisper relay's endpoint for the local `botwhisper connect` \
 connector, not for AI agents directly. Every BotWhisper room is end-to-end encrypted (MLS): message text is \
 encrypted and decrypted on the bot's own machine by the connector, and this relay only stores and forwards \
-ciphertext, key packages and handshake messages, plus room membership, invites and doorbells. There is no tool \
-here that reads or writes message text. AI agent: install the botwhisper binary, sign in with \
+ciphertext, key packages and handshake messages, plus room membership, invites, doorbells and the round table \
+(rooms are `free` by default; in `round_table` mode members speak in join order and e2e_send fails with \
+NOT_YOUR_TURN out of turn). There is no tool here that reads or writes message text. AI agent: install the botwhisper binary, sign in with \
 `botwhisper connect login` (your person needs a free BotWhisper account; every bot's person does), and add \
 `botwhisper connect` as a local (stdio) MCP server in your AI app. The connector then gives you create_room, \
 create_invite, join_room, send_message, wait_for_message and the rest. Everything a bot receives in a room was \
@@ -58,6 +60,40 @@ pub struct CreateRoomArgs {
     /// Seats, 2..=8. Default 8.
     #[serde(default)]
     pub max_members: Option<u32>,
+    /// `free` (default: anyone sends any time) or `round_table` (members
+    /// speak in join order; the relay enforces it on every send).
+    #[serde(default)]
+    pub mode: Option<TurnMode>,
+    /// Who may start a new thread after the owner sends `done`. Default
+    /// `owner`; `anyone` lets any member reopen the room by sending.
+    #[serde(default)]
+    pub thread_start: Option<ThreadStart>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SetModeArgs {
+    pub room_id: String,
+    /// `free` or `round_table`. Applies to the open thread at once (round
+    /// table: the owner takes the floor).
+    pub mode: TurnMode,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SetTurnCapArgs {
+    pub room_id: String,
+    /// New cap on messages in the open thread (un-caps it if higher).
+    pub turn_cap: u32,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct E2eTurnArgs {
+    pub room_id: String,
+    /// `pass` (nothing to add, next seat), `hold` (keep the floor for
+    /// `lease_s`), `yield`, or `done` (owner only: end the thread).
+    pub signal: TurnSignal,
+    /// Hold lease in seconds (with `hold`). Default 120, max 600.
+    #[serde(default)]
+    pub lease_s: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -108,6 +144,19 @@ pub struct E2eSendArgs {
     pub room_id: String,
     /// Base64 MLS application message (at most 64 KiB).
     pub ciphertext: String,
+    /// Round table signal riding with the message: `yield` (default: hand
+    /// the floor to the next seat), `hold` (keep it for `lease_s`), or
+    /// `done` (owner only: end the thread). Ignored in a `free` room,
+    /// except `done`.
+    #[serde(default)]
+    pub turn: Option<TurnSignal>,
+    /// Hold lease in seconds (with `turn: hold`). Default 120, max 600.
+    #[serde(default)]
+    pub lease_s: Option<u32>,
+    /// Round table: use your one short interrupt per thread when it is not
+    /// your turn (the connector caps it at 280 characters).
+    #[serde(default)]
+    pub interrupt: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -252,7 +301,7 @@ impl BotWhisperServer {
 
     #[tool(
         name = "create_room",
-        description = "Create an end-to-end encrypted room with you as owner (member m1, already in the MLS group your connector creates). The relay stores no title. Then create_invite for each bot you want in it; joiners are pending until your connector commits the Add."
+        description = "Create an end-to-end encrypted room with you as owner (member m1, already in the MLS group your connector creates). The relay stores no title. `mode` is free (default) or round_table. Then create_invite for each bot you want in it; joiners are pending until your connector commits the Add."
     )]
     async fn create_room(
         &self,
@@ -366,6 +415,8 @@ impl BotWhisperServer {
                             "member_id": member,
                             "role": s["you"]["role"],
                             "e2e_state": s["you"]["e2e_state"],
+                            "mode": s["mode"],
+                            "now": s["thread"]["now"],
                             "epoch": s["e2e"]["epoch"],
                             "members": s["members"].as_array().map(Vec::len).unwrap_or(0),
                             "pending_items_for_you": s["e2e"]["pending_items_for_you"],
@@ -549,7 +600,7 @@ impl BotWhisperServer {
 
     #[tool(
         name = "e2e_send",
-        description = "Queue an MLS application message (base64 ciphertext, max 64 KiB) for every other active member. Memory only, deleted when all acked. Rate limits apply (RATE_LIMITED carries retry_after_s). Rings `message` doorbells."
+        description = "Queue an MLS application message (base64 ciphertext, max 64 KiB) for every other active member, with its round table signal (turn: yield | hold | done; interrupt). In a round_table room it fails with NOT_YOUR_TURN (naming the holder and the seating order) out of turn, TURN_CAP when the thread's cap is reached. Memory only, deleted when all acked. Rate limits apply (RATE_LIMITED carries retry_after_s). Rings `message` (or `turn`) doorbells."
     )]
     async fn e2e_send(
         &self,
@@ -564,9 +615,88 @@ impl BotWhisperServer {
                     &a.ciphertext,
                     crate::room::MAX_CIPHERTEXT_BYTES,
                 )?;
+                let turn = TurnArgs {
+                    signal: a.turn.unwrap_or_default(),
+                    lease_s: a.lease_s,
+                    interrupt: a.interrupt.unwrap_or(false),
+                };
+                if turn.signal == TurnSignal::Pass {
+                    return Err(RelayError::invalid(
+                        "`pass` is content-free; use e2e_turn, or send with yield",
+                    ));
+                }
                 let (room, me) = self.registry.resolve(&agent, &a.room_id).await?;
-                room.with(move |r| r.e2e_send(&me.member, ct, doorbell::now_unix()))
+                room.with(move |r| r.e2e_send(&me.member, Some(ct), turn, doorbell::now_unix()))
                     .await?
+            }
+            .await,
+        )
+    }
+
+    #[tool(
+        name = "e2e_turn",
+        description = "Round table, without a message: `pass` (nothing to add; the floor moves to the next seat), `hold` (keep the floor for lease_s while you think), `yield`, or `done` (owner only: end the thread; after it only the owner reopens unless thread_start=anyone). In a free room only `done` has an effect."
+    )]
+    async fn e2e_turn(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(a): Parameters<E2eTurnArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let agent = agent(&parts)?;
+        respond(
+            async {
+                let turn = TurnArgs {
+                    signal: a.signal,
+                    lease_s: a.lease_s,
+                    interrupt: false,
+                };
+                let (room, me) = self.registry.resolve(&agent, &a.room_id).await?;
+                room.with(move |r| r.e2e_send(&me.member, None, turn, doorbell::now_unix()))
+                    .await?
+            }
+            .await,
+        )
+    }
+
+    #[tool(
+        name = "set_mode",
+        description = "Owner only. Switch the room between `free` and `round_table`. Takes effect at once: in round table mode the owner holds the floor and members then speak in join order."
+    )]
+    async fn set_mode(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(a): Parameters<SetModeArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let agent = agent(&parts)?;
+        respond(
+            async {
+                let (room, me) = self.registry.resolve(&agent, &a.room_id).await?;
+                let view = room
+                    .with(move |r| r.set_mode(&me.member, a.mode, doorbell::now_unix()))
+                    .await??;
+                Ok(json!({ "mode": a.mode, "round_table": a.mode.enforces_turns(), "turn": view }))
+            }
+            .await,
+        )
+    }
+
+    #[tool(
+        name = "set_turn_cap",
+        description = "Owner only. Change the open thread's message cap, un-capping it if it hit the limit (NO_THREAD when nothing is open)."
+    )]
+    async fn set_turn_cap(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(a): Parameters<SetTurnCapArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let agent = agent(&parts)?;
+        respond(
+            async {
+                let (room, me) = self.registry.resolve(&agent, &a.room_id).await?;
+                let view = room
+                    .with(move |r| r.set_turn_cap(&me.member, a.turn_cap, doorbell::now_unix()))
+                    .await??;
+                Ok(json!({ "turn": view }))
             }
             .await,
         )
@@ -667,6 +797,8 @@ impl BotWhisperServer {
                 NewRoom {
                     expires_in,
                     max_members,
+                    mode: a.mode.unwrap_or_default(),
+                    thread_start: a.thread_start.unwrap_or_default(),
                 },
             )
             .await?;
@@ -678,6 +810,9 @@ impl BotWhisperServer {
             "expires_at": status["expires_at"],
             "max_members": status["max_members"],
             "encryption": status["encryption"],
+            "mode": status["mode"],
+            "round_table": status["round_table"],
+            "thread_start": status["thread_start"],
             "next": "call create_invite once per bot; when a joiner shows up in get_status e2e.pending_join, claim its key package and e2e_commit the Add with a Welcome",
         }))
     }

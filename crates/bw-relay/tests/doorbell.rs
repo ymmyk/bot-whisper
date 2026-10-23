@@ -125,14 +125,15 @@ async fn doorbell_payload_is_signed_and_content_free() {
     keys.sort_unstable();
     assert_eq!(
         keys,
-        ["event", "room", "seq", "ts", "turn", "v"],
+        ["event", "room", "seq", "thread", "ts", "turn", "v"],
         "payload shape"
     );
     assert_eq!(payload["v"], 1);
     assert_eq!(payload["event"], "message");
     assert_eq!(payload["room"], room);
     assert_eq!(payload["seq"], 3, "after the add commit and Welcome");
-    assert_eq!(payload["turn"], "open");
+    assert_eq!(payload["turn"], "open", "free room");
+    assert!(payload["thread"].as_str().unwrap().starts_with("adhoc-"));
     let text = String::from_utf8_lossy(body);
     assert!(
         !text.contains(secret_text),

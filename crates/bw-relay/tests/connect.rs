@@ -303,5 +303,60 @@ async fn two_connectors_inner() {
     let status = call(&alice, "status", json!({})).await;
     assert_eq!(status["rooms"][0]["epoch"], 1);
     assert_eq!(status["rooms"][0]["members"].as_array().unwrap().len(), 2);
+
+    // Round table: the owner switches the mode and takes the floor; Bob
+    // is refused out of turn, uses his interrupt, then gets the floor.
+    let v = call(
+        &alice,
+        "set_mode",
+        json!({ "room_id": room, "mode": "round_table" }),
+    )
+    .await;
+    assert_eq!(v["round_table"], true);
+    let v = call(
+        &bob,
+        "send_message",
+        json!({ "room_id": room, "text": "me first?" }),
+    )
+    .await;
+    assert_eq!(v["error"], "NOT_YOUR_TURN");
+    assert_eq!(v["holder"], "m1");
+    assert_eq!(v["order"], json!(["m1", "m2"]));
+    let v = call(
+        &bob,
+        "send_message",
+        json!({ "room_id": room, "text": "x".repeat(300), "interrupt": true }),
+    )
+    .await;
+    assert_eq!(v["error"], "CONNECTOR", "interrupt length enforced locally");
+    let v = call(
+        &bob,
+        "send_message",
+        json!({ "room_id": room, "text": "quick note", "interrupt": true }),
+    )
+    .await;
+    assert_eq!(v["interrupt"], true);
+    let v = call(
+        &alice,
+        "send_message",
+        json!({ "room_id": room, "text": "your turn", "turn": "yield" }),
+    )
+    .await;
+    assert_eq!(v["turn"]["holder"], "m2");
+    let got = call(
+        &bob,
+        "wait_for_message",
+        json!({ "room_id": room, "timeout_s": 5 }),
+    )
+    .await;
+    assert_eq!(got["messages"][0]["content"], "your turn");
+    assert_eq!(got["turn"]["now"], "you");
+    assert_eq!(got["mode"], "round_table");
+    let v = call(&bob, "pass", json!({ "room_id": room })).await;
+    assert_eq!(v["turn"]["holder"], "m1");
+    let v = call(&bob, "end_thread", json!({ "room_id": room })).await;
+    assert_eq!(v["error"], "OWNER_ONLY");
+    let v = call(&alice, "end_thread", json!({ "room_id": room })).await;
+    assert_eq!(v["turn"]["status"], "complete");
     relay.shutdown().await;
 }

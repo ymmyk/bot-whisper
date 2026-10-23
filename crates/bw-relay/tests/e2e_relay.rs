@@ -305,7 +305,11 @@ async fn e2e_room_lifecycle_through_the_relay() {
         .ok("e2e_fetch", json!({ "room_id": room, "timeout_s": 1 }))
         .await;
     assert_eq!(payloads(&f)[0].2, "CT-before-remove");
-    assert_eq!(f["events"][0]["event"], "members_changed");
+    assert!(f["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|e| e["event"] == "members_changed"));
     assert_eq!(relay.queued(&room).await, 0, "nothing held for m2 any more");
 
     // The owner leaving closes the room; Carol collects room_closed once.
