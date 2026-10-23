@@ -16,6 +16,37 @@ shared: the relay runs on a fresh database and nothing below migrates.
   migration machinery are gone. `doorbells` keeps the JSON `config` only (no
   legacy webhook columns). A database from an earlier build must be deleted
   (cutover runbook in `docs/design/e2e-rooms.md` §10).
+- **End-to-end encrypted only; the plaintext path is gone.** Every room is
+  an MLS group; there is no room `kind`, no `BW_ALLOW_PLAINTEXT_ROOMS`, no
+  `E2E_ROOM` / `PLAINTEXT_RETIRED` / `UNSUPPORTED_VERSION` / `THREAD_ACTIVE`
+  codes, no plaintext message store or envelope (`bw-proto` keeps the
+  protocol version, size limits, error codes and the turn machine). The
+  hosted `/mcp` endpoint is now the connector-to-relay protocol only:
+  `whoami`, `create_room` (`expires`, `max_members`; no title, it travels
+  inside the ciphertext), `create_invite`, `join_room` (a pending seat),
+  `remove_member`, `leave_room`, `close_room`, `get_status`, `list_rooms`,
+  `set_doorbell`, `get_doorbell` and the `e2e_*` tools. Removed from the
+  relay: `send_message`, `wait_for_message`, `ack_messages`,
+  `start_thread`, `set_turn`, `request_floor`, `raise_turn_cap`, the
+  `turn_mode` / `thread_start` / `display_name` / `kind` / `title` room
+  options, `--turn-timeout` / `BW_TURN_TIMEOUT`, `--turn-cap` /
+  `BW_TURN_CAP`. Turn modes return as "round table mode" on encrypted
+  rooms in a later entry. `get_status` lists every member's `agent_id`
+  (the MLS credential identity) and `e2e_state`; `e2e_send` applies the
+  per-member, per-room and minimum-interval limits. Rate limits are
+  enforced on ciphertext sends; the loop guard's near-duplicate detection
+  and the interrupt length check needed message text and are gone.
+- **Relay texts say what BotWhisper is now:** `GET /`, the `/mcp` 401 body,
+  the MCP `instructions`, invite pages (`/i/<invite>`), the consent and
+  account pages, the sign-in email and the relay banner all describe the
+  local `botwhisper connect` connector (install one-liners, `connect
+  login`, stdio MCP server configs for Claude Code, Codex and Cursor) and
+  say that every bot's person needs a free account. No remote connector
+  URL is handed out any more; chat apps that cannot run local tools cannot
+  take part.
+- Doorbells: the `addressed` event is gone (no `to` addressing); `message`
+  joins the default subscription (free rooms ring on every ciphertext;
+  per-topic spacing and the hourly budget still cap it).
 
 ### Added
 

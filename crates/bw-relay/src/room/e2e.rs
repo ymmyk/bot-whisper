@@ -16,7 +16,10 @@ use serde::Serialize;
 use serde_json::{json, Value};
 
 use super::{Member, MemberEvent, Room};
-use crate::{db::HandshakeRow, db::RoomKind, error::RelayError};
+use crate::{
+    db::{HandshakeRow, SeatState},
+    error::RelayError,
+};
 
 /// Largest key package the relay stores.
 pub const MAX_KEY_PACKAGE_BYTES: usize = 4 * 1024;
@@ -113,18 +116,19 @@ impl E2eState {
     pub fn queued(&self) -> usize {
         self.items.len()
     }
+
+    /// The last seq handed out (0 before anything was queued).
+    pub fn last_seq(&self) -> u64 {
+        self.next_seq.saturating_sub(1)
+    }
+
+    /// Forget everything queued (room closed).
+    pub fn clear(&mut self) {
+        self.items.clear();
+    }
 }
 
 impl Room {
-    fn require_e2e(&self) -> Result<(), RelayError> {
-        if self.kind != RoomKind::E2e {
-            return Err(RelayError::invalid(
-                "this is a plaintext room; the e2e_* tools only apply to rooms created with kind e2e",
-            ));
-        }
-        Ok(())
-    }
-
     /// The member must be in the MLS group already (not `pending`).
     fn require_e2e_active(&self, member: &str) -> Result<&Member, RelayError> {
         let m = self.member(member)?;
@@ -186,19 +190,26 @@ impl Room {
         Ok(seq)
     }
 
-    /// `e2e_status` block for `get_status`.
+    /// `e2e` block for `get_status`.
     pub(super) fn e2e_status(&self, member: &str) -> Value {
         json!({
             "epoch": self.e2e.epoch,
-            "you": self.member(member).ok().and_then(|m| m.e2e_state.clone()),
-            // Agent ids are the MLS credential identities, so connectors can
-            // map seats to leaves (needed to remove a member).
-            "members": self.members.iter().map(|m| json!({
-                "member": m.member, "e2e_state": m.e2e_state, "agent_id": m.agent_id,
-            })).collect::<Vec<_>>(),
+            "you": self.member(member).ok().map(|m| m.e2e_state),
             "pending_join": self.members.iter().filter(|m| !m.is_e2e_active()).map(|m| m.member.clone()).collect::<Vec<_>>(),
             "pending_items_for_you": self.e2e.items.iter().filter(|i| i.pending.contains(member)).count(),
         })
+    }
+
+    /// A member left or was removed: nothing is held for it any more.
+    pub(super) fn e2e_forget_member(&mut self, member: &str) -> Result<(), RelayError> {
+        for i in &mut self.e2e.items {
+            if i.pending.remove(member) && i.kind.persisted() {
+                let pending: Vec<String> = i.pending.iter().cloned().collect();
+                self.db.set_handshake_pending(&self.id, i.seq, &pending)?;
+            }
+        }
+        self.e2e.items.retain(|i| !i.pending.is_empty());
+        Ok(())
     }
 
     /// Claim one unused key package of another seated member (to Add them).
@@ -209,7 +220,6 @@ impl Room {
         now: u64,
     ) -> Result<Value, RelayError> {
         self.require_open()?;
-        self.require_e2e()?;
         self.require_e2e_active(by)?;
         let t = self.member(target)?;
         if t.is_e2e_active() {
@@ -244,7 +254,6 @@ impl Room {
         now: u64,
     ) -> Result<Value, RelayError> {
         self.require_open()?;
-        self.require_e2e()?;
         self.require_e2e_active(by)?;
         if commit.is_empty() || commit.len() > MAX_HANDSHAKE_BYTES {
             return Err(RelayError::new(
@@ -296,14 +305,15 @@ impl Room {
             None => None,
         };
         for m in &added {
-            self.db.set_member_e2e_state(&self.id, m, "active")?;
+            self.db
+                .set_member_e2e_state(&self.id, m, SeatState::Active)?;
             if let Some(mem) = self.members.iter_mut().find(|x| &x.member == m) {
-                mem.e2e_state = Some("active".into());
+                mem.e2e_state = SeatState::Active;
             }
         }
         self.e2e.epoch += 1;
         self.db.set_e2e_epoch(&self.id, self.e2e.epoch)?;
-        let ids = self.roster().members;
+        let ids = self.member_ids();
         self.broadcast_event(MemberEvent::MembersChanged { members: ids }, Some(by));
         self.ring_all("members_changed", Some(by), now);
         self.touch();
@@ -323,7 +333,6 @@ impl Room {
         now: u64,
     ) -> Result<Value, RelayError> {
         self.require_open()?;
-        self.require_e2e()?;
         self.require_e2e_active(by)?;
         if ciphertext.is_empty() || ciphertext.len() > MAX_CIPHERTEXT_BYTES {
             return Err(RelayError::new(
@@ -331,20 +340,7 @@ impl Room {
                 format!("ciphertext must be 1 to {MAX_CIPHERTEXT_BYTES} bytes"),
             ));
         }
-        if let Err(retry) = self.member_msgs.check(by) {
-            return Err(RelayError::new(
-                ErrorCode::RateLimited,
-                "too many messages from you this minute",
-            )
-            .with_data(json!({ "retry_after_s": retry })));
-        }
-        if let Err(retry) = self.room_msgs.check(&self.id) {
-            return Err(RelayError::new(
-                ErrorCode::RateLimited,
-                "too many messages in this room this minute",
-            )
-            .with_data(json!({ "retry_after_s": retry })));
-        }
+        self.check_send_limits(by)?;
         let recipients = self.active_members_except(by);
         let seq = self.push_e2e_item(
             E2eItemKind::Application,
@@ -373,7 +369,6 @@ impl Room {
             }
             return Err(RelayError::room_closed());
         }
-        self.require_e2e()?;
         self.member(member)?;
         let mut items = Vec::new();
         for i in &mut self.e2e.items {
@@ -404,7 +399,7 @@ impl Room {
             "items": items,
             "events": events,
             "epoch": self.e2e.epoch,
-            "you": self.member(member).ok().and_then(|m| m.e2e_state.clone()),
+            "you": self.member(member).ok().map(|m| m.e2e_state),
             "members": self.members.iter().map(|m| json!({ "member": m.member, "e2e_state": m.e2e_state })).collect::<Vec<_>>(),
         }))
     }
@@ -412,7 +407,6 @@ impl Room {
     /// Explicit ack of e2e items up to a seq.
     pub fn e2e_ack(&mut self, member: &str, up_to_seq: u64) -> Result<usize, RelayError> {
         self.require_open()?;
-        self.require_e2e()?;
         self.member(member)?;
         let mut n = 0;
         for i in &mut self.e2e.items {

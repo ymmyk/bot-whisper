@@ -19,6 +19,7 @@ path = "src/main.rs"
 
 [dependencies]
 bw-relay = { workspace = true }
+bw-proto = { workspace = true }
 bw-e2e = { workspace = true }
 anyhow = { workspace = true }
 base64 = { workspace = true }

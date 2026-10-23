@@ -235,11 +235,6 @@ async fn two_connectors_inner() {
     let created = call(&alice, "create_room", json!({ "title": "Secret plans" })).await;
     assert_eq!(created["encryption"], "mls (end-to-end)");
     let room = created["room_id"].as_str().unwrap().to_string();
-    // The relay only has a placeholder title.
-    assert_eq!(
-        relay.db.get_room(&room).unwrap().unwrap().title,
-        "(encrypted)"
-    );
 
     let inv = call(
         &alice,
@@ -291,7 +286,7 @@ async fn two_connectors_inner() {
     assert_eq!(got["messages"][0]["sender"]["member"], "m1");
     let st = call(&bob, "get_status", json!({ "room_id": room })).await;
     assert_eq!(st["title"], "Secret plans");
-    assert_eq!(st["kind"], "e2e");
+    assert_eq!(st["encryption"], "mls (end-to-end)");
     call(
         &bob,
         "send_message",

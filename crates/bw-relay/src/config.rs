@@ -29,10 +29,6 @@ pub struct RelayConfig {
     pub behind_proxy: bool,
     /// Rate limits.
     pub limits: RateLimits,
-    /// Turn timeout: how long the floor holder may stay silent before being
-    /// rung, then skipped (groups) or stalled (2 parties). Default 30 min.
-    /// Zero disables.
-    pub turn_timeout: Duration,
     /// Access token lifetime. Default 1 h.
     pub access_token_ttl: Duration,
     /// Refresh token lifetime. Default 90 d.
@@ -45,8 +41,6 @@ pub struct RelayConfig {
     pub unacked_ttl: Duration,
     /// Hard cap on members per room. Default 8.
     pub max_members: u32,
-    /// Default turn cap per thread. Default 40.
-    pub default_turn_cap: u32,
     /// Default room expiry. Default 7 days.
     pub default_room_expiry: Duration,
     /// Default invite TTL. Default 7 days.
@@ -72,9 +66,6 @@ pub struct RelayConfig {
     pub vapid_private_key_file: Option<PathBuf>,
     /// VAPID `sub` claim (`mailto:` or `https:`). Defaults from the public URL.
     pub vapid_subject: Option<String>,
-    /// Plaintext rooms may be created and used. The E2E cutover flips this
-    /// to `false`, after which plaintext tools answer `PLAINTEXT_RETIRED`.
-    pub allow_plaintext_rooms: bool,
 }
 
 impl Default for RelayConfig {
@@ -88,14 +79,12 @@ impl Default for RelayConfig {
             mail: MailConfig::Log,
             behind_proxy: false,
             limits: RateLimits::default(),
-            turn_timeout: Duration::from_secs(30 * 60),
             access_token_ttl: Duration::from_secs(3600),
             refresh_token_ttl: Duration::from_secs(90 * 24 * 3600),
             session_ttl: Duration::from_secs(30 * 24 * 3600),
             login_link_ttl: Duration::from_secs(15 * 60),
             unacked_ttl: Duration::from_secs(72 * 3600),
             max_members: 8,
-            default_turn_cap: 40,
             default_room_expiry: Duration::from_secs(7 * 24 * 3600),
             default_invite_ttl: Duration::from_secs(7 * 24 * 3600),
             allow_insecure_doorbells: false,
@@ -106,7 +95,6 @@ impl Default for RelayConfig {
             ntfy_min_interval: Duration::from_secs(5),
             vapid_private_key_file: None,
             vapid_subject: None,
-            allow_plaintext_rooms: true,
         }
     }
 }
@@ -158,9 +146,6 @@ impl RelayConfig {
         }
         if self.max_members < 2 {
             self.max_members = 2;
-        }
-        if self.default_turn_cap == 0 {
-            self.default_turn_cap = 1;
         }
         self
     }

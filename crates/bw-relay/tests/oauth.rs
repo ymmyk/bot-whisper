@@ -408,8 +408,8 @@ async fn email_signin_pkce_refresh_and_revoke() {
     assert!(page.contains("Test &lt;Client&gt;"));
     assert!(page.contains("Have an invite instead?"));
     assert!(
-        page.contains("plaintext relay"),
-        "operator notice on the consent page"
+        page.contains("End-to-end encrypted."),
+        "encryption notice on the consent page"
     );
 
     // Missing PKCE is refused with a redirect error.
@@ -446,7 +446,7 @@ async fn email_signin_pkce_refresh_and_revoke() {
         .ok("create_room", json!({ "title": "OAuth room" }))
         .await;
     assert_eq!(room["role"], "owner");
-    assert_eq!(room["turn_mode"], "free");
+    assert_eq!(room["encryption"], "mls (end-to-end)");
 
     // With a browser session the next client needs one click.
     let client2 = register(&http, &base).await;
@@ -769,12 +769,6 @@ async fn two_bots_on_one_account_and_client_are_two_members() {
         .map(|m| m["display_name"].as_str().unwrap())
         .collect();
     assert_eq!(names, vec!["Test <Client>", "Other bot"]);
-    bot_a
-        .ok(
-            "send_message",
-            json!({ "room_id": room_id, "text": "hi me" }),
-        )
-        .await;
 
     // Refresh keeps the bot: same member in the room.
     let r = refresh_grant(
@@ -826,7 +820,7 @@ async fn guest_joins_with_invite_and_is_scoped_to_that_room() {
         .as_str()
         .unwrap()
         .to_string();
-    let other = make_room(&owner, &[], "Other", json!({})).await;
+    let other = make_room(&owner, &[], json!({})).await;
     let inv = owner
         .ok("create_invite", json!({ "room_id": room, "label": "Sam" }))
         .await;
@@ -869,10 +863,6 @@ async fn guest_joins_with_invite_and_is_scoped_to_that_room() {
             .await,
         "UNAUTHORIZED"
     );
-    // Guests talk like anyone else.
-    guest.send(&room, "hi from Sam").await;
-    assert_eq!(contents(&owner.wait(&room, 5).await), vec!["hi from Sam"]);
-
     // The invite is spent: a second guest attempt is refused on the page.
     let r = http
         .post(format!("{base}/oauth/authorize"))
@@ -1004,9 +994,8 @@ async fn unconfirmed_clients_are_told_to_confirm_the_email() {
         says_confirm(&body);
         assert!(body.contains("from this BotWhisper relay"));
         assert!(body.contains(&format!("create an account first at {base}/signup")));
-        assert!(body.contains(&format!(
-            "`claude mcp add --transport http botwhisper {base}/mcp`"
-        )));
+        assert!(body.contains(&format!("`botwhisper connect login --relay {base}`")));
+        assert!(body.contains("botwhisper-installer.sh | sh"));
         no_secrets(&body.replace("bwa_not-a-real-token", ""));
     }
 
@@ -1040,8 +1029,8 @@ async fn unconfirmed_clients_are_told_to_confirm_the_email() {
 
     // The plain-text index.
     let idx = http.get(&base).send().await.unwrap().text().await.unwrap();
-    assert!(idx.contains(&format!("create an account at {base}/signup")));
-    assert!(idx.contains(&format!("ask your user to add {base}/mcp as a")));
+    assert!(idx.contains(&format!("create a free account at {base}/signup")));
+    assert!(idx.contains("Every bot's person needs an account"));
     assert!(idx.contains("'Your BotWhisper sign-in link'") && idx.contains("check spam"));
 
     // The invite landing page an agent may fetch before it has the connector.
@@ -1057,22 +1046,19 @@ async fn unconfirmed_clients_are_told_to_confirm_the_email() {
     assert!(page.starts_with("This is a BotWhisper room invite. Give it to your AI agent"));
     assert!(page.contains("Opening this page does not use the invite"));
     assert!(page.contains("AI agent without the connector"));
+    assert!(page.contains("needs a free BotWhisper account first"));
+    assert!(page.contains(&format!("sign up at {base}/signup")));
+    assert!(page.contains("ACCOUNT_REQUIRED"));
+    assert!(page.contains(&format!("`botwhisper connect login --relay {base}`")));
     assert!(page.contains(&format!(
-        "`claude mcp add --transport http botwhisper {base}/mcp`"
+        "`claude mcp add botwhisper -- botwhisper connect --relay {base}`"
     )));
-    assert!(page.contains("type `/mcp` in Claude Code"));
-    assert!(page.contains(&format!("`codex mcp add botwhisper --url {base}/mcp`")));
     assert!(page.contains("~/.cursor/mcp.json"));
-    assert!(page.contains(&format!(
-        "adds {base}/mcp as a connector in the app's settings"
-    )));
-    assert!(page.contains("agents that run on a computer"));
-    assert!(page.contains("Have an invite instead?"));
     assert!(page.contains("call `join_room` with this invite URL"));
+    assert!(!page.contains("Have an invite instead?"));
     // The index carries the same setup commands.
-    assert!(idx.contains(&format!(
-        "`claude mcp add --transport http botwhisper {base}/mcp`"
-    )));
+    assert!(idx.contains(&format!("`botwhisper connect login --relay {base}`")));
+    assert!(idx.contains("end-to-end encrypted"));
 
     // No mail was sent beyond the one pending sign-in, and the pending
     // address never shows up anywhere above.
@@ -1087,9 +1073,10 @@ async fn mcp_instructions_explain_email_confirmation() {
     let info = bot.svc.peer_info().expect("server info");
     let ins = info.instructions.clone().unwrap_or_default();
     assert!(
-        ins.contains("sign-up happens through this connector's browser sign-in"),
+        ins.contains("sign-up happens in the browser during `botwhisper connect login`"),
         "{ins}"
     );
+    assert!(ins.contains("no tool here that reads or writes message text"));
     assert!(ins.contains(&format!("{}/signup", relay.base())));
     assert!(ins.contains("check their inbox (and spam)"));
     assert!(ins.contains("expires in 15 minutes"));

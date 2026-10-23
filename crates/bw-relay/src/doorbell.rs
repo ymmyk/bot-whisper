@@ -37,7 +37,6 @@ pub const ALL_EVENTS: &[&str] = &[
     "thread_started",
     "message",
     "turn",
-    "addressed",
     "lease_expired",
     "thread_done",
     "stalled",
@@ -49,8 +48,8 @@ pub const ALL_EVENTS: &[&str] = &[
 /// Default subscription.
 pub const DEFAULT_EVENTS: &[&str] = &[
     "thread_started",
+    "message",
     "turn",
-    "addressed",
     "thread_done",
     "stalled",
 ];

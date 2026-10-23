@@ -8,7 +8,6 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use bw_proto::TurnMode;
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::doorbell::{DoorbellConfig, DoorbellKey, DoorbellStatus};
@@ -16,20 +15,20 @@ use crate::doorbell::{DoorbellConfig, DoorbellKey, DoorbellStatus};
 const SCHEMA: &str = r#"
 -- The one initial schema. BotWhisper has no data migrations: a relay runs on
 -- a database this file created, or on a fresh one.
+-- Rooms are MLS groups. The relay knows no title (it travels inside the
+-- ciphertext), only the metadata needed to route handshakes and ciphertext.
 CREATE TABLE IF NOT EXISTS rooms (
     id            TEXT PRIMARY KEY,
-    title         TEXT NOT NULL,
     owner         TEXT NOT NULL,
     created_at    INTEGER NOT NULL,
     expires_at    INTEGER,
     max_members   INTEGER NOT NULL,
-    turn_mode     TEXT NOT NULL,
     next_member_n INTEGER NOT NULL,
-    thread_start  TEXT NOT NULL DEFAULT 'owner',
     owner_account TEXT,
-    kind          TEXT NOT NULL DEFAULT 'plaintext',
     e2e_epoch     INTEGER NOT NULL DEFAULT 0
 );
+-- A seat. `e2e_state` is `pending` until a member's commit adds the bot to
+-- the group, then `active`.
 CREATE TABLE IF NOT EXISTS members (
     room_id       TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
     member_id     TEXT NOT NULL,
@@ -38,7 +37,7 @@ CREATE TABLE IF NOT EXISTS members (
     role          TEXT NOT NULL,
     invite_label  TEXT,
     joined_at     INTEGER NOT NULL,
-    e2e_state     TEXT,
+    e2e_state     TEXT NOT NULL,
     PRIMARY KEY (room_id, member_id)
 );
 CREATE INDEX IF NOT EXISTS members_by_agent ON members(agent_id);
@@ -157,48 +156,31 @@ CREATE TABLE IF NOT EXISTS bot_doorbells (
 );
 "#;
 
-/// Whether a room is relay-readable or an MLS group. Fixed at creation.
+/// A seat's place in the MLS group.
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    Default,
-    serde::Serialize,
-    serde::Deserialize,
-    schemars::JsonSchema,
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
 )]
 #[serde(rename_all = "snake_case")]
-pub enum RoomKind {
-    /// Today's behaviour: the relay sees plaintext while messages are in memory.
-    #[default]
-    Plaintext,
-    /// End-to-end encrypted: the relay stores and forwards ciphertext only.
-    E2e,
+pub enum SeatState {
+    /// Seated at the relay, waiting for a member's commit (and Welcome).
+    Pending,
+    /// In the group.
+    Active,
 }
 
-impl RoomKind {
+impl SeatState {
     pub fn as_str(self) -> &'static str {
         match self {
-            RoomKind::Plaintext => "plaintext",
-            RoomKind::E2e => "e2e",
+            SeatState::Pending => "pending",
+            SeatState::Active => "active",
         }
     }
 
     fn parse(s: &str) -> Self {
-        if s == "e2e" {
-            RoomKind::E2e
+        if s == "active" {
+            SeatState::Active
         } else {
-            RoomKind::Plaintext
-        }
-    }
-
-    /// The encryption label shown in `get_status` and on messages.
-    pub fn encryption_label(self) -> &'static str {
-        match self {
-            RoomKind::Plaintext => bw_proto::Enc::None.label(),
-            RoomKind::E2e => bw_proto::Enc::Mls.label(),
+            SeatState::Pending
         }
     }
 }
@@ -261,60 +243,15 @@ pub fn new_bot_id() -> String {
 #[derive(Debug, Clone)]
 pub struct RoomRow {
     pub id: String,
-    pub title: String,
     pub owner: String,
     pub created_at: u64,
     pub expires_at: Option<u64>,
     pub max_members: u32,
-    /// Room turn mode. `free` by default (turn control is opt-in).
-    pub turn_mode: TurnMode,
     pub next_member_n: u32,
-    /// Who may open a new thread after the owner's `done`.
-    pub thread_start: ThreadStart,
     /// Account that owns the room (rate limits). `None` for dev tokens.
     pub owner_account: Option<String>,
-    /// Plaintext or end-to-end encrypted.
-    pub kind: RoomKind,
-    /// Current MLS epoch (number of accepted commits) in an e2e room.
+    /// Current MLS epoch (number of accepted commits).
     pub e2e_epoch: u64,
-}
-
-/// Who may start a new thread once the owner has ended one (fix 5c).
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    Default,
-    serde::Serialize,
-    serde::Deserialize,
-    schemars::JsonSchema,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum ThreadStart {
-    /// Only the owner (default).
-    #[default]
-    Owner,
-    /// Any member, by sending into the idle room or calling `start_thread`.
-    Anyone,
-}
-
-impl ThreadStart {
-    fn as_str(self) -> &'static str {
-        match self {
-            ThreadStart::Owner => "owner",
-            ThreadStart::Anyone => "anyone",
-        }
-    }
-
-    fn parse(s: &str) -> Self {
-        if s == "anyone" {
-            ThreadStart::Anyone
-        } else {
-            ThreadStart::Owner
-        }
-    }
 }
 
 /// An account row. `email` is `None` for invite-scoped guests.
@@ -397,9 +334,8 @@ pub struct MemberRow {
     pub role: String,
     pub invite_label: Option<String>,
     pub joined_at: u64,
-    /// E2E rooms: `pending` until an existing member's commit adds this
-    /// member, then `active`. `None` in plaintext rooms.
-    pub e2e_state: Option<String>,
+    /// `pending` until an existing member's commit adds this member.
+    pub e2e_state: SeatState,
 }
 
 /// An invite row (secret stored hashed).
@@ -429,10 +365,8 @@ pub struct AccountClient {
 #[derive(Debug, Clone)]
 pub struct AccountRoom {
     pub id: String,
-    pub title: String,
     pub created_at: u64,
     pub expires_at: Option<u64>,
-    pub turn_mode: String,
     pub owned: bool,
     pub member_count: u32,
     pub max_members: u32,
@@ -454,7 +388,6 @@ pub struct AccountSeat {
 pub struct AccountInvite {
     pub id: String,
     pub room_id: String,
-    pub room_title: String,
     pub label: Option<String>,
     pub expires_at: u64,
     pub redeemed_at: Option<u64>,
@@ -506,20 +439,16 @@ impl Db {
     pub fn insert_room(&self, room: &RoomRow) -> Result<()> {
         self.with(|c| {
             c.execute(
-                "INSERT INTO rooms (id, title, owner, created_at, expires_at, max_members, turn_mode, next_member_n, thread_start, owner_account, kind, e2e_epoch)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                "INSERT INTO rooms (id, owner, created_at, expires_at, max_members, next_member_n, owner_account, e2e_epoch)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     room.id,
-                    room.title,
                     room.owner,
                     room.created_at as i64,
                     room.expires_at.map(|v| v as i64),
                     room.max_members,
-                    mode_str(room.turn_mode),
                     room.next_member_n,
-                    room.thread_start.as_str(),
                     room.owner_account,
-                    room.kind.as_str(),
                     room.e2e_epoch as i64,
                 ],
             )?;
@@ -530,23 +459,19 @@ impl Db {
     pub fn get_room(&self, id: &str) -> Result<Option<RoomRow>> {
         self.with(|c| {
             c.query_row(
-                "SELECT id, title, owner, created_at, expires_at, max_members, turn_mode, next_member_n, thread_start, owner_account, kind, e2e_epoch
+                "SELECT id, owner, created_at, expires_at, max_members, next_member_n, owner_account, e2e_epoch
                  FROM rooms WHERE id = ?1",
                 params![id],
                 |r| {
                     Ok(RoomRow {
                         id: r.get(0)?,
-                        title: r.get(1)?,
-                        owner: r.get(2)?,
-                        created_at: r.get::<_, i64>(3)? as u64,
-                        expires_at: r.get::<_, Option<i64>>(4)?.map(|v| v as u64),
-                        max_members: r.get(5)?,
-                        turn_mode: parse_mode(&r.get::<_, String>(6)?),
-                        next_member_n: r.get(7)?,
-                        thread_start: ThreadStart::parse(&r.get::<_, String>(8)?),
-                        owner_account: r.get(9)?,
-                        kind: RoomKind::parse(&r.get::<_, String>(10)?),
-                        e2e_epoch: r.get::<_, i64>(11)? as u64,
+                        owner: r.get(1)?,
+                        created_at: r.get::<_, i64>(2)? as u64,
+                        expires_at: r.get::<_, Option<i64>>(3)?.map(|v| v as u64),
+                        max_members: r.get::<_, i64>(4)? as u32,
+                        next_member_n: r.get::<_, i64>(5)? as u32,
+                        owner_account: r.get(6)?,
+                        e2e_epoch: r.get::<_, i64>(7)? as u64,
                     })
                 },
             )
@@ -615,7 +540,7 @@ impl Db {
                     m.role,
                     m.invite_label,
                     m.joined_at as i64,
-                    m.e2e_state
+                    m.e2e_state.as_str()
                 ],
             )?;
             Ok(())
@@ -650,18 +575,23 @@ impl Db {
                     role: r.get(3)?,
                     invite_label: r.get(4)?,
                     joined_at: r.get::<_, i64>(5)? as u64,
-                    e2e_state: r.get(6)?,
+                    e2e_state: SeatState::parse(&r.get::<_, String>(6)?),
                 })
             })?;
             rows.collect()
         })
     }
 
-    pub fn set_member_e2e_state(&self, room_id: &str, member_id: &str, state: &str) -> Result<()> {
+    pub fn set_member_e2e_state(
+        &self,
+        room_id: &str,
+        member_id: &str,
+        state: SeatState,
+    ) -> Result<()> {
         self.with(|c| {
             c.execute(
                 "UPDATE members SET e2e_state = ?3 WHERE room_id = ?1 AND member_id = ?2",
-                params![room_id, member_id, state],
+                params![room_id, member_id, state.as_str()],
             )?;
             Ok(())
         })
@@ -1597,7 +1527,7 @@ impl Db {
     pub fn account_rooms(&self, account_id: &str) -> Result<Vec<AccountRoom>> {
         self.with(|c| {
             let mut st = c.prepare(
-                "SELECT r.id, r.title, r.created_at, r.expires_at, r.turn_mode,
+                "SELECT r.id, r.created_at, r.expires_at,
                         (r.owner_account IS NOT NULL AND r.owner_account = ?1)
                           OR EXISTS (SELECT 1 FROM members m WHERE m.room_id = r.id
                                      AND m.member_id = r.owner
@@ -1613,13 +1543,11 @@ impl Db {
             let rows = st.query_map(params![account_id], |r| {
                 Ok(AccountRoom {
                     id: r.get(0)?,
-                    title: r.get(1)?,
-                    created_at: r.get::<_, i64>(2)? as u64,
-                    expires_at: r.get::<_, Option<i64>>(3)?.map(|v| v as u64),
-                    turn_mode: r.get(4)?,
-                    owned: r.get::<_, i64>(5)? != 0,
-                    member_count: r.get::<_, i64>(6)? as u32,
-                    max_members: r.get::<_, i64>(7)? as u32,
+                    created_at: r.get::<_, i64>(1)? as u64,
+                    expires_at: r.get::<_, Option<i64>>(2)?.map(|v| v as u64),
+                    owned: r.get::<_, i64>(3)? != 0,
+                    member_count: r.get::<_, i64>(4)? as u32,
+                    max_members: r.get::<_, i64>(5)? as u32,
                 })
             })?;
             rows.collect()
@@ -1652,7 +1580,7 @@ impl Db {
     pub fn account_invites(&self, account_id: &str) -> Result<Vec<AccountInvite>> {
         self.with(|c| {
             let mut st = c.prepare(
-                "SELECT i.id, i.room_id, r.title, i.label, i.expires_at, i.redeemed_at
+                "SELECT i.id, i.room_id, i.label, i.expires_at, i.redeemed_at
                  FROM invites i JOIN rooms r ON r.id = i.room_id
                  WHERE r.owner_account = ?1
                     OR EXISTS (SELECT 1 FROM members m WHERE m.room_id = r.id
@@ -1664,10 +1592,9 @@ impl Db {
                 Ok(AccountInvite {
                     id: r.get(0)?,
                     room_id: r.get(1)?,
-                    room_title: r.get(2)?,
-                    label: r.get(3)?,
-                    expires_at: r.get::<_, i64>(4)? as u64,
-                    redeemed_at: r.get::<_, Option<i64>>(5)?.map(|v| v as u64),
+                    label: r.get(2)?,
+                    expires_at: r.get::<_, i64>(3)? as u64,
+                    redeemed_at: r.get::<_, Option<i64>>(4)?.map(|v| v as u64),
                 })
             })?;
             rows.collect()
@@ -1694,27 +1621,6 @@ fn account_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<AccountRow> {
     })
 }
 
-fn mode_str(m: TurnMode) -> &'static str {
-    match m {
-        TurnMode::Alternate => "alternate",
-        TurnMode::RoundRobin => "round_robin",
-        TurnMode::Queue => "queue",
-        TurnMode::Moderated => "moderated",
-        TurnMode::Free => "free",
-    }
-}
-
-/// Unknown values fall back to `free`.
-fn parse_mode(s: &str) -> TurnMode {
-    match s {
-        "alternate" => TurnMode::Alternate,
-        "round_robin" => TurnMode::RoundRobin,
-        "queue" => TurnMode::Queue,
-        "moderated" => TurnMode::Moderated,
-        _ => TurnMode::Free,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1724,16 +1630,12 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         db.insert_room(&RoomRow {
             id: "r1".into(),
-            title: "t".into(),
             owner: "m1".into(),
             created_at: 1,
             expires_at: None,
             max_members: 8,
-            turn_mode: TurnMode::Queue,
             next_member_n: 2,
-            thread_start: ThreadStart::Anyone,
             owner_account: Some("acct".into()),
-            kind: RoomKind::E2e,
             e2e_epoch: 0,
         })
         .unwrap();
@@ -1747,7 +1649,7 @@ mod tests {
                 role: "owner".into(),
                 invite_label: None,
                 joined_at: 1,
-                e2e_state: Some("active".into()),
+                e2e_state: SeatState::Pending,
             },
         )
         .unwrap();
@@ -1805,14 +1707,11 @@ mod tests {
         assert!(!db.redeem_invite("i1", 6).unwrap(), "second redeem loses");
         assert_eq!(db.rooms_for_agent("a").unwrap().len(), 1);
         let room = db.get_room("r1").unwrap().unwrap();
-        assert_eq!(room.turn_mode, TurnMode::Queue);
-        assert_eq!(room.thread_start, ThreadStart::Anyone);
-        assert_eq!(room.kind, RoomKind::E2e);
         assert_eq!(room.e2e_epoch, 4);
-        assert_eq!(
-            db.members("r1").unwrap()[0].e2e_state.as_deref(),
-            Some("active")
-        );
+        assert_eq!(db.members("r1").unwrap()[0].e2e_state, SeatState::Pending);
+        db.set_member_e2e_state("r1", "m1", SeatState::Active)
+            .unwrap();
+        assert_eq!(db.members("r1").unwrap()[0].e2e_state, SeatState::Active);
         db.delete_room("r1").unwrap();
         assert!(
             db.handshakes("r1").unwrap().is_empty(),

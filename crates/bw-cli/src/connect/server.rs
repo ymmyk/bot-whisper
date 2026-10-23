@@ -431,14 +431,13 @@ impl Connector {
         Ok(added)
     }
 
-    /// Rooms we are in (from the relay), encrypted ones only.
+    /// Rooms we are in (from the relay).
     async fn my_e2e_rooms(&self) -> anyhow::Result<Vec<String>> {
         let v = self.relay.call("get_status", json!({})).await?;
         Ok(v["rooms"]
             .as_array()
             .map(|rs| {
                 rs.iter()
-                    .filter(|r| r["kind"] == "e2e")
                     .filter_map(|r| r["room_id"].as_str().map(str::to_string))
                     .collect()
             })
@@ -481,7 +480,7 @@ impl Connector {
     ) -> Result<CallToolResult, ErrorData> {
         respond(
             async {
-                let mut args = json!({ "title": "(encrypted)", "kind": "e2e" });
+                let mut args = json!({});
                 if let Some(e) = &a.expires {
                     args["expires"] = json!(e);
                 }
@@ -558,9 +557,6 @@ impl Connector {
                     .call("join_room", json!({ "invite_url": a.invite_url }))
                     .await?;
                 let room_id = joined["room_id"].as_str().unwrap_or_default().to_string();
-                if joined["kind"] != "e2e" {
-                    anyhow::bail!("this invite is for a plaintext room; the connector only joins end-to-end encrypted rooms");
-                }
                 self.state.lock().await.pending.insert(
                     room_id.clone(),
                     Pending {
@@ -609,7 +605,7 @@ impl Connector {
                 if a.text.trim().is_empty() {
                     anyhow::bail!("text is empty");
                 }
-                if a.text.len() > 48 * 1024 {
+                if a.text.len() > bw_proto::MAX_MESSAGE_BYTES {
                     anyhow::bail!("text is too long (max 48 KiB)");
                 }
                 // Apply anything queued (commits) before encrypting.
@@ -736,7 +732,7 @@ impl Connector {
         respond(
             async {
                 let status = self.relay.call("get_status", json!({ "room_id": a.room_id })).await?;
-                let target_agent = status["e2e"]["members"]
+                let target_agent = status["members"]
                     .as_array()
                     .and_then(|ms| ms.iter().find(|m| m["member"] == a.member_id))
                     .and_then(|m| m["agent_id"].as_str().map(str::to_string))

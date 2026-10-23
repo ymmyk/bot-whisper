@@ -20,15 +20,15 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run the relay (remote MCP endpoint + OAuth + doorbells + SQLite metadata).
+    /// Run the relay (the connector's MCP endpoint + OAuth + doorbells + SQLite metadata).
     Relay(Box<RelayArgs>),
     /// Subscribe to your bot's ntfy doorbell topic and run a command, post to
     /// a local URL or print a JSON line on every content-free ping.
     Listen(Box<ListenArgs>),
     /// The local connector: holds your bot's keys and tokens, talks to the
-    /// relay, and serves end-to-end encrypted room tools to your AI app over
-    /// stdio (MCP). `connect login` first, then add `botwhisper connect` as a
-    /// local MCP server.
+    /// relay, and serves the end-to-end encrypted room tools to your AI app
+    /// over stdio (MCP). `connect login` first (your person needs a free
+    /// account), then add `botwhisper connect` as a local MCP server.
     Connect(Box<ConnectArgs>),
 }
 
@@ -146,19 +146,9 @@ struct RelayArgs {
     #[arg(long, env = "BW_UNACKED_TTL", default_value = "72h")]
     unacked_ttl: String,
 
-    /// Turn timeout for rooms with a turn mode (e.g. 30m). The silent floor
-    /// holder is rung once, then skipped (groups) or the thread stalls
-    /// (two parties). `0s` disables.
-    #[arg(long, env = "BW_TURN_TIMEOUT", default_value = "30m")]
-    turn_timeout: String,
-
     /// Members per room cap.
     #[arg(long, env = "BW_MAX_MEMBERS", default_value_t = 8)]
     max_members: u32,
-
-    /// Default message cap per thread.
-    #[arg(long, env = "BW_TURN_CAP", default_value_t = 40)]
-    turn_cap: u32,
 
     /// Rate limit: content messages per member per minute (0 = unlimited).
     #[arg(long, env = "BW_RATE_MSGS_PER_MEMBER", default_value_t = 10)]
@@ -225,11 +215,6 @@ struct RelayArgs {
     /// VAPID subject (`mailto:` or `https:`). Default: the public URL.
     #[arg(long, env = "BW_VAPID_SUBJECT")]
     vapid_subject: Option<String>,
-
-    /// Allow plaintext (relay-readable) rooms. The E2E cutover sets this to
-    /// false; plaintext tools then answer PLAINTEXT_RETIRED.
-    #[arg(long, env = "BW_ALLOW_PLAINTEXT_ROOMS", default_value_t = true, action = clap::ArgAction::Set)]
-    allow_plaintext_rooms: bool,
 }
 
 #[tokio::main]
@@ -454,9 +439,6 @@ async fn relay(args: RelayArgs) -> anyhow::Result<()> {
     let unacked_ttl = bw_relay::config::parse_expiry(&args.unacked_ttl)
         .map_err(anyhow::Error::msg)?
         .ok_or_else(|| anyhow::anyhow!("--unacked-ttl cannot be `never`"))?;
-    let turn_timeout = bw_relay::config::parse_expiry(&args.turn_timeout)
-        .map_err(anyhow::Error::msg)?
-        .unwrap_or(Duration::ZERO);
     let mail = bw_relay::mail::MailConfig::from_env().map_err(anyhow::Error::msg)?;
     let ntfy_min_interval = bw_relay::config::parse_expiry(&args.ntfy_min_interval)
         .map_err(anyhow::Error::msg)?
@@ -498,10 +480,8 @@ async fn relay(args: RelayArgs) -> anyhow::Result<()> {
             min_turn_interval_s: args.min_turn_interval,
             ..Default::default()
         },
-        turn_timeout,
         unacked_ttl,
         max_members: args.max_members,
-        default_turn_cap: args.turn_cap,
         allow_insecure_doorbells: args.allow_insecure_doorbells,
         allowed_hosts: args
             .allowed_hosts
@@ -513,7 +493,6 @@ async fn relay(args: RelayArgs) -> anyhow::Result<()> {
         ntfy_min_interval,
         vapid_private_key_file: args.vapid_private_key_file,
         vapid_subject: args.vapid_subject,
-        allow_plaintext_rooms: args.allow_plaintext_rooms,
         ..Default::default()
     };
     let mail_kind = match &cfg.mail {
@@ -521,15 +500,14 @@ async fn relay(args: RelayArgs) -> anyhow::Result<()> {
         bw_relay::mail::MailConfig::Smtp { .. } => "smtp",
     };
     eprintln!(
-        "BotWhisper relay v{} on {} — MCP at /mcp (OAuth 2.1 sign-in), health at /health, mail: {}, \
-         doorbells: ntfy default {} ({}), web push VAPID key at /push/vapid-public-key. \
-         Plaintext rooms {}: the operator can read their messages in memory.",
+        "BotWhisper relay v{} on {} — connector protocol at /mcp (OAuth 2.1 sign-in), health at \
+         /health, mail: {}, doorbells: ntfy default {} ({}), web push VAPID key at \
+         /push/vapid-public-key. Every room is end-to-end encrypted: the relay holds ciphertext only.",
         env!("CARGO_PKG_VERSION"),
         cfg.bind,
         mail_kind,
         cfg.ntfy_base_url,
         if cfg.ntfy_token.is_some() { "relay token set" } else { "no relay token" },
-        if cfg.allow_plaintext_rooms { "allowed" } else { "retired" },
     );
     bw_relay::run(cfg).await
 }

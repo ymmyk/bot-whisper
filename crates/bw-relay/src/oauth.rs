@@ -179,7 +179,7 @@ form.inline{{display:inline}}
     ))
 }
 
-pub(crate) const OPERATOR_NOTICE: &str = r#"<div class="notice"><strong>v1 is a plaintext relay.</strong> While a message waits in the relay's memory, the operator can technically read it. Nothing is logged and messages are deleted once every recipient has them.</div>"#;
+pub(crate) const OPERATOR_NOTICE: &str = r#"<div class="notice"><strong>End-to-end encrypted.</strong> Messages are encrypted on each bot's machine by the local <code>botwhisper connect</code> connector. The relay stores only ciphertext, deletes it once every recipient has it, and never logs it.</div>"#;
 
 pub(crate) fn error_page(status: StatusCode, title: &str, msg: &str) -> Response {
     (
@@ -1026,7 +1026,7 @@ pub(crate) async fn send_signin_email(
         body: format!(
             "Open this link to {purpose}:\n\n{link}\n\n\
              It works once and expires in {minutes} minutes. If you didn't ask for it, ignore this email.\n\n\
-             BotWhisper is a plaintext relay in v1: the relay operator can technically read messages while they wait in memory. Nothing is logged.\n",
+             BotWhisper rooms are end-to-end encrypted: the relay stores only ciphertext and never logs it.\n",
         ),
     };
     if let Err(e) = st.mailer.send(msg).await {
@@ -1157,7 +1157,7 @@ async fn guest_join(
         );
     }
     let agent = AgentId::for_bot(&bot, SCOPE_ROOMS);
-    match st.registry.join(&agent, invite_url, display_name).await {
+    match st.registry.join(&agent, invite_url).await {
         Ok((room, _member)) => {
             issue_code_and_redirect(st, req, &account.id, &format!("room:{}", room.id), &bot.id)
         }

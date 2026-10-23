@@ -1,9 +1,10 @@
-//! BotWhisper relay: room actors, memory-only message queues, remote MCP
-//! endpoint with OAuth 2.1, HMAC doorbells and SQLite metadata.
+//! BotWhisper relay: room actors, memory-only ciphertext queues, the
+//! connector's MCP endpoint with OAuth 2.1, push doorbells and SQLite
+//! metadata.
 //!
-//! v1 is a plaintext relay. The operator can technically read messages while
-//! they sit in memory; nothing is logged and messages are deleted once every
-//! recipient acks.
+//! Every room is end-to-end encrypted (MLS). The relay stores and forwards
+//! key packages, handshake messages and application ciphertext; it never
+//! sees message text, and ciphertext is deleted once every recipient acks.
 
 pub mod auth;
 pub mod config;

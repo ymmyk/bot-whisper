@@ -9,6 +9,7 @@ use std::{
     time::Duration,
 };
 
+use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use bw_relay::{
     db::Db,
     doorbell::{Backoff, Doorbells},
@@ -128,10 +129,10 @@ impl TestRelay {
             .expect("bot connects")
     }
 
-    /// Messages currently held in memory for a room.
+    /// Ciphertext and handshake items currently held in memory for a room.
     pub async fn queued(&self, room_id: &str) -> usize {
         let h = self.relay.registry.get(room_id).await.expect("room exists");
-        h.with(|r| r.queued_messages()).await.expect("room alive")
+        h.with(|r| r.e2e_queued()).await.expect("room alive")
     }
 
     pub async fn shutdown(self) -> (Arc<RelayConfig>, Db) {
@@ -192,14 +193,21 @@ impl Bot {
             .to_string()
     }
 
+    /// "Send a message": queue `text` as if it were ciphertext (the relay
+    /// never looks inside; tests that need real MLS use `bw-e2e`).
     pub async fn send(&self, room: &str, text: &str) -> Value {
-        self.ok("send_message", json!({ "room_id": room, "text": text }))
-            .await
+        self.ok(
+            "e2e_send",
+            json!({ "room_id": room, "ciphertext": B64.encode(text.as_bytes()) }),
+        )
+        .await
     }
 
+    /// Long-poll the room's queue (application ciphertext, handshakes and
+    /// events).
     pub async fn wait(&self, room: &str, timeout_s: u64) -> Value {
         self.ok(
-            "wait_for_message",
+            "e2e_fetch",
             json!({ "room_id": room, "timeout_s": timeout_s }),
         )
         .await
@@ -218,16 +226,11 @@ fn text_of(r: &CallToolResult) -> String {
         .join("\n")
 }
 
-/// Create a room owned by `owner` and have `members` join via invites.
-/// Returns the room id.
-pub async fn make_room(owner: &Bot, members: &[&Bot], title: &str, extra: Value) -> String {
-    let mut args = json!({ "title": title });
-    if let (Some(a), Some(e)) = (args.as_object_mut(), extra.as_object()) {
-        for (k, v) in e {
-            a.insert(k.clone(), v.clone());
-        }
-    }
-    let created = owner.ok("create_room", args).await;
+/// Create a room owned by `owner`, have `members` join via invites and let
+/// the owner "add" each of them with a placeholder commit and Welcome, so
+/// everyone is active. Queues are drained afterwards. Returns the room id.
+pub async fn make_room(owner: &Bot, members: &[&Bot], extra: Value) -> String {
+    let created = owner.ok("create_room", extra).await;
     let room = created["room_id"].as_str().unwrap().to_string();
     for (i, m) in members.iter().enumerate() {
         let inv = owner
@@ -236,19 +239,38 @@ pub async fn make_room(owner: &Bot, members: &[&Bot], title: &str, extra: Value)
                 json!({ "room_id": room, "label": format!("bot {}", i + 2) }),
             )
             .await;
-        m.ok("join_room", json!({ "invite_url": inv["invite_url"] }))
+        let joined = m
+            .ok("join_room", json!({ "invite_url": inv["invite_url"] }))
             .await;
+        let member = joined["you"]["member"].as_str().unwrap().to_string();
+        owner
+            .ok(
+                "e2e_commit",
+                json!({ "room_id": room, "epoch": i, "commit": B64.encode(b"add"),
+                        "welcome": B64.encode(b"welcome"), "welcome_to": [member], "added": [member] }),
+            )
+            .await;
+    }
+    for b in std::iter::once(&owner).chain(members.iter()) {
+        b.wait(&room, 0).await;
     }
     room
 }
 
-/// Content strings of the messages in a wait result.
-pub fn contents(wait: &Value) -> Vec<String> {
-    wait["messages"]
+/// Decoded application payloads ("message contents") in a fetch result.
+pub fn contents(fetch: &Value) -> Vec<String> {
+    fetch["items"]
         .as_array()
         .map(|a| {
             a.iter()
-                .map(|m| m["content"].as_str().unwrap_or_default().to_string())
+                .filter(|i| i["kind"] == "application")
+                .map(|i| {
+                    String::from_utf8(
+                        B64.decode(i["payload"].as_str().unwrap_or_default())
+                            .unwrap(),
+                    )
+                    .unwrap()
+                })
                 .collect()
         })
         .unwrap_or_default()

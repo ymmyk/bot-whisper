@@ -340,6 +340,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "bw-e2e",
+ "bw-proto",
  "bw-relay",
  "clap",
  "dotenvy",

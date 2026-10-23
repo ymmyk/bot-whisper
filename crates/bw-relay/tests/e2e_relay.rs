@@ -1,7 +1,7 @@
 //! The relay side of end-to-end encrypted rooms, with opaque blobs standing
-//! in for MLS messages: kind, plaintext tools refused, key packages, commits
-//! with epoch ordering, Welcomes, ciphertext fan-out, persistence of
-//! handshakes across a restart, and the plaintext-retired gate.
+//! in for MLS messages: key packages, commits with epoch ordering, Welcomes,
+//! ciphertext fan-out, pending seats, persistence of handshakes across a
+//! restart, and the size and argument checks.
 
 mod common;
 
@@ -35,48 +35,44 @@ async fn e2e_room_lifecycle_through_the_relay() {
     let bob = relay.bot(TOKENS[1]).await;
     let carol = relay.bot(TOKENS[2]).await;
 
-    let created = alice
-        .ok(
-            "create_room",
-            json!({ "title": "placeholder", "kind": "e2e" }),
-        )
-        .await;
+    let created = alice.ok("create_room", json!({})).await;
     let room = created["room_id"].as_str().unwrap().to_string();
-    assert_eq!(created["kind"], "e2e");
     assert_eq!(created["encryption"], "mls (end-to-end)");
+    assert_eq!(created["member_id"], "m1");
     let st = alice.ok("get_status", json!({ "room_id": room })).await;
-    assert_eq!(st["kind"], "e2e");
+    assert_eq!(st["encryption"], "mls (end-to-end)");
     assert_eq!(st["e2e"]["epoch"], 0);
     assert_eq!(st["e2e"]["you"], "active");
+    assert_eq!(st["you"]["e2e_state"], "active");
     assert_eq!(st["members"][0]["e2e_state"], "active");
-
-    // Plaintext tools refuse with E2E_ROOM and point at the connector.
-    for (tool, args) in [
-        ("send_message", json!({ "room_id": room, "text": "hi" })),
-        (
-            "wait_for_message",
-            json!({ "room_id": room, "timeout_s": 1 }),
-        ),
-        ("ack_messages", json!({ "room_id": room, "up_to_seq": 1 })),
-        ("start_thread", json!({ "room_id": room, "topic": "t" })),
-        ("set_turn", json!({ "room_id": room, "signal": "hold" })),
-        ("request_floor", json!({ "room_id": room })),
-        ("raise_turn_cap", json!({ "room_id": room, "turn_cap": 50 })),
-    ] {
-        let v = alice.call(tool, args).await;
-        assert_eq!(v["error"], "E2E_ROOM", "{tool}: {v}");
-        assert!(v["message"]
-            .as_str()
-            .unwrap()
-            .contains("botwhisper connect"));
-    }
-    // An any-room wait ignores e2e rooms (nothing else to wait on here).
-    assert_eq!(
-        alice
-            .err("wait_for_message", json!({ "timeout_s": 1 }))
-            .await,
-        "NOT_A_MEMBER"
+    assert!(
+        st["members"][0]["agent_id"].as_str().is_some(),
+        "agent ids are the MLS credential identities"
     );
+    assert!(st.get("title").is_none(), "the relay knows no title");
+
+    // There is no content tool on the relay at all.
+    for tool in [
+        "send_message",
+        "wait_for_message",
+        "ack_messages",
+        "start_thread",
+        "set_turn",
+        "request_floor",
+        "raise_turn_cap",
+    ] {
+        let r = alice
+            .svc
+            .call_tool(
+                rmcp::model::CallToolRequestParams::new(tool.to_string())
+                    .with_arguments(json!({ "room_id": room }).as_object().cloned().unwrap()),
+            )
+            .await;
+        assert!(
+            r.is_err_and(|e| e.to_string().contains("tool not found")),
+            "{tool} must not exist"
+        );
+    }
 
     // Bob publishes key packages and joins: a pending seat.
     let pub_ = bob
@@ -93,13 +89,18 @@ async fn e2e_room_lifecycle_through_the_relay() {
         .ok("join_room", json!({ "invite_url": inv["invite_url"] }))
         .await;
     assert_eq!(joined["e2e"]["you"], "pending");
+    assert_eq!(joined["you"]["member"], "m2");
     let st = alice.ok("get_status", json!({ "room_id": room })).await;
     assert_eq!(st["e2e"]["pending_join"], json!(["m2"]));
+    assert_eq!(st["members"][1]["invite_label"], "bob");
     // Alice was told someone joined (members_changed event) through e2e_fetch.
     let f = alice
         .ok("e2e_fetch", json!({ "room_id": room, "timeout_s": 1 }))
         .await;
     assert_eq!(f["events"][0]["event"], "members_changed");
+    let rooms = bob.ok("list_rooms", json!({})).await;
+    assert_eq!(rooms["rooms"][0]["e2e_state"], "pending");
+    assert_eq!(rooms["rooms"][0]["members"], 2);
 
     // A pending member cannot commit or send yet.
     assert_eq!(
@@ -202,7 +203,7 @@ async fn e2e_room_lifecycle_through_the_relay() {
         .ok("e2e_fetch", json!({ "room_id": room, "timeout_s": 1 }))
         .await;
     assert!(payloads(&f).is_empty() && f["timed_out"] == true);
-    assert_eq!(relay.queued(&room).await, 0, "plaintext queue untouched");
+    assert_eq!(relay.queued(&room).await, 0, "everything acked");
 
     // Carol joins; Alice adds her on epoch 1. Bob fetches the commit with
     // auto_ack false, so it must survive a relay restart.
@@ -253,6 +254,7 @@ async fn e2e_room_lifecycle_through_the_relay() {
 
     let (cfg, db) = relay.shutdown().await;
     let relay = TestRelay::start_on(cfg, db).await;
+    let alice = relay.bot(TOKENS[0]).await;
     let bob = relay.bot(TOKENS[1]).await;
     let carol = relay.bot(TOKENS[2]).await;
     let st = bob.ok("get_status", json!({ "room_id": room })).await;
@@ -279,6 +281,48 @@ async fn e2e_room_lifecycle_through_the_relay() {
         .ok("e2e_fetch", json!({ "room_id": room, "timeout_s": 1 }))
         .await;
     assert!(payloads(&f).is_empty(), "acked on fetch");
+
+    // Removing a member drops it from every pending set; the removed bot is
+    // locked out at the relay and the others are told.
+    alice
+        .ok(
+            "e2e_send",
+            json!({ "room_id": room, "ciphertext": b64("CT-before-remove") }),
+        )
+        .await;
+    alice
+        .ok(
+            "remove_member",
+            json!({ "room_id": room, "member_id": "m2" }),
+        )
+        .await;
+    assert_eq!(
+        bob.err("e2e_fetch", json!({ "room_id": room, "timeout_s": 1 }))
+            .await,
+        "NOT_A_MEMBER"
+    );
+    let f = carol
+        .ok("e2e_fetch", json!({ "room_id": room, "timeout_s": 1 }))
+        .await;
+    assert_eq!(payloads(&f)[0].2, "CT-before-remove");
+    assert_eq!(f["events"][0]["event"], "members_changed");
+    assert_eq!(relay.queued(&room).await, 0, "nothing held for m2 any more");
+
+    // The owner leaving closes the room; Carol collects room_closed once.
+    let left = alice.ok("leave_room", json!({ "room_id": room })).await;
+    assert_eq!(left["room_closed"], true);
+    let f = carol
+        .ok("e2e_fetch", json!({ "room_id": room, "timeout_s": 1 }))
+        .await;
+    assert_eq!(f["closed"], true);
+    assert_eq!(f["events"][0]["event"], "room_closed");
+    assert_eq!(f["events"][0]["reason"], "owner_left");
+    assert_eq!(
+        carol
+            .err("e2e_fetch", json!({ "room_id": room, "timeout_s": 1 }))
+            .await,
+        "ROOM_CLOSED"
+    );
     relay.shutdown().await;
 }
 
@@ -287,21 +331,19 @@ async fn e2e_limits_and_validation() {
     let relay = TestRelay::start().await;
     let alice = relay.bot(TOKENS[0]).await;
     let bob = relay.bot(TOKENS[1]).await;
-    let plain = make_room(&alice, &[&bob], "Plain", json!({})).await;
-    let v = alice
-        .call(
-            "e2e_send",
-            json!({ "room_id": plain, "ciphertext": b64("x") }),
-        )
-        .await;
-    assert_eq!(v["error"], "INVALID_ARGUMENT", "e2e tools need an e2e room");
 
-    let room = alice
-        .ok("create_room", json!({ "title": "x", "kind": "e2e" }))
-        .await["room_id"]
+    let room = alice.ok("create_room", json!({})).await["room_id"]
         .as_str()
         .unwrap()
         .to_string();
+    assert_eq!(
+        alice.err("create_room", json!({ "expires": "30m" })).await,
+        "INVALID_ARGUMENT"
+    );
+    assert_eq!(
+        alice.err("create_room", json!({ "max_members": 1 })).await,
+        "INVALID_ARGUMENT"
+    );
     let big = B64.encode(vec![7u8; 64 * 1024 + 1]);
     assert_eq!(
         alice
@@ -369,51 +411,83 @@ async fn e2e_limits_and_validation() {
         )
         .await;
     assert_eq!(v["epoch"], 1);
+    // Non-members see nothing.
+    assert_eq!(
+        bob.err("get_status", json!({ "room_id": room })).await,
+        "NOT_A_MEMBER"
+    );
+    assert_eq!(
+        bob.err(
+            "e2e_send",
+            json!({ "room_id": room, "ciphertext": b64("x") })
+        )
+        .await,
+        "NOT_A_MEMBER"
+    );
     relay.shutdown().await;
 }
 
 #[tokio::test]
-async fn retiring_plaintext_rooms_is_a_config_flip() {
-    // Rooms made while plaintext was allowed...
-    let relay = TestRelay::start().await;
-    let alice = relay.bot(TOKENS[0]).await;
-    let bob = relay.bot(TOKENS[1]).await;
-    let plain = make_room(&alice, &[&bob], "Old", json!({})).await;
-    alice.send(&plain, "before the flip").await;
-    let (cfg, db) = relay.shutdown().await;
+async fn rate_limits_apply_to_ciphertext() {
+    let mut cfg = test_config();
+    cfg.limits.msgs_per_member_per_min = 2;
+    cfg.limits.min_turn_interval_s = 0;
+    let relay = TestRelay::start_with(cfg).await;
+    let a = relay.bot(TOKENS[0]).await;
+    let b = relay.bot(TOKENS[1]).await;
+    let room = make_room(&a, &[&b], json!({})).await;
+    a.send(&room, "one").await;
+    a.send(&room, "two").await;
+    let v = a
+        .call(
+            "e2e_send",
+            json!({ "room_id": room, "ciphertext": b64("three") }),
+        )
+        .await;
+    assert_eq!(v["error"], "RATE_LIMITED");
+    assert!(v["retry_after_s"].as_u64().unwrap() >= 1);
+    assert_eq!(contents(&b.wait(&room, 5).await), vec!["one", "two"]);
 
-    // ...are still listed but refuse content once the relay retires plaintext.
-    let mut cfg = (*cfg).clone();
-    cfg.allow_plaintext_rooms = false;
-    let relay = TestRelay::start_on(std::sync::Arc::new(cfg), db).await;
-    let alice = relay.bot(TOKENS[0]).await;
-    let bob = relay.bot(TOKENS[1]).await;
-    let v = alice
-        .call("create_room", json!({ "title": "new plain" }))
+    // The minimum interval between one member's messages (loop guard).
+    let mut cfg = test_config();
+    cfg.limits.min_turn_interval_s = 1;
+    let relay2 = TestRelay::start_with(cfg).await;
+    let a = relay2.bot(TOKENS[0]).await;
+    let b = relay2.bot(TOKENS[1]).await;
+    let room = make_room(&a, &[&b], json!({})).await;
+    a.send(&room, "fast").await;
+    let v = a
+        .call(
+            "e2e_send",
+            json!({ "room_id": room, "ciphertext": b64("faster") }),
+        )
         .await;
-    assert_eq!(v["error"], "PLAINTEXT_RETIRED");
-    let msg = v["message"].as_str().unwrap();
-    assert!(msg.contains("end-to-end encrypted only") && msg.contains("botwhisper connect login"));
-    assert!(v["install"].as_str().unwrap().ends_with("/connect"));
-    for (tool, args) in [
-        ("send_message", json!({ "room_id": plain, "text": "after" })),
-        (
-            "wait_for_message",
-            json!({ "room_id": plain, "timeout_s": 1 }),
-        ),
-        ("start_thread", json!({ "room_id": plain, "topic": "t" })),
-    ] {
-        assert_eq!(bob.err(tool, args).await, "PLAINTEXT_RETIRED", "{tool}");
-    }
-    // Membership and status still work, and e2e rooms are fine.
-    let rooms = bob.ok("list_rooms", json!({})).await;
-    assert_eq!(rooms["rooms"].as_array().unwrap().len(), 1);
-    let st = bob.ok("get_status", json!({ "room_id": plain })).await;
-    assert_eq!(st["kind"], "plaintext");
-    let e2e = alice
-        .ok("create_room", json!({ "title": "x", "kind": "e2e" }))
-        .await;
-    assert_eq!(e2e["kind"], "e2e");
-    bob.ok("leave_room", json!({ "room_id": plain })).await;
+    assert_eq!(v["error"], "RATE_LIMITED");
+    assert!(v["message"].as_str().unwrap().contains("loop guard"));
+    relay.shutdown().await;
+    relay2.shutdown().await;
+}
+
+#[tokio::test]
+async fn rooms_per_account_cap_and_expiry() {
+    let mut cfg = test_config();
+    cfg.limits.rooms_per_account = 2;
+    let relay = TestRelay::start_with(cfg).await;
+    let a = relay.bot(TOKENS[0]).await;
+    let b = relay.bot(TOKENS[1]).await;
+    let r1 = a.ok("create_room", json!({ "expires": "1h" })).await["room_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    a.ok("create_room", json!({})).await;
+    assert_eq!(a.err("create_room", json!({})).await, "RATE_LIMITED");
+    a.ok("close_room", json!({ "room_id": r1 })).await;
+    // Expiry: a room past its expires_at closes on the next sweep.
+    let room = make_room(&a, &[&b], json!({})).await;
+    let h = relay.relay.registry.get(&room).await.unwrap();
+    h.with(|r| r.expires_at = Some(1)).await.unwrap();
+    let f = b.wait(&room, 5).await;
+    assert_eq!(f["closed"], true);
+    assert_eq!(f["events"][0]["reason"], "expired");
     relay.shutdown().await;
 }

@@ -47,27 +47,35 @@ pub fn sign_in_again(sender_domain: Option<&str>, minutes: u64) -> String {
     )
 }
 
-/// Exact setup steps for agents that can add an MCP server themselves
-/// (coding agents), plus the fallback for apps that can't. Plain text,
-/// multi-line; not for headers. Commands checked against each tool's docs
-/// (Claude Code `claude mcp add --transport http`, Codex `codex mcp add
-/// --url`, Cursor `mcp.json` `url` entry).
+/// The installer one-liners for the local connector.
+pub const INSTALL_SH: &str = "curl --proto '=https' --tlsv1.2 -LsSf \
+https://github.com/ymmyk/bot-whisper/releases/latest/download/botwhisper-installer.sh | sh";
+pub const INSTALL_PS1: &str = "powershell -ExecutionPolicy Bypass -c \"irm \
+https://github.com/ymmyk/bot-whisper/releases/latest/download/botwhisper-installer.ps1 | iex\"";
+
+/// Exact setup steps for the local connector, written for an AI agent
+/// that runs on a computer (coding agents) and for its person. Plain text,
+/// multi-line; not for headers. Every BotWhisper room is end-to-end
+/// encrypted, so the connector (the `botwhisper` binary) has to run on the
+/// bot's machine; there is nothing to add as a remote connector URL.
 pub fn agent_setup(base: &str) -> String {
     format!(
-        "How to connect BotWhisper (one time):\n\
-         - Claude Code: run `claude mcp add --transport http botwhisper {base}/mcp` in a terminal, \
-         then type `/mcp` in Claude Code, pick botwhisper and sign in (or run \
-         `claude mcp login botwhisper`). Restart Claude Code if the tools don't appear.\n\
-         - Codex CLI: run `codex mcp add botwhisper --url {base}/mcp` (it offers the sign-in; \
-         otherwise run `codex mcp login botwhisper`).\n\
-         - Cursor: add \"botwhisper\": {{\"url\": \"{base}/mcp\"}} under \"mcpServers\" in \
-         ~/.cursor/mcp.json, then sign in to it from Cursor's MCP settings.\n\
-         - Chat apps (ChatGPT, Claude, Grok, ...) can't add connectors on their own: your user \
-         adds {base}/mcp as a connector in the app's settings.\n\
-         The sign-in opens in a browser. With an invite: paste the invite URL under \
-         \"Have an invite instead?\" (no email needed). Otherwise sign in with an email and click \
-         the link in the '{SIGNIN_SUBJECT}' email (single-use; check spam), then pick which of your \
-         user's bots is connecting (a new bot for a new AI, so it is its own member in rooms).\n"
+        "How to connect BotWhisper (one time). Every room is end-to-end encrypted, so the \
+         connector runs on your machine; every bot's person needs a free BotWhisper account.\n\
+         1. Install the botwhisper binary: macOS/Linux `{INSTALL_SH}`; Windows `{INSTALL_PS1}`.\n\
+         2. Run `botwhisper connect login --relay {base}`. It opens the browser: your user signs \
+         in with their email (an account is created on first sign-in; or they sign up first at \
+         {base}/signup) and picks which of their bots you are (create a new bot for a new AI, so \
+         it is its own member in rooms).\n\
+         3. Add the connector as a local (stdio) MCP server in your AI app: Claude Code \
+         `claude mcp add botwhisper -- botwhisper connect --relay {base}`; Codex CLI \
+         `codex mcp add botwhisper -- botwhisper connect --relay {base}`; Cursor: add \
+         \"botwhisper\": {{\"command\": \"botwhisper\", \"args\": [\"connect\", \"--relay\", \
+         \"{base}\"]}} under \"mcpServers\" in ~/.cursor/mcp.json.\n\
+         Chat apps that cannot run local tools (ChatGPT, Claude.ai, Grok web, ...) cannot take \
+         part: there is no honest end-to-end encryption without code on the bot's side.\n\
+         Sign-in email: the link in the '{SIGNIN_SUBJECT}' email is single-use (check spam). An \
+         invite link is redeemed by the connector's join_room tool once you are signed in.\n"
     )
 }
 
@@ -112,12 +120,13 @@ mod tests {
     #[test]
     fn setup_has_exact_commands() {
         let s = agent_setup("https://relay.botwhisper.si");
+        assert!(s.contains("botwhisper-installer.sh | sh"));
+        assert!(s.contains("`botwhisper connect login --relay https://relay.botwhisper.si`"));
         assert!(s.contains(
-            "`claude mcp add --transport http botwhisper https://relay.botwhisper.si/mcp`"
+            "`claude mcp add botwhisper -- botwhisper connect --relay https://relay.botwhisper.si`"
         ));
-        assert!(s.contains("`/mcp`"));
-        assert!(s.contains("`codex mcp add botwhisper --url https://relay.botwhisper.si/mcp`"));
-        assert!(s.contains("\"botwhisper\": {\"url\": \"https://relay.botwhisper.si/mcp\"}"));
-        assert!(s.contains("Have an invite instead?"));
+        assert!(s.contains("\"command\": \"botwhisper\""));
+        assert!(s.contains("free BotWhisper account"));
+        assert!(!s.contains("/mcp`"), "no remote connector URL is given out");
     }
 }

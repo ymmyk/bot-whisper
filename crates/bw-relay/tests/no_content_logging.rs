@@ -1,6 +1,7 @@
-//! Proves the relay never logs message content, even at its most verbose
-//! setting. This test owns the process-global tracing subscriber, so it
-//! lives in its own test binary.
+//! Proves the relay never logs what it relays, even at its most verbose
+//! setting: ciphertext (and the text it might stand for), invite labels,
+//! room ids, doorbell secrets. This test owns the process-global tracing
+//! subscriber, so it lives in its own test binary.
 
 mod common;
 
@@ -9,6 +10,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use common::*;
 use serde_json::json;
 use tracing_subscriber::{fmt::MakeWriter, EnvFilter};
@@ -47,10 +49,9 @@ async fn relay_never_logs_message_content() {
     let relay = TestRelay::start().await;
     let a = relay.bot(TOKENS[0]).await;
     let b = relay.bot(TOKENS[1]).await;
-    let room = make_room(&a, &[&b], "Quiet", json!({ "turn_mode": "free" })).await;
+    let room = make_room(&a, &[&b], json!({})).await;
 
     let sentinel = "CANARY-7c1d2e-the-quick-brown-fox";
-    let display = "NAME-CANARY-b2a1";
     let c = Bot::connect(&relay.url(), TOKENS[2]).await.unwrap();
     let inv = a
         .ok(
@@ -58,9 +59,17 @@ async fn relay_never_logs_message_content() {
             json!({ "room_id": room, "label": "LABEL-CANARY-3f" }),
         )
         .await;
+    c.ok("join_room", json!({ "invite_url": inv["invite_url"] }))
+        .await;
     c.ok(
-        "join_room",
-        json!({ "invite_url": inv["invite_url"], "display_name": display }),
+        "e2e_publish_key_packages",
+        json!({ "key_packages": [B64.encode("KEYPACKAGE-CANARY-1a")] }),
+    )
+    .await;
+    a.ok(
+        "e2e_commit",
+        json!({ "room_id": room, "epoch": 1, "commit": B64.encode("COMMIT-CANARY-2b"),
+                "welcome": B64.encode("WELCOME-CANARY-4c"), "welcome_to": ["m3"], "added": ["m3"] }),
     )
     .await;
 
@@ -69,14 +78,14 @@ async fn relay_never_logs_message_content() {
     // Exercise the error paths too (they format messages).
     let _ = b
         .call(
-            "send_message",
-            json!({ "room_id": room, "text": sentinel, "turn": "done" }),
+            "e2e_send",
+            json!({ "room_id": room, "ciphertext": "not base64 CANARY-err" }),
         )
         .await;
     let _ = c
         .call(
-            "send_message",
-            json!({ "room_id": "nope", "text": sentinel }),
+            "e2e_send",
+            json!({ "room_id": "nope", "ciphertext": B64.encode(sentinel) }),
         )
         .await;
     let _ = a.call("set_doorbell", json!({ "room_id": room, "webhook_url": "http://127.0.0.1:9199/x", "secret": sentinel })).await;
@@ -106,16 +115,14 @@ async fn relay_never_logs_message_content() {
         "the relay did log something at trace level"
     );
     for needle in [
-        sentinel,
-        display,
-        "LABEL-CANARY",
-        &room,
-        "TOPIC-CANARY",
-        "TOKEN-CANARY",
-        "9199",
+        sentinel.to_string(),
+        B64.encode(sentinel),
+        "CANARY".to_string(),
+        room.clone(),
+        "9199".to_string(),
     ] {
         assert!(
-            !logs.contains(needle),
+            !logs.contains(&needle),
             "logs must not contain {needle:?}; got:\n{logs}"
         );
     }

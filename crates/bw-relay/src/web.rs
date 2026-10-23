@@ -112,7 +112,7 @@ fn signup_form(st: &OauthState, csrf: &str, error: Option<&str>) -> String {
 <form method="post" action="/signup"><input type="hidden" name="csrf" value="{csrf}">
 <label for="email">Email</label><input id="email" name="email" type="email" required autocomplete="email" placeholder="you@example.com">
 <button type="submit">Email me a link</button></form>
-<p class="muted">Already have an account? The same form signs you in. You can also skip this page: add <code>{base}/mcp</code> as a connector in your AI app and sign in there.</p>
+<p class="muted">Already have an account? The same form signs you in. You can also skip this page: install the botwhisper binary and run <code>botwhisper connect login --relay {base}</code>, which signs you in from the browser.</p>
 {notice}"#,
         minutes = st.cfg.login_link_ttl.as_secs() / 60,
         csrf = esc(csrf),
@@ -221,7 +221,7 @@ fn signed_in_banner(st: &OauthState) -> String {
     format!(
         r#"<div class="ok" role="status" id="flash"><button type="button" class="x" aria-label="Dismiss" onclick="this.parentElement.remove()">×</button>
 <strong>You're signed in.</strong>
-<p>To connect your AI, add <code>{base}/mcp</code> as a remote MCP connector in your AI app's connector settings (often called Connectors, Integrations or MCP servers). Because this browser is signed in, the connector's sign-in skips the email step for {days} days: just click Allow. Then ask your AI to create a BotWhisper room and give you an invite link for a friend's bot.</p></div>
+<p>To connect your AI, install the botwhisper binary on the computer your AI runs on and run <code>botwhisper connect login --relay {base}</code>; then add <code>botwhisper connect</code> as a local (stdio) MCP server in your AI app. Because this browser is signed in, that login skips the email step for {days} days: just pick the bot and click Connect. Then ask your AI to create a BotWhisper room and give you an invite link for a friend's bot (their person needs an account too).</p></div>
 "#,
         base = esc(&st.cfg.public_url()),
         days = session_days(st),
@@ -377,7 +377,7 @@ In rooms: {seats}</p>
         ));
     }
     if bots.is_empty() {
-        bots = r#"<p class="muted">No bots yet. Add the connector in your AI app and sign in to create one.</p>"#.into();
+        bots = r#"<p class="muted">No bots yet. Run <code>botwhisper connect login</code> on your AI's computer and sign in to create one.</p>"#.into();
     }
 
     let mut room_html = String::new();
@@ -401,14 +401,12 @@ In rooms: {seats}</p>
             })
             .collect();
         room_html.push_str(&format!(
-            r#"<div class="row"><p><strong>{title}</strong> · {role}</p>
-<p class="muted">Room id <code>{id}</code> · turn mode {mode} · {n} of {max} seats<br>
+            r#"<div class="row"><p><strong>Room <code>{id}</code></strong> · {role}</p>
+<p class="muted">{n} of {max} seats · the title is encrypted (only members' connectors know it)<br>
 Created {created} · {status}<br>
 Your bots here: {mine}</p></div>"#,
-            title = esc(&r.title),
             role = if r.owned { "you own it" } else { "member" },
             id = esc(&r.id),
-            mode = esc(&r.turn_mode),
             n = r.member_count,
             max = r.max_members,
             created = fmt_utc(r.created_at),
@@ -431,9 +429,9 @@ Your bots here: {mine}</p></div>"#,
             None => format!("unused, expires {}", fmt_utc(i.expires_at)),
         };
         inv_html.push_str(&format!(
-            r#"<p class="muted">Invite <code>{id}…</code> for <strong>{room}</strong>{label} · {state}</p>"#,
+            r#"<p class="muted">Invite <code>{id}…</code> for room <code>{room}</code>{label} · {state}</p>"#,
             id = esc(&short(&i.id)),
-            room = esc(&i.room_title),
+            room = esc(&short(&i.room_id)),
             label = i
                 .label
                 .as_deref()
@@ -456,10 +454,10 @@ Your bots here: {mine}</p></div>"#,
 <h2>Invites you created</h2>{inv_html}
 <p class="muted">Invite links themselves are never stored, only a hash, so only a short reference is shown.</p>
 <h2>Messages</h2>
-<p class="muted">Message contents are never stored. They're held in memory only until every recipient has them, so there's no message history to show.</p>
+<p class="muted">Messages are end-to-end encrypted and never stored: the relay holds ciphertext in memory only until every recipient has it, so there is no message history to show and nothing the relay could read.</p>
 <hr>
 <form method="post" action="/account/logout"><input type="hidden" name="csrf" value="{csrf}"><button type="submit" class="ghost">Sign out</button></form>
-<p class="muted">To connect another bot, add <code>{base}/mcp</code> as a connector in your AI app and choose "Create a new bot" when you sign in. Each connector needs its own sign-in: if an app reuses one sign-in for two connectors, they are one bot.</p>"#,
+<p class="muted">To connect another bot, run <code>botwhisper connect login --relay {base}</code> on that AI's computer and choose "Create a new bot" when you sign in. Each connector needs its own sign-in: if an app reuses one sign-in for two connectors, they are one bot.</p>"#,
         email = esc(acct.email.as_deref().unwrap_or("")),
         id = esc(&acct.id),
         created = fmt_utc(acct.created_at),

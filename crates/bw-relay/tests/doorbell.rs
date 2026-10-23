@@ -76,7 +76,7 @@ async fn doorbell_payload_is_signed_and_content_free() {
     let relay = TestRelay::start().await;
     let a = relay.bot(TOKENS[0]).await;
     let b = relay.bot(TOKENS[1]).await;
-    let room = make_room(&a, &[&b], "Bells", json!({ "turn_mode": "alternate" })).await;
+    let room = make_room(&a, &[&b], json!({})).await;
     let (url, hook) = start_hook(0).await;
 
     // https-only unless the relay allows insecure doorbells (tests do).
@@ -84,7 +84,7 @@ async fn doorbell_payload_is_signed_and_content_free() {
         .ok(
             "set_doorbell",
             json!({ "room_id": room, "webhook_url": url, "secret": "shh-secret-1", "auth_header": "Key abc",
-                    "events": ["thread_started", "turn", "addressed", "thread_done", "message"] }),
+                    "events": ["thread_started", "turn", "thread_done", "message"] }),
         )
         .await;
     assert_eq!(set["scope"], "room");
@@ -125,15 +125,14 @@ async fn doorbell_payload_is_signed_and_content_free() {
     keys.sort_unstable();
     assert_eq!(
         keys,
-        ["event", "room", "seq", "thread", "ts", "turn", "v"],
+        ["event", "room", "seq", "ts", "turn", "v"],
         "payload shape"
     );
     assert_eq!(payload["v"], 1);
-    assert_eq!(payload["event"], "turn");
+    assert_eq!(payload["event"], "message");
     assert_eq!(payload["room"], room);
-    assert_eq!(payload["seq"], 1);
-    assert_eq!(payload["turn"], "yours");
-    assert!(payload["thread"].as_str().unwrap().starts_with("adhoc-"));
+    assert_eq!(payload["seq"], 3, "after the add commit and Welcome");
+    assert_eq!(payload["turn"], "open");
     let text = String::from_utf8_lossy(body);
     assert!(
         !text.contains(secret_text),
@@ -161,7 +160,7 @@ async fn doorbell_payload_is_signed_and_content_free() {
     assert_eq!(headers.get("authorization").unwrap(), "Key abc");
     assert_eq!(headers.get("content-type").unwrap(), "application/json");
 
-    // The woken agent calls wait_for_message, which returns immediately.
+    // The woken connector fetches, which returns immediately.
     let got = b.wait(&room, 5).await;
     assert_eq!(contents(&got), vec![secret_text]);
 
@@ -181,7 +180,7 @@ async fn doorbell_retries_with_backoff_and_coalesces() {
     let relay = TestRelay::start().await;
     let a = relay.bot(TOKENS[0]).await;
     let b = relay.bot(TOKENS[1]).await;
-    let room = make_room(&a, &[&b], "Retry", json!({ "turn_mode": "free" })).await;
+    let room = make_room(&a, &[&b], json!({})).await;
     let (url, hook) = start_hook(2).await;
     b.ok("set_doorbell", json!({ "room_id": room, "webhook_url": url, "secret": "shh-secret-2", "events": ["message", "turn"] }))
         .await;
@@ -197,7 +196,7 @@ async fn doorbell_retries_with_backoff_and_coalesces() {
                 .unwrap()
         })
         .collect();
-    assert_eq!(seqs, vec![1, 1, 1]);
+    assert_eq!(seqs, vec![3, 3, 3]);
     let stats = relay.relay.registry.bells.stats();
     assert_eq!(stats.delivered.load(Ordering::Relaxed), 1);
     assert_eq!(stats.failed.load(Ordering::Relaxed), 0);

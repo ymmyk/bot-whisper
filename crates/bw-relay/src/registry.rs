@@ -2,14 +2,14 @@
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
-use bw_proto::{ErrorCode, MemberId, TurnMode};
+use bw_proto::{ErrorCode, MemberId};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
 use crate::{
     auth::AgentId,
     config::RelayConfig,
-    db::{Db, RoomKind, ThreadStart},
+    db::Db,
     doorbell::{self, Doorbells},
     error::RelayError,
     room::{Member, Room, RoomHandle},
@@ -23,16 +23,11 @@ pub struct Registry {
     pub cfg: Arc<RelayConfig>,
 }
 
-/// Options for a new room.
+/// Options for a new room. No title: it travels inside the ciphertext.
 #[derive(Debug, Clone)]
 pub struct NewRoom {
-    pub title: String,
-    pub display_name: Option<String>,
     pub expires_in: Option<Duration>,
     pub max_members: u32,
-    pub turn_mode: TurnMode,
-    pub thread_start: ThreadStart,
-    pub kind: RoomKind,
 }
 
 impl Registry {
@@ -62,9 +57,6 @@ impl Registry {
                 ErrorCode::Unauthorized,
                 "invite-scoped guests cannot create rooms; sign in with an account",
             ));
-        }
-        if opts.kind == RoomKind::Plaintext && !self.cfg.allow_plaintext_rooms {
-            return Err(RelayError::plaintext_retired(&self.cfg.public_url()));
         }
         let max_rooms = self.cfg.limits.rooms_per_account;
         if max_rooms > 0 && self.db.count_rooms_owned_by(agent.limit_key())? >= max_rooms {
@@ -176,7 +168,6 @@ impl Registry {
         &self,
         agent: &AgentId,
         invite_url: &str,
-        display_name: Option<String>,
     ) -> Result<(RoomHandle, Member), RelayError> {
         if agent.room_scope().is_some() {
             return Err(RelayError::new(
@@ -221,9 +212,9 @@ impl Registry {
             ));
         }
         let handle = self.get(&invite.room_id).await?;
-        let id = agent.id.clone();
+        let agent = agent.clone();
         let member = handle
-            .with(move |room| room.join(&invite, &id, display_name, now))
+            .with(move |room| room.join(&invite, &agent, now))
             .await??;
         Ok((handle, member))
     }

@@ -97,12 +97,7 @@ async fn mls_group_over_the_relay() {
     let bob = Identity::new(&me_b).unwrap();
     let carol = Identity::new(&me_c).unwrap();
 
-    let room = a
-        .ok(
-            "create_room",
-            json!({ "title": "(encrypted)", "kind": "e2e" }),
-        )
-        .await["room_id"]
+    let room = a.ok("create_room", json!({})).await["room_id"]
         .as_str()
         .unwrap()
         .to_string();

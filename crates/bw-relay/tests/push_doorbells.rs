@@ -109,7 +109,7 @@ fn content_free(body: &[u8], secret_text: &str) -> Value {
         .map(String::as_str)
         .collect();
     keys.sort_unstable();
-    assert_eq!(keys, ["event", "room", "seq", "thread", "ts", "turn", "v"]);
+    assert_eq!(keys, ["event", "room", "seq", "ts", "turn", "v"]);
     payload
 }
 
@@ -122,7 +122,7 @@ async fn ntfy_is_the_default_with_a_generated_private_topic() {
     let relay = TestRelay::start_with(cfg).await;
     let a = relay.bot(TOKENS[0]).await;
     let b = relay.bot(TOKENS[1]).await;
-    let room = make_room(&a, &[&b], "Ntfy", json!({ "turn_mode": "free" })).await;
+    let room = make_room(&a, &[&b], json!({})).await;
 
     // No arguments at all: ntfy on the relay's server, random topic.
     let set = b
@@ -168,7 +168,7 @@ async fn ntfy_is_the_default_with_a_generated_private_topic() {
         let payload = content_free(body, secret_text);
         assert_eq!(payload["event"], "message");
         assert_eq!(payload["room"], room);
-        assert_eq!(payload["seq"], 1);
+        assert_eq!(payload["seq"], 3, "after the add commit and Welcome");
         assert_eq!(payload["turn"], "open");
     }
     let stats = relay.relay.registry.bells.stats();
@@ -248,7 +248,7 @@ async fn bot_default_doorbell_covers_rooms_joined_later() {
     assert_eq!(got["doorbell"]["topic"], topic);
     assert_eq!(got["doorbell"]["status"], "never");
 
-    let room = make_room(&a, &[&b], "Later", json!({ "turn_mode": "free" })).await;
+    let room = make_room(&a, &[&b], json!({})).await;
     a.send(&room, "hello").await;
     let hits = wait_for_hits(&mock, 1).await;
     assert_eq!(hits[0].0, topic);
@@ -285,7 +285,7 @@ async fn webpush_is_encrypted_and_vapid_signed_and_410_kills_it() {
     let relay = TestRelay::start().await;
     let a = relay.bot(TOKENS[0]).await;
     let b = relay.bot(TOKENS[1]).await;
-    let room = make_room(&a, &[&b], "Push", json!({ "turn_mode": "free" })).await;
+    let room = make_room(&a, &[&b], json!({})).await;
 
     // The relay publishes its VAPID public key.
     let key: Value = reqwest::get(format!("{}/push/vapid-public-key", relay.base()))
@@ -419,7 +419,7 @@ async fn gotify_and_pushover_are_plain_posts() {
     let a = relay.bot(TOKENS[0]).await;
     let b = relay.bot(TOKENS[1]).await;
     let c = relay.bot(TOKENS[2]).await;
-    let room = make_room(&a, &[&b, &c], "Posts", json!({ "turn_mode": "free" })).await;
+    let room = make_room(&a, &[&b, &c], json!({})).await;
     let set = b
         .ok(
             "set_doorbell",

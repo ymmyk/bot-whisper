@@ -6,6 +6,14 @@ numbered item of TASK-phase3 is its own commit (item 0 in four: 0a-0d).
 - **0a** Schema collapsed into one initial schema, migration machinery and
   the pre-bot code fallback removed (`db.rs`, `oauth.rs`); doorbell rows
   are JSON `config` only.
+- **0b** Plaintext path removed: `bw-proto` envelope, room `kind`, the
+  plaintext queue, threads/turns in the room actor (back as round table in
+  item 1), the content tools, `BW_ALLOW_PLAINTEXT_ROOMS`. `/mcp` is the
+  connector protocol only; relay texts (index, 401, instructions, invite
+  page, consent/account pages, mail) describe the local connector and the
+  account requirement. Tests: `exchange`, `free_mode`, `guards` deleted;
+  the shared harness drives `e2e_send` / `e2e_fetch`; `e2e_relay` grew
+  removal, owner-leave, rate-limit, cap and expiry coverage.
 
 # Phase 2 progress (push doorbells, `botwhisper listen`, E2E milestone M1)
 

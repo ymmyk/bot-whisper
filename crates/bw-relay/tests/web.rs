@@ -138,7 +138,7 @@ async fn signup_page_renders_and_needs_csrf() {
     assert!(page.contains("Create your BotWhisper account"));
     assert!(page.contains(r#"name="email" type="email""#));
     assert!(
-        page.contains("plaintext relay"),
+        page.contains("End-to-end encrypted."),
         "same card style and notice"
     );
 
@@ -228,7 +228,7 @@ async fn confirm_link_signs_in_once_and_expired_links_fail() {
         .await
         .unwrap();
     assert!(page.contains("You're signed in."));
-    assert!(page.contains(&format!("{base}/mcp")));
+    assert!(page.contains(&format!("botwhisper connect login --relay {base}")));
     assert!(page.contains("skips the email step for 30 days"));
     assert!(page.contains("Dismiss"));
     // ...and not on reload.
@@ -263,7 +263,7 @@ async fn confirm_link_signs_in_once_and_expired_links_fail() {
         .await
         .unwrap();
     assert!(acct.contains("me@example.com"));
-    assert!(acct.contains("Message contents are never stored"));
+    assert!(acct.contains("end-to-end encrypted and never stored"));
     assert!(acct.contains("All times are UTC"));
 
     // Single use.
@@ -392,14 +392,13 @@ async fn account_page_shows_only_own_data_and_disconnect_needs_csrf() {
     assert!(page.contains("alice@example.com") && page.contains("Alice Claude"));
     assert!(page.contains(&format!("{alice_id}:bwc_alice1")));
     assert!(page.contains("Connected to <strong>Alice Claude</strong>"));
-    assert!(page.contains("Alice room") && page.contains(&room_id));
+    assert!(page.contains(&room_id) && page.contains("title is encrypted"));
     assert!(page.contains("you own it") && page.contains("for Sam") && page.contains("unused"));
     assert!(page.contains("Rename") && page.contains("Delete"));
     for other in [
         "bob@example.com",
         "Bob ChatGPT",
         "bwc_bob1",
-        "Bob room",
         bob_id.as_str(),
     ] {
         assert!(!page.contains(other), "Alice must not see {other}");
@@ -619,7 +618,7 @@ async fn index_redirects_only_a_valid_session_to_account() {
     let r = anon.get(format!("{base}/")).send().await.unwrap();
     assert_eq!(r.status(), StatusCode::OK);
     check_headers(&r);
-    assert!(r.text().await.unwrap().starts_with("BotWhisper relay."));
+    assert!(r.text().await.unwrap().starts_with("BotWhisper relay:"));
 
     // Garbage cookie: the text index, no redirect.
     let r = anon
