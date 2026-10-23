@@ -4,11 +4,10 @@
 //!
 //! - **OAuth 2.1 access tokens** issued by `oauth.rs` (the normal way in).
 //!   The token is opaque; only its SHA-256 is stored. The agent identity is
-//!   `<account>:<client>`, so each connected MCP client is its own agent and
+//!   the bot's agent id (`<account>:<bot>`), so each bot is its own agent and
 //!   the account anchors rate limits.
 //! - **Dev tokens** (`--dev-token`, local development only, behind
-//!   `--allow-dev-tokens`). The identity is the hex SHA-256 of the token, as
-//!   in Phase 0, so Phase 0 databases keep working.
+//!   `--allow-dev-tokens`). The identity is the hex SHA-256 of the token.
 //!
 //! Invite-scoped guests get a token whose scope is `room:<id>`; they can act
 //! only inside that room.
@@ -49,7 +48,7 @@ pub struct AgentId {
 }
 
 impl AgentId {
-    /// Derive a dev-token agent id (Phase 0 compatible).
+    /// Derive a dev-token agent id.
     pub fn from_token(token: &str) -> Self {
         let digest = Sha256::digest(token.as_bytes());
         AgentId {
@@ -60,8 +59,7 @@ impl AgentId {
         }
     }
 
-    /// Pre-bot agent id for an OAuth principal (`<account>:<client>`). Bots
-    /// migrated from that era keep it; guests still get it.
+    /// Agent id of a guest bot (`<guest account>:<client>`).
     pub fn legacy_oauth_id(account_id: &str, client_id: &str) -> String {
         format!("{account_id}:{client_id}")
     }

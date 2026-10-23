@@ -5,6 +5,18 @@ All notable changes to BotWhisper. The format follows
 
 ## [Unreleased]
 
+### Breaking: fresh start (Will, 2026-10-23)
+
+Only Will is testing, so there is no backward compatibility until the link is
+shared: the relay runs on a fresh database and nothing below migrates.
+
+- **No data migrations.** The schema is one initial `CREATE TABLE` set; the
+  startup migrations (Phase 0 column adds, the HTTP-API guest cleanup, bots
+  for pre-bot grants, the pre-bot authorization-code fallback) and the
+  migration machinery are gone. `doorbells` keeps the JSON `config` only (no
+  legacy webhook columns). A database from an earlier build must be deleted
+  (cutover runbook in `docs/design/e2e-rooms.md` §10).
+
 ### Added
 
 - **Push doorbells, ntfy by default.** `set_doorbell` takes a `type`:

@@ -11,9 +11,11 @@ use anyhow::{Context, Result};
 use bw_proto::TurnMode;
 use rusqlite::{params, Connection, OptionalExtension};
 
-use crate::doorbell::{DoorbellConfig, DoorbellKey, DoorbellStatus, DoorbellTarget};
+use crate::doorbell::{DoorbellConfig, DoorbellKey, DoorbellStatus};
 
 const SCHEMA: &str = r#"
+-- The one initial schema. BotWhisper has no data migrations: a relay runs on
+-- a database this file created, or on a fresh one.
 CREATE TABLE IF NOT EXISTS rooms (
     id            TEXT PRIMARY KEY,
     title         TEXT NOT NULL,
@@ -22,7 +24,11 @@ CREATE TABLE IF NOT EXISTS rooms (
     expires_at    INTEGER,
     max_members   INTEGER NOT NULL,
     turn_mode     TEXT NOT NULL,
-    next_member_n INTEGER NOT NULL
+    next_member_n INTEGER NOT NULL,
+    thread_start  TEXT NOT NULL DEFAULT 'owner',
+    owner_account TEXT,
+    kind          TEXT NOT NULL DEFAULT 'plaintext',
+    e2e_epoch     INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS members (
     room_id       TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
@@ -32,6 +38,7 @@ CREATE TABLE IF NOT EXISTS members (
     role          TEXT NOT NULL,
     invite_label  TEXT,
     joined_at     INTEGER NOT NULL,
+    e2e_state     TEXT,
     PRIMARY KEY (room_id, member_id)
 );
 CREATE INDEX IF NOT EXISTS members_by_agent ON members(agent_id);
@@ -43,16 +50,17 @@ CREATE TABLE IF NOT EXISTS invites (
     expires_at    INTEGER NOT NULL,
     redeemed_at   INTEGER
 );
+-- Per-room doorbells. `config` is DoorbellConfig as JSON (secrets included;
+-- never logged, never shown).
 CREATE TABLE IF NOT EXISTS doorbells (
-    room_id       TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
-    member_id     TEXT NOT NULL,
-    webhook_url   TEXT NOT NULL,
-    secret        TEXT NOT NULL,
-    auth_header   TEXT,
-    events        TEXT NOT NULL,
+    room_id          TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+    member_id        TEXT NOT NULL,
+    config           TEXT NOT NULL,
+    status           TEXT NOT NULL DEFAULT 'never',
+    last_delivery_at INTEGER,
     PRIMARY KEY (room_id, member_id)
 );
--- Accounts and OAuth 2.1 (Phase 1). Every secret is stored hashed.
+-- Accounts and OAuth 2.1. Every secret is stored hashed.
 CREATE TABLE IF NOT EXISTS accounts (
     id            TEXT PRIMARY KEY,
     email         TEXT UNIQUE,
@@ -75,7 +83,8 @@ CREATE TABLE IF NOT EXISTS oauth_codes (
     account_id     TEXT NOT NULL,
     scope          TEXT NOT NULL,
     expires_at     INTEGER NOT NULL,
-    used           INTEGER NOT NULL DEFAULT 0
+    used           INTEGER NOT NULL DEFAULT 0,
+    bot_id         TEXT
 );
 CREATE TABLE IF NOT EXISTS oauth_tokens (
     token_hash    TEXT PRIMARY KEY,
@@ -84,7 +93,8 @@ CREATE TABLE IF NOT EXISTS oauth_tokens (
     account_id    TEXT NOT NULL,
     scope         TEXT NOT NULL,
     expires_at    INTEGER NOT NULL,
-    revoked       INTEGER NOT NULL DEFAULT 0
+    revoked       INTEGER NOT NULL DEFAULT 0,
+    bot_id        TEXT
 );
 CREATE INDEX IF NOT EXISTS oauth_tokens_by_account ON oauth_tokens(account_id);
 CREATE TABLE IF NOT EXISTS pending_logins (
@@ -96,9 +106,8 @@ CREATE TABLE IF NOT EXISTS pending_logins (
 );
 -- A bot is one AI identity of an account, picked or created on the sign-in
 -- page. Every grant (token chain) is bound to one bot; room membership is
--- keyed on the bot's agent_id, so a bot keeps its seats across reconnects
--- and new client registrations. Bots migrated from the per-client era keep
--- their old `<account>:<client>` agent id; new ones get `<account>:<bot>`.
+-- keyed on the bot's agent_id (`<account>:<bot>`), so a bot keeps its seats
+-- across reconnects and new client registrations.
 CREATE TABLE IF NOT EXISTS bots (
     id             TEXT PRIMARY KEY,
     account_id     TEXT NOT NULL,
@@ -147,25 +156,6 @@ CREATE TABLE IF NOT EXISTS bot_doorbells (
     last_delivery_at INTEGER
 );
 "#;
-
-/// Columns added after Phase 0. `ALTER TABLE ADD COLUMN` fails if the column
-/// exists, which is how we detect an already-migrated file.
-const MIGRATIONS: &[&str] = &[
-    "ALTER TABLE rooms ADD COLUMN thread_start TEXT NOT NULL DEFAULT 'owner'",
-    "ALTER TABLE rooms ADD COLUMN owner_account TEXT",
-    "ALTER TABLE oauth_codes ADD COLUMN bot_id TEXT",
-    "ALTER TABLE oauth_tokens ADD COLUMN bot_id TEXT",
-    // Phase 2: doorbell transports. `config` is DoorbellConfig as JSON; rows
-    // without it are Phase 0 webhooks described by the three legacy columns.
-    "ALTER TABLE doorbells ADD COLUMN config TEXT",
-    "ALTER TABLE doorbells ADD COLUMN status TEXT NOT NULL DEFAULT 'never'",
-    "ALTER TABLE doorbells ADD COLUMN last_delivery_at INTEGER",
-    // Phase 2: room kind (plaintext | e2e) and MLS epoch; member E2E state
-    // (NULL in plaintext rooms, `pending` until added, then `active`).
-    "ALTER TABLE rooms ADD COLUMN kind TEXT NOT NULL DEFAULT 'plaintext'",
-    "ALTER TABLE rooms ADD COLUMN e2e_epoch INTEGER NOT NULL DEFAULT 0",
-    "ALTER TABLE members ADD COLUMN e2e_state TEXT",
-];
 
 /// Whether a room is relay-readable or an MLS group. Fixed at creation.
 #[derive(
@@ -265,110 +255,6 @@ pub fn unique_bot_name(want: &str, taken: &[String]) -> String {
 /// A fresh bot id.
 pub fn new_bot_id() -> String {
     format!("bot_{}", &uuid::Uuid::new_v4().simple().to_string()[..20])
-}
-
-/// One-time data migrations, safe to run on every start.
-///
-/// 1. The short-lived `/api/v1` HTTP API is gone: delete its room tokens
-///    (client id `bw-api`), the guest members they created and their guest
-///    accounts.
-/// 2. Bots: every grant or seat from before bots existed (agent id
-///    `<account>:<client>`) gets a bot that keeps that exact agent id, named
-///    after the client, and its tokens are bound to it. Member ids, rooms
-///    and invites are untouched.
-fn migrate_data(c: &Connection) -> rusqlite::Result<()> {
-    let tx = c.unchecked_transaction()?;
-    // (1) API leftovers.
-    let api_agents: Vec<String> = {
-        let mut st =
-            tx.prepare("SELECT DISTINCT agent_id FROM members WHERE agent_id LIKE '%:bw-api'")?;
-        let rows = st.query_map([], |r| r.get(0))?;
-        rows.collect::<rusqlite::Result<_>>()?
-    };
-    let mut api_accounts: Vec<String> = {
-        let mut st =
-            tx.prepare("SELECT DISTINCT account_id FROM oauth_tokens WHERE client_id = 'bw-api'")?;
-        let rows = st.query_map([], |r| r.get(0))?;
-        rows.collect::<rusqlite::Result<_>>()?
-    };
-    for a in &api_agents {
-        tx.execute(
-            "DELETE FROM doorbells WHERE EXISTS (SELECT 1 FROM members m
-               WHERE m.agent_id = ?1 AND m.room_id = doorbells.room_id
-                 AND m.member_id = doorbells.member_id)",
-            params![a],
-        )?;
-        tx.execute("DELETE FROM members WHERE agent_id = ?1", params![a])?;
-        if let Some(acct) = a.strip_suffix(":bw-api") {
-            api_accounts.push(acct.to_string());
-        }
-    }
-    let tokens = tx.execute("DELETE FROM oauth_tokens WHERE client_id = 'bw-api'", [])?;
-    for a in &api_accounts {
-        tx.execute(
-            "DELETE FROM accounts WHERE id = ?1 AND kind = 'guest'",
-            params![a],
-        )?;
-    }
-    if tokens > 0 || !api_agents.is_empty() {
-        tracing::info!(
-            tokens,
-            members = api_agents.len(),
-            "migration: removed HTTP API guests"
-        );
-    }
-
-    // (2) Bots for pre-bot grants and seats.
-    type Legacy = (String, String, String, Option<String>, i64);
-    let legacy: Vec<Legacy> = {
-        let mut st = tx.prepare(
-            "WITH g(account_id, client_id) AS (
-                 SELECT account_id, client_id FROM oauth_tokens WHERE bot_id IS NULL
-                 UNION
-                 SELECT a.id, substr(m.agent_id, length(a.id) + 2)
-                 FROM members m JOIN accounts a
-                   ON substr(m.agent_id, 1, length(a.id) + 1) = a.id || ':')
-             SELECT g.account_id, g.client_id, g.account_id || ':' || g.client_id,
-                    cl.name, COALESCE(cl.created_at, 0)
-             FROM g JOIN accounts a ON a.id = g.account_id
-             LEFT JOIN oauth_clients cl ON cl.id = g.client_id
-             WHERE NOT EXISTS (SELECT 1 FROM bots b
-                               WHERE b.agent_id = g.account_id || ':' || g.client_id)
-             ORDER BY 5, 2",
-        )?;
-        let rows = st.query_map([], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
-        })?;
-        rows.collect::<rusqlite::Result<_>>()?
-    };
-    let mut created = 0usize;
-    for (account, client, agent, cname, at) in &legacy {
-        let taken: Vec<String> = {
-            let mut st = tx.prepare("SELECT name FROM bots WHERE account_id = ?1")?;
-            let rows = st.query_map(params![account], |r| r.get(0))?;
-            rows.collect::<rusqlite::Result<_>>()?
-        };
-        let name = unique_bot_name(cname.as_deref().unwrap_or("Bot"), &taken);
-        tx.execute(
-            "INSERT INTO bots (id, account_id, name, agent_id, created_at, last_client_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![new_bot_id(), account, name, agent, at, client],
-        )?;
-        created += 1;
-    }
-    // Bind every unbound token to the bot that carries its old agent id.
-    let bound = tx.execute(
-        "UPDATE oauth_tokens SET bot_id =
-           (SELECT b.id FROM bots b
-            WHERE b.agent_id = oauth_tokens.account_id || ':' || oauth_tokens.client_id)
-         WHERE bot_id IS NULL",
-        [],
-    )?;
-    tx.commit()?;
-    if created > 0 || bound > 0 {
-        tracing::info!(created, bound, "migration: bots for existing grants");
-    }
-    Ok(())
 }
 
 /// A room row.
@@ -474,8 +360,7 @@ pub struct TokenRow {
     pub account_id: String,
     pub scope: String,
     pub expires_at: u64,
-    /// The bot this grant is bound to (`None` only for pre-bot rows that the
-    /// startup migration could not match).
+    /// The bot this grant is bound to.
     pub bot_id: Option<String>,
 }
 
@@ -606,15 +491,6 @@ impl Db {
     fn init(conn: Connection) -> Result<Self> {
         conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;")?;
         conn.execute_batch(SCHEMA)?;
-        for m in MIGRATIONS {
-            // "duplicate column name" means this file is already migrated.
-            if let Err(e) = conn.execute_batch(m) {
-                if !e.to_string().contains("duplicate column") {
-                    return Err(e.into());
-                }
-            }
-        }
-        migrate_data(&conn)?;
         Ok(Db {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -1027,32 +903,12 @@ impl Db {
                 }
                 Some(cfg) => {
                     let json = serde_json::to_string(cfg).unwrap_or_default();
-                    // Legacy NOT NULL columns are kept filled for webhooks so
-                    // an older binary still reads them; empty otherwise.
-                    let (url, secret, auth) = match &cfg.target {
-                        DoorbellTarget::Webhook {
-                            url,
-                            secret,
-                            auth_header,
-                        } => (url.as_str(), secret.as_str(), auth_header.clone()),
-                        _ => ("", "", None),
-                    };
                     c.execute(
-                        "INSERT INTO doorbells (room_id, member_id, webhook_url, secret, auth_header, events, config, status, last_delivery_at)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'never', NULL)
+                        "INSERT INTO doorbells (room_id, member_id, config, status, last_delivery_at)
+                         VALUES (?1, ?2, ?3, 'never', NULL)
                          ON CONFLICT(room_id, member_id) DO UPDATE SET
-                           webhook_url = excluded.webhook_url, secret = excluded.secret,
-                           auth_header = excluded.auth_header, events = excluded.events,
                            config = excluded.config, status = 'never', last_delivery_at = NULL",
-                        params![
-                            room_id,
-                            member_id,
-                            url,
-                            secret,
-                            auth,
-                            cfg.events.join(","),
-                            json
-                        ],
+                        params![room_id, member_id, json],
                     )?;
                 }
             }
@@ -1060,33 +916,16 @@ impl Db {
         })
     }
 
-    /// Build a config from a row: the JSON `config` when present, else the
-    /// Phase 0 webhook columns.
+    /// Build a config from a row (`member_id, config, status, last_delivery_at`).
     fn doorbell_from_row(
         r: &rusqlite::Row<'_>,
     ) -> rusqlite::Result<(DoorbellConfig, DoorbellStatus)> {
-        let webhook_url: String = r.get(1)?;
-        let secret: String = r.get(2)?;
-        let auth_header: Option<String> = r.get(3)?;
-        let events: String = r.get(4)?;
-        let config: Option<String> = r.get(5)?;
-        let status: String = r.get(6)?;
-        let last: Option<i64> = r.get(7)?;
-        let cfg = config
-            .as_deref()
-            .and_then(|j| serde_json::from_str::<DoorbellConfig>(j).ok())
-            .unwrap_or_else(|| DoorbellConfig {
-                target: DoorbellTarget::Webhook {
-                    url: webhook_url,
-                    secret,
-                    auth_header,
-                },
-                events: events
-                    .split(',')
-                    .filter(|s| !s.is_empty())
-                    .map(String::from)
-                    .collect(),
-            });
+        let config: String = r.get(1)?;
+        let status: String = r.get(2)?;
+        let last: Option<i64> = r.get(3)?;
+        let cfg = serde_json::from_str::<DoorbellConfig>(&config).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(e))
+        })?;
         Ok((
             cfg,
             DoorbellStatus {
@@ -1096,8 +935,7 @@ impl Db {
         ))
     }
 
-    const DOORBELL_COLS: &'static str =
-        "member_id, webhook_url, secret, auth_header, events, config, status, last_delivery_at";
+    const DOORBELL_COLS: &'static str = "member_id, config, status, last_delivery_at";
 
     /// Every per-room doorbell of a room (configuration only).
     pub fn doorbells(&self, room_id: &str) -> Result<Vec<(String, DoorbellConfig)>> {
@@ -1866,7 +1704,7 @@ fn mode_str(m: TurnMode) -> &'static str {
     }
 }
 
-/// Unknown values (including Phase 0's `auto`) fall back to `free`.
+/// Unknown values fall back to `free`.
 fn parse_mode(s: &str) -> TurnMode {
     match s {
         "alternate" => TurnMode::Alternate,
@@ -1988,27 +1826,6 @@ mod tests {
     }
 
     #[test]
-    fn migrations_are_idempotent_and_upgrade_phase0_files() {
-        // A Phase 0 schema without the new columns.
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE rooms (id TEXT PRIMARY KEY, title TEXT NOT NULL, owner TEXT NOT NULL,
-             created_at INTEGER NOT NULL, expires_at INTEGER, max_members INTEGER NOT NULL,
-             turn_mode TEXT NOT NULL, next_member_n INTEGER NOT NULL);
-             INSERT INTO rooms VALUES ('old', 't', 'm1', 1, NULL, 8, 'auto', 2);",
-        )
-        .unwrap();
-        let db = Db::init(conn).unwrap();
-        let room = db.get_room("old").unwrap().unwrap();
-        assert_eq!(room.turn_mode, TurnMode::Free, "auto becomes free");
-        assert_eq!(room.thread_start, ThreadStart::Owner);
-        assert_eq!(room.owner_account, None);
-        // Re-running init on the same schema is fine.
-        let again = Db::open_in_memory().unwrap();
-        assert_eq!(again.count_rooms().unwrap(), 0);
-    }
-
-    #[test]
     fn codes_logins_and_tokens_are_single_use_and_expire() {
         let db = Db::open_in_memory().unwrap();
         db.insert_code(
@@ -2121,63 +1938,6 @@ mod tests {
         );
         db.sweep_auth(1000).unwrap();
         assert!(db.find_token("r1", "refresh").unwrap().is_none(), "expired");
-    }
-
-    #[test]
-    fn migration_keeps_agent_ids_and_drops_api_guests() {
-        let db = Db::open_in_memory().unwrap();
-        db.with(|c| {
-            c.execute_batch(
-                "INSERT INTO accounts VALUES ('u1', 'x@example.com', 'user', 1);
-                 INSERT INTO accounts VALUES ('g1', NULL, 'guest', 2);
-                 INSERT INTO accounts VALUES ('api1', NULL, 'guest', 3);
-                 INSERT INTO oauth_clients VALUES ('bwc_cur', NULL, 'Cursor', '[]', 'none', 10);
-                 INSERT INTO oauth_clients VALUES ('bwc_grk', NULL, 'Cursor', '[]', 'none', 20);
-                 INSERT INTO rooms (id, title, owner, created_at, max_members, turn_mode, next_member_n)
-                   VALUES ('r1', 'Room', 'm1', 1, 8, 'free', 4);
-                 INSERT INTO members (room_id, member_id, agent_id, display_name, role, invite_label, joined_at)
-                   VALUES ('r1', 'm1', 'u1:bwc_cur', 'Will', 'owner', NULL, 1);
-                 INSERT INTO members (room_id, member_id, agent_id, display_name, role, invite_label, joined_at)
-                   VALUES ('r1', 'm2', 'api1:bw-api', 'API', 'member', NULL, 2);
-                 INSERT INTO members (room_id, member_id, agent_id, display_name, role, invite_label, joined_at)
-                   VALUES ('r1', 'm3', 'g1:bwc_grk', 'Sam', 'member', NULL, 3);
-                 INSERT INTO oauth_tokens (token_hash, kind, client_id, account_id, scope, expires_at)
-                   VALUES ('h1', 'access', 'bwc_cur', 'u1', 'rooms', 9999999999);
-                 INSERT INTO oauth_tokens (token_hash, kind, client_id, account_id, scope, expires_at)
-                   VALUES ('h2', 'refresh', 'bwc_grk', 'u1', 'rooms', 9999999999);
-                 INSERT INTO oauth_tokens (token_hash, kind, client_id, account_id, scope, expires_at)
-                   VALUES ('h3', 'access', 'bw-api', 'api1', 'room:r1', 9999999999);",
-            )
-        })
-        .unwrap();
-        db.with(migrate_data).unwrap();
-        db.with(migrate_data).unwrap(); // idempotent
-        let bots = db.account_bots("u1").unwrap();
-        let ids: Vec<&str> = bots.iter().map(|b| b.agent_id.as_str()).collect();
-        assert_eq!(ids, vec!["u1:bwc_cur", "u1:bwc_grk"]);
-        let names: Vec<&str> = bots.iter().map(|b| b.name.as_str()).collect();
-        assert_eq!(names, vec!["Cursor", "Cursor 2"], "names made unique");
-        assert_eq!(db.account_bots("g1").unwrap().len(), 1, "guest seat bot");
-        let t = db.get_token("h1", "access", 0).unwrap().unwrap();
-        assert_eq!(t.bot_id.as_deref(), Some(bots[0].id.as_str()));
-        let t = db.find_token("h2", "refresh").unwrap().unwrap().0;
-        assert_eq!(t.bot_id.as_deref(), Some(bots[1].id.as_str()));
-        // API guest gone; everyone else keeps their member id.
-        let members: Vec<(String, String)> = db
-            .members("r1")
-            .unwrap()
-            .into_iter()
-            .map(|m| (m.member_id, m.agent_id))
-            .collect();
-        assert_eq!(
-            members,
-            vec![
-                ("m1".to_string(), "u1:bwc_cur".to_string()),
-                ("m3".to_string(), "g1:bwc_grk".to_string())
-            ]
-        );
-        assert!(db.find_token("h3", "access").unwrap().is_none());
-        assert!(db.get_account("api1").unwrap().is_none());
     }
 
     #[test]

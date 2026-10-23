@@ -1560,41 +1560,14 @@ pub async fn token(
     }
 }
 
-/// The bot a code is for. Codes issued before bots existed (10-minute
-/// lifetime, so only right after an upgrade) get the bot that carries their
-/// old agent id, created if needed.
+/// The bot a code is for (every code is bound to one of the account's bots).
 fn code_bot(st: &OauthState, row: &CodeRow) -> Option<String> {
-    if let Some(b) = &row.bot_id {
-        return st
-            .db
-            .get_bot(b)
-            .ok()
-            .flatten()
-            .filter(|b| b.account_id == row.account_id)
-            .map(|b| b.id);
-    }
-    let agent = AgentId::legacy_oauth_id(&row.account_id, &row.client_id);
-    let bots = st.db.account_bots(&row.account_id).ok()?;
-    if let Some(b) = bots.iter().find(|b| b.agent_id == agent) {
-        return Some(b.id.clone());
-    }
-    let names: Vec<String> = bots.into_iter().map(|b| b.name).collect();
-    let client = st.db.get_client(&row.client_id).ok().flatten();
-    let bot = BotRow {
-        id: new_bot_id(),
-        account_id: row.account_id.clone(),
-        name: unique_bot_name(
-            client.and_then(|c| c.name).as_deref().unwrap_or("Bot"),
-            &names,
-        ),
-        agent_id: agent,
-        created_at: now_unix(),
-        last_used_at: None,
-        last_client_id: Some(row.client_id.clone()),
-        last_client_name: None,
-    };
-    st.db.insert_bot(&bot).ok()?;
-    Some(bot.id)
+    st.db
+        .get_bot(row.bot_id.as_deref()?)
+        .ok()
+        .flatten()
+        .filter(|b| b.account_id == row.account_id)
+        .map(|b| b.id)
 }
 
 /// RFC 7009 revocation. Always 200 for a well-formed request.

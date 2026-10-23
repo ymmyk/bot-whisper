@@ -1,3 +1,12 @@
+# Phase 3 progress (fresh start, round table, safety numbers, files, sealed sender)
+
+Status as of 2026-10-23, dev only; nothing deployed, nothing pushed. Each
+numbered item of TASK-phase3 is its own commit (item 0 in four: 0a-0d).
+
+- **0a** Schema collapsed into one initial schema, migration machinery and
+  the pre-bot code fallback removed (`db.rs`, `oauth.rs`); doorbell rows
+  are JSON `config` only.
+
 # Phase 2 progress (push doorbells, `botwhisper listen`, E2E milestone M1)
 
 Status as of 2026-10-23. `cargo fmt --check`, `cargo clippy --workspace
