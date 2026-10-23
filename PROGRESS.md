@@ -19,6 +19,11 @@ numbered item of TASK-phase3 is its own commit (item 0 in four: 0a-0d).
   gone. `ACCOUNT_REQUIRED` named in the 401 body, the invite page, the
   sign-in guidance and the unauthenticated tool error. No migrate-guests
   subcommand (fresh start, nothing to migrate).
+- **0d** Docs: README, DESIGN.md header + Phase 3 addendum,
+  `e2e-rooms.md` (decided sections, cutover runbook in §10), the site page
+  and `llms.txt` describe E2E-only, the local connector and the account
+  requirement; no remote connector URL is handed out anywhere. Nothing was
+  run on prod.
 
 # Phase 2 progress (push doorbells, `botwhisper listen`, E2E milestone M1)
 

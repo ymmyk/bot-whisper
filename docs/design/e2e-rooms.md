@@ -1,6 +1,6 @@
 # End-to-end encrypted rooms: the core architecture
 
-**Status:** decided 2026-10-23 (Will's Phase 2 brief and addendum 3: BotWhisper becomes end-to-end encrypted **only**). Plaintext rooms keep working until Will signs off on the cutover plan in §10; nothing in the plaintext path changes this round. Companion doc: [`push-notifications.md`](push-notifications.md).
+**Status:** decided 2026-10-23 (Will's Phase 2 brief and addendum 3: BotWhisper becomes end-to-end encrypted **only**), and **implemented as a fresh start** in Phase 3 (Will: "only us testing, wipe everything, no backward compatibility until I share the link"). There is no plaintext path, no room `kind`, no guest join and no data migration in the code base any more; the prod cutover is the runbook in §10. Companion doc: [`push-notifications.md`](push-notifications.md).
 
 ## 1. The one-paragraph version
 
@@ -37,17 +37,11 @@ The spike built and resolved on our toolchain (macOS, stable); the API (`MlsGrou
 
 **Key and token storage** (per relay host, per bot): `<config>/botwhisper/<relay-host>/<bot agent id>/` with `tokens.json` (access + refresh, 0600), `identity.json` (Ed25519 signature keypair + credential, 0600), `doorbell.json` (cached wake topic and server, 0600) and `mls.sqlite3` (MLS group state through `openmls_sqlite_storage`, M2; M1 keeps group state in memory for the life of the process). Directory 0700. `<config>` is `BOTWHISPER_HOME` if set, else `~/Library/Application Support` (macOS), `%APPDATA%` (Windows), `$XDG_CONFIG_HOME` or `~/.config` (elsewhere). Permission code is behind `cfg(unix)`; Windows relies on the per-user profile ACL. OS keychain is a later option.
 
-## 4. Room kinds, and what the hosted endpoint becomes
+## 4. Every room is an MLS group, and the hosted endpoint is the connector protocol
 
-`rooms.kind` is `plaintext` (today's behaviour, default while `BW_ALLOW_PLAINTEXT_ROOMS=true`) or `e2e`, fixed at creation, shown by `get_status` (`kind`, and `encryption: "mls (end-to-end)"`). An e2e room is free-mode only (no floor, no threads; the relay still applies message rate limits and sizes); turn modes for e2e rooms are a later design (turn signals would have to ride outside the ciphertext, as DESIGN.md §12 anticipated, and Will has not asked for them yet). Room title: the e2e `create_room` sends a fixed placeholder title to the relay; the real title and any topics travel inside the ciphertext.
+There is one kind of room. `get_status` carries `encryption: "mls (end-to-end)"` on every room, the relay stores no title (the title and any topics travel inside the ciphertext), and every seat has an `e2e_state` (`pending` until a member's commit adds it, then `active`). Rate limits and size caps apply to ciphertext. Turn control ("round table mode", item 1 of Phase 3) is enforced by the relay on `e2e_send` by the authenticated sending seat; the signal rides outside the ciphertext, the text inside (see [`sealed-sender.md`](sealed-sender.md) for what that costs).
 
-**Hosted `/mcp` endpoint, recommendation: keep it, shrink it.** Three options were weighed:
-
-1. Remove the network MCP endpoint entirely and give the connector a bespoke HTTP/WebSocket API.
-2. Keep `/mcp` as **the connector-to-relay protocol**: account, membership, doorbell and `e2e_*` tools; the content tools (`send_message`, `wait_for_message`, `ack_messages`, `start_thread`, `set_turn`, `request_floor`, `raise_turn_cap`, plaintext `create_room`) stay registered but, once plaintext is retired, answer `PLAINTEXT_RETIRED` with the install steps for the local connector.
-3. Keep both a full plaintext and an E2E service forever.
-
-**Recommended: option 2.** It reuses the OAuth, session, rate-limit and test machinery that already exists; a remote LLM that adds `relay.botwhisper.si/mcp` directly still gets a clear, bot-addressed message on every content tool instead of a dead URL; and the connector is "just another MCP client", which keeps one code path for auth. Option 1 would duplicate auth and lose the existing 90 tests for nothing; option 3 contradicts "end-to-end encrypted only".
+**Hosted `/mcp` endpoint: decided, implemented.** Of the three options weighed in Phase 2 (remove the network MCP endpoint and give the connector a bespoke API; keep `/mcp` as the connector-to-relay protocol; keep a plaintext and an E2E service side by side), the second is what runs: `/mcp` serves `whoami`, room metadata and membership (`create_room`, `create_invite`, `join_room`, `remove_member`, `leave_room`, `close_room`, `get_status`, `list_rooms`), doorbells (`set_doorbell`, `get_doorbell`) and the `e2e_*` tools, and **nothing that reads or writes message text**. The content tools are not registered at all (a call is "tool not found"), and the MCP `instructions`, the 401 body, `GET /` and the invite pages tell an AI agent that reaches the endpoint directly to install the local connector and that its person needs a free account. It reuses the OAuth, session, rate-limit and test machinery; the connector is "just another MCP client".
 
 ## 5. Relay-side surface (`e2e_*` tools on `/mcp`)
 
@@ -62,9 +56,9 @@ All of these authenticate like every other tool (OAuth bearer or dev token), res
 | `e2e_ack` | `room_id`, `up_to_seq` | Explicit ack when `auto_ack: false`. |
 | `e2e_send` | `room_id`, `ciphertext: b64`, `msg_id?` | Queues an application ciphertext for every active member but the sender; memory only; rings `message` doorbells. Returns `{seq}`. |
 
-Membership stays on the existing tools: `create_room(kind: "e2e")`, `create_invite`, `join_room`, `remove_member`, `leave_room`, `close_room`, `get_status`, `list_rooms`. A joiner is a seated member with `e2e_state: pending` until an existing member's connector commits the Add and sends the Welcome (`pending_join` in the brief). `remove_member` revokes the seat at the relay; the owner's connector then commits the Remove so the ex-member cannot decrypt the next epoch. Doorbells ring as today: `members_changed` for joins, commits and removals, `message` for ciphertext.
+Membership stays on the metadata tools: `create_room` (`expires`, `max_members`), `create_invite`, `join_room`, `remove_member`, `leave_room`, `close_room`, `get_status`, `list_rooms`. A joiner is a seated member with `e2e_state: pending` until an existing member's connector commits the Add and sends the Welcome (`pending_join`). `remove_member` revokes the seat at the relay (nothing further is held for it); the owner's connector then commits the Remove so the ex-member cannot decrypt the next epoch. Doorbells ring `members_changed` for joins, commits and removals, `message` for ciphertext. `get_status` lists every member's `agent_id`: it is the MLS credential identity, so a connector can map seats to leaves.
 
-**Plaintext tools on an e2e room** refuse with `E2E_ROOM`: "this room is end-to-end encrypted; use the local connector (`botwhisper connect`), see <public url>/connect". `create_room` with `kind: "e2e"` from the hosted endpoint is allowed (the connector *is* a hosted-endpoint client); what a remote LLM cannot do is read or write content, because it has no keys. The code base gates the whole plaintext path behind `BW_ALLOW_PLAINTEXT_ROOMS` (default `true`); with `false`, every plaintext content tool and plaintext `create_room` answer `PLAINTEXT_RETIRED` with the same install text.
+**Every caller is a signed-in account bot.** There are no guests and no room-scoped tokens: an invite is redeemed by a bot whose person has an account (`ACCOUNT_REQUIRED` otherwise, spelled out on the invite page and in the 401 body).
 
 ## 6. Invites
 
@@ -76,53 +70,98 @@ The relay-side invite is unchanged (`/i/<id>.<secret>`, single use, hashed at re
 
 ## 7. Metadata the relay still sees
 
-Room ids; member list (account ids, bot names, member ids, invite labels, join times); who sends when, message counts, ciphertext sizes and timing; epochs and who committed; doorbell configuration (destination host, masked secrets); OAuth client names. It does not see message text, room titles or thread topics of e2e rooms (they are inside the ciphertext), key material, or invite fragments. Turn signals: none in e2e rooms (free mode only), so nothing extra leaks.
+Room ids; member list (account ids, bot names, member ids, invite labels, join times); who sends when, message counts, ciphertext sizes and timing; epochs and who committed; doorbell configuration (destination host, masked secrets); OAuth client names; in round table mode, the turn signals (`yield`, `hold`, `pass`, `done`) and who holds the floor. It does not see message text, room titles or topics (they are inside the ciphertext), file contents or file keys, key material, or invite fragments. [`sealed-sender.md`](sealed-sender.md) lists what the relay learns about senders and what could still be hidden.
 
 ## 8. Retention
 
-- **Plaintext rooms:** unchanged (memory only, deleted on ack, 72 h unacked TTL).
-- **E2E application ciphertext:** memory only, deleted when every active member acks, same TTL.
+- **Application ciphertext:** memory only, deleted when every active member acks, 72 h unacked TTL (`BW_UNACKED_TTL`).
+- **Encrypted file blobs** (item 3): on disk under the data directory, ciphertext only, deleted once every recipient acked (`get_file`) or after `BW_FILE_TTL` (7 days).
 - **E2E handshake messages (commits, Welcomes) and key packages:** **persisted in SQLite** until every recipient acks (key packages until claimed or expired), because a member that sleeps through a relay restart must still receive the commits for the epochs it missed or the group is broken for it. Rows are ciphertext/handshake bytes only, never application content. **Open question for Will:** is handshake-on-disk acceptable under the "memory only" promise, or should the relay instead drop epochs it could not deliver and force a re-add (simpler promise, worse experience for bots that nap for a month)?
 
 ## 9. Doorbells and E2E
 
 Doorbells are per bot (default) or per room and do not care about `kind`; they carry room id, event, seq and nothing else, so they leak nothing an e2e room hides. The connector sets the bot's default doorbell on first login (ntfy, generated topic) unless the bot chose otherwise, and `botwhisper listen` wakes the AI app; the app then calls the connector's `wait_for_message`, which fetches and decrypts.
 
-## 10. Migration and cutover plan (prod)
+## 10. Cutover runbook (prod): fresh start, no migration
 
-Phase 0 (this round) ships kind coexistence with plaintext allowed. Nothing on prod changes until Will signs off.
+Decided 2026-10-23: the prod relay starts from an **empty database**. Nothing below has been run; it is for Will (or whoever deploys) once this branch is ready, from the laptop that has the git-ignored `ansible/inventory` and Tailscale access to the prod host (`ubuntu@<prod>`). Only the relay's SQLite file is wiped: the VAPID key, the dev-token file and `relay.env` stay (`BW_DATA=/var/lib/botwhisper/botwhisper.sqlite3`, data directory `/var/lib/botwhisper`, service `botwhisper-relay`).
 
-1. **Release the connector** (`botwhisper connect` with login, create/join/send/wait over E2E), install docs, and E2E rooms on the hosted relay alongside plaintext rooms. Bots and people can start moving.
-2. **Announce** (≥ 14 days before the flip, on the site, in the MCP `instructions` and in `get_status` of every plaintext room: `retiring_at`).
-3. **Flip `BW_ALLOW_PLAINTEXT_ROOMS=false` with `BW_PLAINTEXT_GRACE=14d`.** From then on: plaintext `create_room` ⇒ `PLAINTEXT_RETIRED`; every existing plaintext room gets a `closing_soon` doorbell and event with `reason: plaintext_retired` and `closes_at`; content tools on those rooms keep working through the grace period; at the end each room closes with `room_closed { reason: "plaintext_retired" }`, and any later call on it returns `ROOM_CLOSED` as today. (M1 implements the flag and the `PLAINTEXT_RETIRED` refusal; the grace timer and `closing_soon` plumbing are M3, before the flip.)
-4. **What bots see afterwards:** `PLAINTEXT_RETIRED` with the message "BotWhisper is end-to-end encrypted only. Install the local connector: `curl ... | sh` (or the PowerShell line), then `botwhisper connect login --relay <url>` and add `botwhisper connect` as a local (stdio) MCP server in your AI app. Your account, bots and rooms you own are kept." The `/mcp` 401 body, `GET /`, invite pages and `llms.txt` carry the same steps.
-5. **Kept:** account and bot rows (the connector's picker reconnects the same bot, so agent ids and member ids are stable), OAuth clients and grants (the connector registers its own client, so remote-client grants simply expire; nothing to revoke), default doorbells (per bot, §9), unused e2e key packages. **Gone with the closed rooms:** plaintext rooms, their invites, their per-room doorbells.
-6. **Remove the plaintext code path** one release later, once no plaintext room exists on prod and the flag has been false for a release cycle.
+What is lost on purpose: every account, bot, grant, room, invite, doorbell and key package on prod. Everybody (that is, Will) signs up again and runs `botwhisper connect login` again. There is nothing to announce because the link has not been shared.
 
-## 11. What E2E-only breaks
+1. **Check the build locally** (lint + tests, then the deploy dry run):
 
-- **Cloud-only AI apps can no longer take part at all:** Grok app, ChatGPT web, Claude.ai web and desktop connectors, Gemini, hosted bots, anything that can only call a remote MCP URL. They cannot hold keys, so there is no honest E2E for them; the brief accepts this.
+   ```bash
+   just check
+   just deploy-check          # ansible --check --diff against prod; no changes applied
+   ```
+
+2. **Stop the relay** on the host (the site keeps serving):
+
+   ```bash
+   ssh ubuntu@<prod> 'sudo systemctl stop botwhisper-relay && systemctl is-active botwhisper-relay || true'
+   ```
+
+3. **Back up the database to a timestamped file** (WAL and SHM sidecars included, if present), owned by root, outside the data directory the service may write to:
+
+   ```bash
+   ssh ubuntu@<prod> 'set -e; TS=$(date -u +%Y%m%dT%H%M%SZ); sudo mkdir -p /var/backups/botwhisper;
+     for f in botwhisper.sqlite3 botwhisper.sqlite3-wal botwhisper.sqlite3-shm; do
+       [ -e /var/lib/botwhisper/$f ] && sudo cp -a /var/lib/botwhisper/$f /var/backups/botwhisper/$f.$TS || true;
+     done; sudo ls -la /var/backups/botwhisper'
+   ```
+
+4. **Delete the live database** (the sidecars too, so SQLite cannot replay an old WAL into the fresh file):
+
+   ```bash
+   ssh ubuntu@<prod> 'sudo rm -f /var/lib/botwhisper/botwhisper.sqlite3 /var/lib/botwhisper/botwhisper.sqlite3-wal /var/lib/botwhisper/botwhisper.sqlite3-shm'
+   ```
+
+5. **Deploy this build.** The playbook builds the binary on the host from `git archive HEAD`, installs it, renders `relay.env`, and starts `botwhisper-relay`, which creates the schema on first open:
+
+   ```bash
+   just deploy                # asks for confirmation; deploys git HEAD, so commit first
+   ```
+
+6. **Verify** that the fresh relay is the E2E-only build and is empty:
+
+   ```bash
+   curl -s https://relay.botwhisper.si/health | jq .      # "encryption": "mls (end-to-end)", rooms.total == 0
+   curl -s https://relay.botwhisper.si/ | head -5         # mentions `botwhisper connect login`, no /mcp connector URL
+   ssh ubuntu@<prod> 'sudo journalctl -u botwhisper-relay -n 20 --no-pager'   # "connector protocol at /mcp"
+   ```
+
+   Then sign up at `https://relay.botwhisper.si/signup`, run `botwhisper connect login --relay https://relay.botwhisper.si`, create a room from one bot and join it from a second bot (second account or second bot of the same account); `get_status` must show both seats `active` after the owner's connector adds the joiner.
+
+7. **Roll back** (only if step 6 fails): stop the service, put the backup back, deploy the previous commit:
+
+   ```bash
+   ssh ubuntu@<prod> 'sudo systemctl stop botwhisper-relay && sudo cp -a /var/backups/botwhisper/botwhisper.sqlite3.<TS> /var/lib/botwhisper/botwhisper.sqlite3 && sudo chown botwhisper:botwhisper /var/lib/botwhisper/botwhisper.sqlite3'
+   git checkout <previous tag or commit> && just deploy
+   ```
+
+   The backup is a pre-fresh-start database, so only the previous (pre-Phase-3) binary can run on it; this build would refuse nothing but would see tables it does not use and lack columns it expects.
+
+8. **Keep the backup** for a while, then delete it (`sudo rm /var/backups/botwhisper/*.<TS>`): it holds account emails and token hashes, nothing else of value.
+
+## 11. What E2E-only means (decided and shipped)
+
+- **Cloud-only AI apps cannot take part:** Grok app, ChatGPT web, Claude.ai web and desktop connectors, Gemini, hosted bots, anything that can only call a remote MCP URL. They cannot hold keys, so there is no honest E2E for them; the brief accepts this and the relay texts say so.
 - **Coding agents need the binary installed:** Claude Code, Codex CLI, Cursor, OpenClaw go from "add a URL" to "install `botwhisper`, run `connect login`, add a stdio MCP server". The curl/PowerShell installers exist; OS code signing does not (Gatekeeper and SmartScreen warnings until adoption justifies it, DESIGN.md §13.2).
-- **`npx mcp-remote` bridging** of the hosted endpoint stops being a way in for content.
-- **Invite-only guests without an account** (the consent-page "Have an invite instead?" path) cannot be E2E members: every member needs the connector, and the connector needs an account to sign in. Both people need accounts, as Will decided.
+- **`npx mcp-remote` bridging** of the hosted endpoint is not a way in: there is no content tool to bridge to.
+- **Everyone needs an account.** There are no guests: the connector signs in, and sign-in creates the account. Invitees' people sign up too.
 - **Joining needs an existing member online** to commit the Add; "join while everyone is asleep" waits in `pending`.
-- **Headless servers** need the device-code flow (M3) or a copied config directory.
-- **Turn modes, threads and `start_thread`** are not available in e2e rooms in M1 (free mode only); the game-night `moderated` flow from DESIGN.md §8 needs a later design.
-- **Relay-side features that read content** are gone for good: the loop guard's near-duplicate detection (fingerprints need text; rate limits and the minimum interval remain), interrupts' length check, `BODY_TOO_LARGE` on text (replaced by a ciphertext size cap).
-- **Operational:** the connector keeps MLS state locally; losing the config directory means leaving and re-joining every room (M2 persistence, M3 backup guidance).
-- **Memory-only promise** gets the handshake-on-disk exception (§8).
+- **Headless servers** need the device-code flow (later) or a copied config directory.
+- **Threads are implicit and topic-less** at the relay (the first message opens one, the owner's `done` ends it); the topic is just the first message. Turn control is "round table mode" (item 1), enforced on ciphertext sends.
+- **Relay-side features that read content** are gone for good: the loop guard's near-duplicate detection (fingerprints need text; rate limits and the minimum interval remain), the interrupt length check (the connector enforces it before encrypting), `BODY_TOO_LARGE` on text (replaced by a ciphertext size cap).
+- **Operational:** the connector keeps MLS group state in memory for the life of the process; losing it means leaving and re-joining every room (persistent MLS storage is still open).
+- **Memory-only promise** gets the handshake-on-disk exception (§8) and, with item 3, encrypted file blobs on disk until acked or expired.
 
-## 12. Site / `llms.txt` copy that must change later (list only, not edited this round)
+## 12. Site, `llms.txt` and relay copy
 
-- `site/index.html`: hero "Nothing to install" and every "add the connector URL" step; the "For AI agents" block (`claude mcp add --transport http ...`, `codex mcp add --url`, Cursor `mcp.json` `url`); the "End-to-end encryption, coming soon" callout; the security FAQ answers ("the relay operator can read", "what if a bot is offline"); the "Or give your AI agent this page" line; the comparison table of v1/v2.
-- `site/llms.txt`: steps 1 to 4 (remote connector setup, chat apps), the invite-link section, the links block (add install + `connect login`).
-- Relay texts (code, not site, but same content): `GET /` index text, the `/mcp` 401 body and `WWW-Authenticate` guidance, `guidance::agent_setup`, invite pages (`/i/{invite}`), MCP `instructions`, the consent page's "operator can read" notice, the signed-in banner on `/account`, the `encryption: "none (relay can read)"` labels.
-- `README.md`: intro, v1 notice, Install (add `connect`), Tools table (connector vs relay), Doorbells, Privacy; `DESIGN.md` header and §2, §12, §13.1 (remote-only v1 is no longer the plan).
-- Ansible/Caddy comments mentioning "HTTP API" / "plaintext relay".
+Rewritten in Phase 3 (fresh start 0d): `site/index.html` (install steps instead of "nothing to install", the "For AI agents" block with the connector setup, no "coming soon" callout, FAQ), `site/llms.txt`, the relay's `GET /`, 401 body, `guidance::agent_setup`, invite pages, MCP `instructions`, consent and account pages, the sign-in email, and the README and DESIGN.md headers. The only remote URL handed out is the relay base for `botwhisper connect login --relay`.
 
 ## 13. Milestones
 
-- **M1 (this round):** these two design docs; push doorbells (ntfy default, webhook, Web Push, Gotify, Pushover) and `botwhisper listen`; room `kind` + `BW_ALLOW_PLAINTEXT_ROOMS` + `PLAINTEXT_RETIRED`/`E2E_ROOM`; `e2e_*` relay surface with SQLite persistence and tests; `bw-e2e` crate (OpenMLS wrapper) with the 3-bot test (two bots on one account) and an in-process relay integration test; `botwhisper connect` with loopback OAuth login, token storage, `status`; as much of create/join/send/wait over E2E as fits.
-- **M2:** connector feature-complete over E2E (create/invite/join/send/wait/remove/leave), MLS state in `openmls_sqlite_storage`, invite fragment proof + inviter fingerprint, key package replenishment, `listen` zero-config via `get_doorbell`, safety codes, install docs (`/connect` page).
-- **M3:** device-code login, `closing_soon` + grace timer for the cutover, periodic Update commits (forward secrecy on a schedule), site/`llms.txt` rewrite (§12), external review of `bw-e2e` and the invite flow.
-- **M4:** cutover on prod (§10), plaintext code removal, OS code signing if adoption justifies it.
+- **M1 (Phase 2, done):** these two design docs; push doorbells (ntfy default, webhook, Web Push, Gotify, Pushover) and `botwhisper listen`; the `e2e_*` relay surface with SQLite persistence and tests; the `bw-e2e` crate (OpenMLS wrapper) with the 3-bot test and an in-process relay integration test; `botwhisper connect` with loopback OAuth login, token storage, `status`, and create/invite/join/send/wait over E2E.
+- **Phase 3 (done, this branch):** fresh start (plaintext path, guests and migrations removed; accounts for everyone; relay and site copy), round table mode on encrypted rooms, safety numbers (§14), encrypted files, the sealed-sender design.
+- **Still open:** MLS state in `openmls_sqlite_storage` (today a connector restart means re-joining), the invite `k=` proof (owners auto-add every pending seat), key package replenishment on a schedule, periodic Update commits, device-code login for headless boxes, an install page (`/connect`), external review of `bw-e2e` and the invite flow, OS code signing if adoption justifies it, and the prod cutover itself (§10).

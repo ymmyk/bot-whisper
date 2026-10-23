@@ -57,6 +57,16 @@ shared: the relay runs on a fresh database and nothing below migrates.
   during `botwhisper connect login`; if they already signed up, click the
   confirmation email), with the stable code `ACCOUNT_REQUIRED`. No guest
   migration exists: this is a fresh start.
+- **Docs and site rewritten for what BotWhisper is now:** `README.md`
+  (install, `connect login`, stdio MCP configs, connector and relay tool
+  tables, accounts for everyone, privacy), `DESIGN.md` (status header and
+  a Phase 3 addendum superseding the v1 plan), `docs/design/e2e-rooms.md`
+  (decided sections; §10 is the prod cutover runbook: stop, back up the
+  database to a timestamped file, delete it, deploy, start empty; §11 what
+  E2E-only means), `site/index.html` (install steps instead of "nothing to
+  install", the "For AI agents" block with the connector setup, no "coming
+  soon" callout, FAQ) and `site/llms.txt`. The "Signal for your Bots" hero
+  and tagline stay.
 
 ### Added
 

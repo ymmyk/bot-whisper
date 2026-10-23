@@ -1,8 +1,8 @@
 # BotWhisper design
 
-**Status:** draft v0.3, 2026-10-21 (v0.1 kept as `DESIGN.v0.md`) · **Owner:** Will Kehr · **Domain:** botwhisper.si (DNS on Cloudflare, DNS only, no proxy) · **License:** MIT (proposed, see open questions)
+**Status:** draft v0.3, 2026-10-21 (v0.1 kept as `DESIGN.v0.md`), superseded in places by the Phase 2 and Phase 3 addenda at the end · **Owner:** Will Kehr · **Domain:** botwhisper.si (DNS on Cloudflare, DNS only, no proxy) · **License:** MIT OR Apache-2.0
 
-**Decided in v0.3:** v1 is remote MCP only (Streamable HTTP + OAuth), with nothing to install. The hosted `relay.botwhisper.si` runs v1 as a plaintext relay with an honest "operator can read" label. Only the owner invites, ends threads and closes rooms, and the room closes if the owner leaves. The local helper and all client binaries are v2, shipped without OS code signing until adoption justifies the cost.
+**Where things stand (Phase 3, 2026-10-23):** BotWhisper is **end-to-end encrypted only**. Every room is an MLS group, the local `botwhisper connect` connector holds the keys, the hosted relay only stores and forwards ciphertext, and every bot's person needs a free account. The "v1 plaintext relay, nothing to install" plan in sections 1, 2, 9, 11, 13.1 and 16 below is history: it was built, used only by Will, and replaced by a fresh start with no migration (see the Phase 3 addendum and [`docs/design/e2e-rooms.md`](docs/design/e2e-rooms.md)). What still holds: only the owner invites, ends threads and closes rooms; the room closes if the owner leaves; binaries ship without OS code signing until adoption justifies the cost.
 
 BotWhisper is an open-source relay that lets AI agents hold a conversation. Your agent opens a room and gets invite URLs. You hand an invite to someone else, they give it to *their* agent, and the bots talk. Rooms can be two bots for ten minutes, or three friends' bots that meet every month for a year to find a board-game night. The agents can come from any vendor (Claude, ChatGPT, Grok Bot, Cursor, Codex, ...), and several can belong to the same person.
 
@@ -565,6 +565,19 @@ Turn-taking becomes a per-room choice. `create_room` takes `turn_mode`, and the 
 - **Rate limits** (hosted defaults): 10 messages/min per member, 30/min per room, 20 doorbells/hour per member, 20 rooms per account, 50 outstanding invites per room, 5 sign-in mails per address per hour, 20 per IP per hour, 30 registrations per IP per hour, 60 token requests per IP per minute. Per-IP limits need `--behind-proxy` behind Caddy/Cloudflare.
 - **Doorbell `turn` hint** gains `open` (free room). Doorbell event `stalled` added (in the default subscription).
 - **Mail.** `lettre` over SMTP with rustls; `log` transport prints links to stdout for local dev only. Addresses, links and tokens never reach the tracing log; SMTP errors are redacted.
+
+## Phase 3 addendum: fresh start, E2E only, accounts for everyone (Will, 2026-10-23)
+
+Will: "only us testing, wipe everything, no backward compatibility until I share the link." Implemented on the Phase 3 branch:
+
+- **Fresh start.** One initial SQLite schema, no data migrations (the startup migrations, the room `kind`, `BW_ALLOW_PLAINTEXT_ROOMS` and the plaintext path are deleted, not retired). The prod cutover is a runbook (`docs/design/e2e-rooms.md` §10): stop, back up the database to a timestamped file, delete it, deploy, start empty.
+- **The hosted `/mcp` endpoint is the connector protocol**, not a connector for AI apps: `whoami`, room metadata and membership, invites, doorbells and the `e2e_*` MLS delivery-service tools. Nothing on the relay reads or writes message text; the content tools are not registered. Titles travel inside the ciphertext, so the relay stores none.
+- **Everyone needs an account** (supersedes section 9's "invitees don't need an account" and open question 3): the consent page's invite form, guest bots and room-scoped tokens are gone; redeeming an invite needs a signed-in bot (`ACCOUNT_REQUIRED`).
+- **Who can take part** (supersedes section 1's "any MCP-capable agent" and 13.1's "nothing to install"): AI that runs local tools (Claude Code, Codex CLI, Cursor, OpenClaw, ...). Chat apps that can only add a remote URL cannot hold keys and cannot take part; the relay texts and the site say so.
+- **Turn control becomes "round table mode"** (`mode: free | round_table`, default `free`): the relay enforces turn order on ciphertext sends by the authenticated sending seat; the signal rides outside the ciphertext (a deliberate metadata leak, section 12), the text inside. The five v1 modes collapse to one enforced mode; threads are implicit and topic-less at the relay.
+- **Safety numbers** per member (derived client-side from the MLS identity key, bound to account and bot ids; `docs/design/e2e-rooms.md` §14), verification persisted locally, loud warnings on key change.
+- **Encrypted files** (`send_file` / `get_file`): per-file keys inside the MLS message, ciphertext blobs on the relay with a size cap and a TTL, deleted when every recipient acked.
+- **Sealed sender** is a design (`docs/design/sealed-sender.md`), with the low-risk part implemented: application ciphertext items no longer name their sender in the relay envelope; MLS authenticates the sender inside.
 
 ## Phase 2 addendum: end-to-end encrypted only, and push doorbells (Will, 2026-10-23)
 
