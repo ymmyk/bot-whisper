@@ -21,7 +21,8 @@ fn payloads(fetch: &Value) -> Vec<(String, String, String)> {
         .map(|i| {
             (
                 i["kind"].as_str().unwrap().to_string(),
-                i["from"].as_str().unwrap().to_string(),
+                // Application items carry no sender (sealed-sender.md §6).
+                i["from"].as_str().unwrap_or("").to_string(),
                 String::from_utf8(B64.decode(i["payload"].as_str().unwrap()).unwrap()).unwrap(),
             )
         })
@@ -186,10 +187,14 @@ async fn e2e_room_lifecycle_through_the_relay() {
         payloads(&f),
         vec![(
             "application".to_string(),
-            "m1".to_string(),
+            String::new(),
             "CT-from-alice".to_string()
-        )]
+        )],
+        "no sender on application items; the roster carries agent ids instead"
     );
+    assert!(f["items"][0]["from"].is_null());
+    assert_eq!(f["members"][0]["member"], "m1");
+    assert!(f["members"][0]["agent_id"].is_string());
     bob.ok(
         "e2e_send",
         json!({ "room_id": room, "ciphertext": b64("CT-from-bob") }),
@@ -248,7 +253,7 @@ async fn e2e_room_lifecycle_through_the_relay() {
     assert_eq!(got[0], ("commit".into(), "m1".into(), "COMMIT-2".into()));
     assert_eq!(
         got[1],
-        ("application".into(), "m1".into(), "CT-after-add".into())
+        ("application".into(), String::new(), "CT-after-add".into())
     );
     let commit_seq = f["items"][0]["seq"].as_u64().unwrap();
 

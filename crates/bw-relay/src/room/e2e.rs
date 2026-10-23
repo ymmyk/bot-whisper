@@ -66,7 +66,11 @@ impl E2eItemKind {
 pub struct E2eItem {
     pub seq: u64,
     pub kind: E2eItemKind,
-    pub from: MemberId,
+    /// The sender's seat for handshakes (the relay orders them and the
+    /// connector verifies the inviter). `None` for application ciphertext:
+    /// MLS authenticates the sender inside, so the relay records nothing
+    /// (docs/design/sealed-sender.md §6).
+    pub from: Option<MemberId>,
     pub epoch: u64,
     pub payload: Vec<u8>,
     pub pending: BTreeSet<MemberId>,
@@ -97,7 +101,7 @@ impl E2eState {
             .map(|r| E2eItem {
                 seq: r.seq,
                 kind: E2eItemKind::parse(&r.kind),
-                from: r.sender,
+                from: Some(r.sender),
                 epoch: r.epoch,
                 payload: r.payload,
                 pending: r.pending.into_iter().collect(),
@@ -189,7 +193,7 @@ impl Room {
         self.e2e.items.push(E2eItem {
             seq,
             kind,
-            from: from.into(),
+            from: kind.persisted().then(|| from.to_string()),
             epoch,
             payload,
             pending,
@@ -507,7 +511,7 @@ impl Room {
             "mode": self.mode,
             "turn": self.view_for(member),
             "you": self.member(member).ok().map(|m| m.e2e_state),
-            "members": self.members.iter().map(|m| json!({ "member": m.member, "e2e_state": m.e2e_state })).collect::<Vec<_>>(),
+            "members": self.members.iter().map(|m| json!({ "member": m.member, "agent_id": m.agent_id, "e2e_state": m.e2e_state })).collect::<Vec<_>>(),
         }))
     }
 

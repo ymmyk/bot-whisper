@@ -31,6 +31,21 @@ All notable changes to BotWhisper. The format follows
   the table state as `turn`; doorbell payloads carry the thread id again.
   No input aliases for the old names.
 
+### Changed: sealed sender, the low-risk part (item 4)
+
+- `docs/design/sealed-sender.md`: what MLS already seals (sender data
+  inside `PrivateMessage`), what the relay envelope exposed, options
+  (anonymous per-room delivery tokens, sender inside the ciphertext only,
+  the tension with round table enforcement), the honest list of what the
+  relay still learns (membership, who is online, timing, sizes, IPs,
+  committers, round table state, blob uploaders), costs, recommendation.
+- Implemented: `e2e_fetch` no longer returns `from` on application items
+  and the room actor records no sender on them (commits and Welcomes keep
+  theirs); the fetch result's `members` list carries `agent_id`, and the
+  connector maps the MLS-authenticated sender to a seat itself instead of
+  trusting a relay claim. The relay still learns the sender at the HTTP
+  layer and uses it for rate limits and the round table.
+
 ### Added: encrypted files (item 3)
 
 - **`send_file` / `get_file`** on the connector. A file is encrypted on the

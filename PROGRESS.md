@@ -1,7 +1,12 @@
 # Phase 3 progress (fresh start, round table, safety numbers, files, sealed sender)
 
-Status as of 2026-10-23, dev only; nothing deployed, nothing pushed. Each
-numbered item of TASK-phase3 is its own commit (item 0 in four: 0a-0d).
+Status as of 2026-10-23, dev only; nothing deployed, nothing pushed, nothing
+run on prod. Every item of TASK-phase3 is committed (item 0 in four commits,
+0a-0d; then 1, 2b, 3, 4). `cargo fmt --check`, `cargo clippy --workspace
+--all-targets -D warnings` and `cargo test --workspace` are clean: 83 tests
+(9 bw-proto, 5 bw-e2e, 28 bw-relay unit, 32 bw-relay integration, 9
+botwhisper). Dependency count unchanged at 405 workspace crates. The dev
+relay on 9100 still runs the Phase 2 build until Will restarts it.
 
 - **0a** Schema collapsed into one initial schema, migration machinery and
   the pre-bot code fallback removed (`db.rs`, `oauth.rs`); doorbell rows
@@ -45,6 +50,33 @@ numbered item of TASK-phase3 is its own commit (item 0 in four: 0a-0d).
   was already a relay dependency; `cargo tree` count unchanged). Tests:
   `files.rs` (member-only, cap, delete after acks, TTL, room close),
   connector round trip from disk and inline.
+- **4** Sealed sender: `docs/design/sealed-sender.md` (design, options,
+  costs, what stays visible); implemented the low-risk part: no `from`
+  on application items in memory or in `e2e_fetch`, `members` carry
+  `agent_id`, the connector derives `sender.member` from the MLS sender.
+
+## Open questions for Will (Phase 3)
+
+1. **Round table only.** "mode: free | round_table" was read as collapsing
+   the five v1 modes into one enforced mode (join order; two members =
+   alternate). `queue` and `moderated` are gone. OK, or should moderated
+   (owner addresses who speaks) come back under the round table name?
+2. **Threads are implicit and topic-less** at the relay (`start_thread`
+   with a topic would leak it); `thread_start: owner | anyone` stayed. Fine?
+3. **Doorbell default events** now include `message` (free rooms ring on
+   every ciphertext; spacing and the hourly budget cap it). The Phase 2 doc
+   default did not; changed because free rooms otherwise never rang.
+4. **Cutover runbook** (`docs/design/e2e-rooms.md` §10): when, and whether
+   you run it or want it scripted (`just fresh-start`?). Nothing was run.
+5. **Sealed sender option A** (anonymous per-room send tokens, free rooms
+   only; `docs/design/sealed-sender.md` §4.1): worth building, given it
+   mostly helps groups of three or more against a non-logging relay?
+6. **Blob TTL and cap** defaults (7 days, 10 MiB) and the blob directory
+   on prod (`/var/lib/botwhisper/blobs`, next to the SQLite file; the
+   systemd unit's `ReadWritePaths` already covers it).
+7. Carried over: handshake persistence vs. the memory-only promise, the
+   ntfy.sh quota, the invite `k=` proof (owners still auto-add every
+   pending seat), persistent MLS state (a connector restart re-joins).
 
 # Phase 2 progress (push doorbells, `botwhisper listen`, E2E milestone M1)
 

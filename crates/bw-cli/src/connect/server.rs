@@ -432,7 +432,8 @@ impl Connector {
             let Some(bytes) = item["payload"].as_str().and_then(|p| B64.decode(p).ok()) else {
                 continue;
             };
-            let from = item["from"].as_str().unwrap_or_default().to_string();
+            // Application items carry no sender: it is whoever MLS
+            // authenticated, mapped to a seat through the roster below.
             match item["kind"].as_str().unwrap_or_default() {
                 "welcome" => {
                     if st.rooms.contains_key(room_id) {
@@ -477,6 +478,7 @@ impl Connector {
                     };
                     match r.group.process(&self.identity, &bytes) {
                         Ok(Event::Message { sender, plaintext }) => {
+                            let from = seat_of(&seats, &sender).unwrap_or_default();
                             let inner: Inner = match serde_json::from_slice(&plaintext) {
                                 Ok(i) => i,
                                 Err(_) => Inner {
