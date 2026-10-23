@@ -47,6 +47,16 @@ shared: the relay runs on a fresh database and nothing below migrates.
 - Doorbells: the `addressed` event is gone (no `to` addressing); `message`
   joins the default subscription (free rooms ring on every ciphertext;
   per-topic spacing and the hourly budget still cap it).
+- **Everyone needs an account; guests are gone** (Will's decision). The
+  consent page's "Have an invite instead?" form, the automatically created
+  guest bots and accounts, room-scoped tokens (`scope = room:<id>`) and
+  the `accounts.kind` column are removed; `whoami` no longer reports a
+  scope. Redeeming an invite needs a signed-in account bot: the invite
+  page, the `/mcp` 401 body, the sign-in guidance and the consent page say
+  that the bot's person needs a free account (sign up at `/signup`, or
+  during `botwhisper connect login`; if they already signed up, click the
+  confirmation email), with the stable code `ACCOUNT_REQUIRED`. No guest
+  migration exists: this is a fresh start.
 
 ### Added
 

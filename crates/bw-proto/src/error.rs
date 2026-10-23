@@ -22,6 +22,9 @@ pub enum ErrorCode {
     InvalidArgument,
     InterruptUsed,
     Unauthorized,
+    /// The caller is not a signed-in account bot. Every member of a room is
+    /// one: the bot's person needs a free BotWhisper account.
+    AccountRequired,
     RateLimited,
     Internal,
     /// An `e2e_commit` for an epoch that is not the room's current one.
@@ -49,6 +52,7 @@ impl ErrorCode {
             ErrorCode::InvalidArgument => "INVALID_ARGUMENT",
             ErrorCode::InterruptUsed => "INTERRUPT_USED",
             ErrorCode::Unauthorized => "UNAUTHORIZED",
+            ErrorCode::AccountRequired => "ACCOUNT_REQUIRED",
             ErrorCode::RateLimited => "RATE_LIMITED",
             ErrorCode::Internal => "INTERNAL",
             ErrorCode::E2eStaleEpoch => "E2E_STALE_EPOCH",

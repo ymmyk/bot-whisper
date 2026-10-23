@@ -20,10 +20,6 @@
 //!    token and a rotating refresh token. Tokens are opaque; only hashes
 //!    are stored.
 //!
-//! Invitees without an account paste their invite URL on the same page and
-//! get a token scoped to that one room (`scope = room:<id>`), bound to one
-//! automatically created guest bot (no picker).
-//!
 //! Nothing here logs email addresses, tokens, codes or links.
 
 // Handlers return a ready `Response` as the error branch; that is the
@@ -45,7 +41,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    auth::{sha256_hex, AgentId},
+    auth::sha256_hex,
     config::RelayConfig,
     db::{
         new_bot_id, unique_bot_name, AccountRow, BotRow, ClientRow, CodeRow, Db, PendingLogin,
@@ -313,10 +309,6 @@ pub struct AuthorizeParams {
     pub action: Option<String>,
     #[serde(default)]
     pub email: Option<String>,
-    #[serde(default)]
-    pub invite_url: Option<String>,
-    #[serde(default)]
-    pub display_name: Option<String>,
     /// Bot picker: a bot id, or `new`.
     #[serde(default)]
     pub bot: Option<String>,
@@ -635,12 +627,8 @@ fn signin_page(req: &AuthzRequest, client: &ClientRow, error: Option<&str>) -> H
 <p class="muted">We'll email you a confirmation link. It works once and expires in 15 minutes. No password.</p>
 <button type="submit">Email me a link</button></form>
 <hr>
-<h2>Have an invite instead?</h2>
-<p class="muted">Guests don't need an account. Paste the invite URL you were given and this client gets access to that one room only.</p>
-<form method="post" action="/oauth/authorize">{fields}<input type="hidden" name="action" value="invite">
-<label for="invite_url">Invite URL</label><input id="invite_url" name="invite_url" type="url" required placeholder="https://relay.botwhisper.si/i/…">
-<label for="display_name">Your bot's name (optional, shown to the room)</label><input id="display_name" name="display_name" type="text" maxlength="60" placeholder="Sam's Claude">
-<button type="submit" class="ghost">Join with invite</button></form>
+<h2>Got an invite link?</h2>
+<p class="muted">You still need an account: every member of a room is a signed-in bot. Sign in above (it creates your account), then give the invite link to your bot and it joins with <code>join_room</code>.</p>
 {notice}"#,
             client = client_label(client),
             host = esc(&redirect_host(&req.redirect_uri)),
@@ -650,8 +638,7 @@ fn signin_page(req: &AuthzRequest, client: &ClientRow, error: Option<&str>) -> H
 }
 
 /// CSRF token for forms shown to a signed-in browser, bound to the session
-/// secret (the sign-in page itself needs none: it only sends an email or
-/// redeems an invite the person typed).
+/// secret (the sign-in page itself needs none: it only sends an email).
 pub(crate) fn session_csrf(session: &str) -> String {
     sha256_hex(&format!("bw-account-csrf:{session}"))[..32].to_string()
 }
@@ -742,7 +729,7 @@ fn picker_page(
 <button type="submit" name="action" value="deny" class="ghost">Deny</button>
 <button type="submit" name="action" value="logout" class="ghost">Not you? Sign out</button></form>
 {notice}"#,
-            email = esc(account.email.as_deref().unwrap_or("guest")),
+            email = esc(&account.email),
             client = client_label(client),
             host = esc(&redirect_host(&req.redirect_uri)),
             fields = req.hidden_fields(),
@@ -889,9 +876,7 @@ pub async fn authorize_get(
         Err(r) => return r,
     };
     match (current_account(&st, &headers), csrf_from_headers(&headers)) {
-        (Some(acct), Some(csrf)) if acct.kind == "user" => {
-            picker_page(&st, &req, &client, &acct, &csrf, None)
-        }
+        (Some(acct), Some(csrf)) => picker_page(&st, &req, &client, &acct, &csrf, None),
         _ => no_store(signin_page(&req, &client, None)),
     }
 }
@@ -918,7 +903,7 @@ pub async fn authorize_post(
             r
         }
         action @ ("allow" | "back") => match current_account(&st, &headers) {
-            Some(acct) if acct.kind == "user" => {
+            Some(acct) => {
                 let csrf = csrf_from_headers(&headers);
                 if !csrf_ok(csrf.clone(), p.csrf.as_deref()) {
                     return no_store(error_page(
@@ -947,16 +932,6 @@ pub async fn authorize_post(
                 &client,
                 &ip,
                 p.email.as_deref().unwrap_or_default(),
-            )
-            .await
-        }
-        "invite" => {
-            guest_join(
-                &st,
-                &req,
-                &client,
-                p.invite_url.as_deref().unwrap_or_default(),
-                p.display_name,
             )
             .await
         }
@@ -1105,78 +1080,6 @@ async fn start_email_signin(
     }
 }
 
-async fn guest_join(
-    st: &OauthState,
-    req: &AuthzRequest,
-    client: &ClientRow,
-    invite_url: &str,
-    display_name: Option<String>,
-) -> Response {
-    if invite_url.trim().is_empty() {
-        return no_store(signin_page(req, client, Some("Paste the invite URL.")));
-    }
-    let display_name = display_name
-        .map(|d| d.trim().chars().take(60).collect::<String>())
-        .filter(|d| !d.is_empty());
-    let now = now_unix();
-    let account = AccountRow {
-        id: uuid::Uuid::new_v4().to_string(),
-        email: None,
-        kind: "guest".into(),
-        created_at: now,
-    };
-    if st.db.insert_account(&account).is_err() {
-        return error_page(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Storage error",
-            "Please try again.",
-        );
-    }
-    // One automatically created guest bot, keeping the pre-bot agent id
-    // shape `<guest account>:<client>`.
-    let bot = BotRow {
-        id: new_bot_id(),
-        account_id: account.id.clone(),
-        name: display_name
-            .clone()
-            .or_else(|| client.name.as_deref().map(clean_bot_name))
-            .filter(|n| !n.is_empty())
-            .unwrap_or_else(|| "Guest bot".into()),
-        agent_id: AgentId::legacy_oauth_id(&account.id, &client.id),
-        created_at: now,
-        last_used_at: Some(now),
-        last_client_id: Some(client.id.clone()),
-        last_client_name: None,
-    };
-    if st.db.insert_bot(&bot).is_err() {
-        let _ = st.db.delete_account(&account.id);
-        return error_page(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Storage error",
-            "Please try again.",
-        );
-    }
-    let agent = AgentId::for_bot(&bot, SCOPE_ROOMS);
-    match st.registry.join(&agent, invite_url).await {
-        Ok((room, _member)) => {
-            issue_code_and_redirect(st, req, &account.id, &format!("room:{}", room.id), &bot.id)
-        }
-        Err(e) => {
-            // Nothing else references the guest account or bot yet.
-            let _ = st.db.delete_bot(&bot.id);
-            let _ = st.db.delete_account(&account.id);
-            no_store(signin_page(
-                req,
-                client,
-                Some(&format!(
-                    "Could not join with that invite: {} ({})",
-                    e.message, e.code
-                )),
-            ))
-        }
-    }
-}
-
 fn issue_code_and_redirect(
     st: &OauthState,
     req: &AuthzRequest,
@@ -1243,8 +1146,7 @@ pub async fn confirm(State(st): State<OauthState>, Path(token): Path<String>) ->
         Ok(None) => {
             let a = AccountRow {
                 id: uuid::Uuid::new_v4().to_string(),
-                email: Some(pending.email.clone()),
-                kind: "user".into(),
+                email: pending.email.clone(),
                 created_at: now,
             };
             if st.db.insert_account(&a).is_err() {

@@ -52,12 +52,6 @@ impl Registry {
         agent: &AgentId,
         opts: NewRoom,
     ) -> Result<RoomHandle, RelayError> {
-        if agent.room_scope().is_some() {
-            return Err(RelayError::new(
-                ErrorCode::Unauthorized,
-                "invite-scoped guests cannot create rooms; sign in with an account",
-            ));
-        }
         let max_rooms = self.cfg.limits.rooms_per_account;
         if max_rooms > 0 && self.db.count_rooms_owned_by(agent.limit_key())? >= max_rooms {
             return Err(RelayError::new(
@@ -107,16 +101,12 @@ impl Registry {
         Ok(handle)
     }
 
-    /// Resolve the calling agent's membership in a room. Guest tokens only
-    /// resolve the room they are scoped to.
+    /// Resolve the calling agent's membership in a room.
     pub async fn resolve(
         &self,
         agent: &AgentId,
         room_id: &str,
     ) -> Result<(RoomHandle, Member), RelayError> {
-        if agent.room_scope().is_some_and(|r| r != room_id) {
-            return Err(RelayError::not_a_member());
-        }
         let handle = self.get(room_id).await?;
         let id = agent.id.clone();
         let member = handle
@@ -135,9 +125,6 @@ impl Registry {
     ) -> Result<Vec<(RoomHandle, MemberId)>, RelayError> {
         let mut out = Vec::new();
         for (room_id, member_id) in self.db.rooms_for_agent(&agent.id)? {
-            if agent.room_scope().is_some_and(|r| r != room_id) {
-                continue;
-            }
             match self.get(&room_id).await {
                 Ok(h) => out.push((h, member_id)),
                 Err(_) => continue,
@@ -152,9 +139,6 @@ impl Registry {
             .cloned()
             .collect();
         for h in closing {
-            if agent.room_scope().is_some_and(|r| r != h.id) {
-                continue;
-            }
             let id = agent.id.clone();
             if let Ok(Some(member)) = h.with(move |r| r.pending_close_for(&id)).await {
                 out.push((h, member));
@@ -169,12 +153,6 @@ impl Registry {
         agent: &AgentId,
         invite_url: &str,
     ) -> Result<(RoomHandle, Member), RelayError> {
-        if agent.room_scope().is_some() {
-            return Err(RelayError::new(
-                ErrorCode::Unauthorized,
-                "this token is scoped to one room; sign in with an account to join more",
-            ));
-        }
         let token = invite_url
             .trim()
             .trim_end_matches('/')

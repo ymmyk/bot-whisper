@@ -59,11 +59,12 @@ CREATE TABLE IF NOT EXISTS doorbells (
     last_delivery_at INTEGER,
     PRIMARY KEY (room_id, member_id)
 );
--- Accounts and OAuth 2.1. Every secret is stored hashed.
+-- Accounts and OAuth 2.1. Every account has a confirmed email (there are
+-- no guests: every member of a room is a signed-in bot). Every secret is
+-- stored hashed.
 CREATE TABLE IF NOT EXISTS accounts (
     id            TEXT PRIMARY KEY,
-    email         TEXT UNIQUE,
-    kind          TEXT NOT NULL,
+    email         TEXT NOT NULL UNIQUE,
     created_at    INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS oauth_clients (
@@ -254,13 +255,11 @@ pub struct RoomRow {
     pub e2e_epoch: u64,
 }
 
-/// An account row. `email` is `None` for invite-scoped guests.
+/// An account row.
 #[derive(Debug, Clone)]
 pub struct AccountRow {
     pub id: String,
-    pub email: Option<String>,
-    /// `user` or `guest`.
-    pub kind: String,
+    pub email: String,
     pub created_at: u64,
 }
 
@@ -1036,8 +1035,8 @@ impl Db {
     pub fn insert_account(&self, a: &AccountRow) -> Result<()> {
         self.with(|c| {
             c.execute(
-                "INSERT INTO accounts (id, email, kind, created_at) VALUES (?1, ?2, ?3, ?4)",
-                params![a.id, a.email, a.kind, a.created_at as i64],
+                "INSERT INTO accounts (id, email, created_at) VALUES (?1, ?2, ?3)",
+                params![a.id, a.email, a.created_at as i64],
             )?;
             Ok(())
         })
@@ -1046,7 +1045,7 @@ impl Db {
     pub fn get_account(&self, id: &str) -> Result<Option<AccountRow>> {
         self.with(|c| {
             c.query_row(
-                "SELECT id, email, kind, created_at FROM accounts WHERE id = ?1",
+                "SELECT id, email, created_at FROM accounts WHERE id = ?1",
                 params![id],
                 account_row,
             )
@@ -1054,17 +1053,10 @@ impl Db {
         })
     }
 
-    pub fn delete_account(&self, id: &str) -> Result<()> {
-        self.with(|c| {
-            c.execute("DELETE FROM accounts WHERE id = ?1", params![id])?;
-            Ok(())
-        })
-    }
-
     pub fn account_by_email(&self, email: &str) -> Result<Option<AccountRow>> {
         self.with(|c| {
             c.query_row(
-                "SELECT id, email, kind, created_at FROM accounts WHERE email = ?1",
+                "SELECT id, email, created_at FROM accounts WHERE email = ?1",
                 params![email],
                 account_row,
             )
@@ -1616,8 +1608,7 @@ fn account_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<AccountRow> {
     Ok(AccountRow {
         id: r.get(0)?,
         email: r.get(1)?,
-        kind: r.get(2)?,
-        created_at: r.get::<_, i64>(3)? as u64,
+        created_at: r.get::<_, i64>(2)? as u64,
     })
 }
 

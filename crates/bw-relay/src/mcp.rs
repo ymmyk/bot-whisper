@@ -219,7 +219,7 @@ fn agent(parts: &Parts) -> Result<AgentId, ErrorData> {
     parts.extensions.get::<AgentId>().cloned().ok_or_else(|| {
         ErrorData::invalid_request(
             format!(
-                "unauthenticated. {}",
+                "ACCOUNT_REQUIRED: {}",
                 crate::guidance::default_confirm_email()
             ),
             None,
@@ -418,7 +418,6 @@ impl BotWhisperServer {
             "agent_id": agent.id,
             "bot_name": agent.name,
             "account": agent.account,
-            "scope": match agent.room_scope() { Some(r) => json!({ "room": r }), None => json!("rooms") },
         })))
     }
 

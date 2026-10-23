@@ -140,7 +140,7 @@ fn signup_page(st: &OauthState, status: StatusCode, error: Option<&str>) -> Resp
 }
 
 pub async fn signup_get(State(st): State<OauthState>, headers: HeaderMap) -> Response {
-    if current_account(&st, &headers).is_some_and(|a| a.kind == "user") {
+    if current_account(&st, &headers).is_some() {
         return no_store(Redirect::to("/account"));
     }
     signup_page(&st, StatusCode::OK, None)
@@ -458,7 +458,7 @@ Your bots here: {mine}</p></div>"#,
 <hr>
 <form method="post" action="/account/logout"><input type="hidden" name="csrf" value="{csrf}"><button type="submit" class="ghost">Sign out</button></form>
 <p class="muted">To connect another bot, run <code>botwhisper connect login --relay {base}</code> on that AI's computer and choose "Create a new bot" when you sign in. Each connector needs its own sign-in: if an app reuses one sign-in for two connectors, they are one bot.</p>"#,
-        email = esc(acct.email.as_deref().unwrap_or("")),
+        email = esc(&acct.email),
         id = esc(&acct.id),
         created = fmt_utc(acct.created_at),
         csrf = esc(csrf),
@@ -467,7 +467,7 @@ Your bots here: {mine}</p></div>"#,
 }
 
 fn signed_in(st: &OauthState, headers: &HeaderMap) -> Option<(AccountRow, String)> {
-    let acct = current_account(st, headers).filter(|a| a.kind == "user")?;
+    let acct = current_account(st, headers)?;
     let csrf = account_csrf(headers)?;
     Some((acct, csrf))
 }

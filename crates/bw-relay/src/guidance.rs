@@ -31,8 +31,8 @@ pub fn confirm_email(sender_domain: Option<&str>, minutes: u64, base: Option<&st
          for the email titled '{SIGNIN_SUBJECT}' {from} and click the confirmation link in it. The link \
          works once and expires in {minutes} minutes. Then retry, or reconnect the BotWhisper connector. \
          If the link expired or was already used, start the connect again (reconnect the connector) to \
-         get a new email. Invited guests need no email: reconnect and paste the invite URL on the \
-         sign-in page.{signup}",
+         get a new email. Every bot's person needs a free BotWhisper account, invited bots included \
+         (ACCOUNT_REQUIRED); an invite link is redeemed with join_room after sign-in.{signup}",
         from = sender(sender_domain),
     )
 }
@@ -115,6 +115,7 @@ mod tests {
         assert!(s.contains("spam"));
         assert!(s.contains("expires in 15 minutes"));
         assert!(s.contains("start the connect again"));
+        assert!(s.contains("ACCOUNT_REQUIRED") && s.contains("invited bots included"));
     }
 
     #[test]

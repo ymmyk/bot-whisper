@@ -1,6 +1,6 @@
 //! OAuth 2.1 end to end: metadata, dynamic client registration, the consent
 //! page, email confirmation links, PKCE, refresh rotation, revocation,
-//! invite-scoped guests, and the dev-token flag.
+//! and the dev-token flag.
 
 mod common;
 
@@ -406,7 +406,8 @@ async fn email_signin_pkce_refresh_and_revoke() {
     assert_eq!(r.status(), StatusCode::OK);
     let page = r.text().await.unwrap();
     assert!(page.contains("Test &lt;Client&gt;"));
-    assert!(page.contains("Have an invite instead?"));
+    assert!(page.contains("Got an invite link?"));
+    assert!(page.contains("You still need an account"));
     assert!(
         page.contains("End-to-end encrypted."),
         "encryption notice on the consent page"
@@ -811,71 +812,6 @@ async fn two_bots_on_one_account_and_client_are_two_members() {
 }
 
 #[tokio::test]
-async fn guest_joins_with_invite_and_is_scoped_to_that_room() {
-    let relay = TestRelay::start().await;
-    let base = relay.base();
-    let http = client();
-    let owner = relay.bot(TOKENS[0]).await;
-    let room = owner.ok("create_room", json!({ "title": "Guests" })).await["room_id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    let other = make_room(&owner, &[], json!({})).await;
-    let inv = owner
-        .ok("create_invite", json!({ "room_id": room, "label": "Sam" }))
-        .await;
-
-    let client_id = register(&http, &base).await;
-    let mut form = authorize_params(&client_id, "g1");
-    form.push(("action", "invite".into()));
-    form.push(("invite_url", inv["invite_url"].as_str().unwrap().into()));
-    form.push(("display_name", "Sam's bot".into()));
-    let r = http
-        .post(format!("{base}/oauth/authorize"))
-        .form(&form)
-        .send()
-        .await
-        .unwrap();
-    let (code, state) = code_from_location(&r);
-    assert_eq!(state, "g1");
-    let r = exchange(&http, &base, &client_id, &code, VERIFIER).await;
-    assert_eq!(r.status(), StatusCode::OK);
-    let tokens: Value = r.json().await.unwrap();
-    assert_eq!(tokens["scope"], format!("room:{room}"));
-
-    let guest = relay.bot(tokens["access_token"].as_str().unwrap()).await;
-    let st = guest.ok("get_status", json!({ "room_id": room })).await;
-    assert_eq!(st["you"]["member"], "m2");
-    assert_eq!(st["you"]["display_name"], "Sam's bot");
-    assert_eq!(st["members"][1]["invite_label"], "Sam");
-    assert_eq!(
-        guest.err("create_room", json!({ "title": "nope" })).await,
-        "UNAUTHORIZED"
-    );
-    assert_eq!(
-        guest.err("get_status", json!({ "room_id": other })).await,
-        "NOT_A_MEMBER"
-    );
-    let inv2 = owner.ok("create_invite", json!({ "room_id": other })).await;
-    assert_eq!(
-        guest
-            .err("join_room", json!({ "invite_url": inv2["invite_url"] }))
-            .await,
-        "UNAUTHORIZED"
-    );
-    // The invite is spent: a second guest attempt is refused on the page.
-    let r = http
-        .post(format!("{base}/oauth/authorize"))
-        .form(&form)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(r.status(), StatusCode::OK);
-    assert!(r.text().await.unwrap().contains("INVITE_USED"));
-    relay.shutdown().await;
-}
-
-#[tokio::test]
 async fn signup_is_rate_limited_and_dev_tokens_need_the_flag() {
     let mut cfg = test_config();
     cfg.limits.signups_per_email_per_hour = 2;
@@ -990,7 +926,7 @@ async fn unconfirmed_clients_are_told_to_confirm_the_email() {
         assert!(www.contains("resource_metadata=\""));
         says_confirm(&www);
         let body = r.text().await.unwrap();
-        assert!(body.starts_with("unauthorized: No BotWhisper access yet."));
+        assert!(body.starts_with("unauthorized (ACCOUNT_REQUIRED): No BotWhisper access yet."));
         says_confirm(&body);
         assert!(body.contains("from this BotWhisper relay"));
         assert!(body.contains(&format!("create an account first at {base}/signup")));

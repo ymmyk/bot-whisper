@@ -8,10 +8,6 @@
 //!   the account anchors rate limits.
 //! - **Dev tokens** (`--dev-token`, local development only, behind
 //!   `--allow-dev-tokens`). The identity is the hex SHA-256 of the token.
-//!
-//! Invite-scoped guests get a token whose scope is `room:<id>`; they can act
-//! only inside that room.
-
 use std::{collections::HashSet, sync::Arc};
 
 use axum::{
@@ -24,15 +20,6 @@ use sha2::{Digest, Sha256};
 
 use crate::db::Db;
 
-/// What a token may do.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum Scope {
-    /// A full account: create rooms, join by invite, everything.
-    Rooms,
-    /// An invite-scoped guest: only this room.
-    Room(String),
-}
-
 /// The authenticated agent, stored in request extensions and visible to tool
 /// handlers through `http::request::Parts`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -41,7 +28,6 @@ pub struct AgentId {
     pub id: String,
     /// Account the agent belongs to (rate limits). `None` for dev tokens.
     pub account: Option<String>,
-    pub scope: Scope,
     /// The bot's name, the default display name in rooms. `None` for dev
     /// tokens.
     pub name: Option<String>,
@@ -54,35 +40,16 @@ impl AgentId {
         AgentId {
             id: hex::encode(&digest[..16]),
             account: None,
-            scope: Scope::Rooms,
             name: None,
         }
     }
 
-    /// Agent id of a guest bot (`<guest account>:<client>`).
-    pub fn legacy_oauth_id(account_id: &str, client_id: &str) -> String {
-        format!("{account_id}:{client_id}")
-    }
-
-    /// The agent for a bot, with the token's scope.
-    pub fn for_bot(bot: &crate::db::BotRow, scope: &str) -> Self {
-        let scope = match scope.strip_prefix("room:") {
-            Some(room) => Scope::Room(room.to_string()),
-            None => Scope::Rooms,
-        };
+    /// The agent for a bot.
+    pub fn for_bot(bot: &crate::db::BotRow) -> Self {
         AgentId {
             id: bot.agent_id.clone(),
             account: Some(bot.account_id.clone()),
-            scope,
             name: Some(bot.name.clone()),
-        }
-    }
-
-    /// The room a guest token is confined to, if any.
-    pub fn room_scope(&self) -> Option<&str> {
-        match &self.scope {
-            Scope::Room(r) => Some(r),
-            Scope::Rooms => None,
         }
     }
 
@@ -151,7 +118,7 @@ impl TokenAuth {
             return None;
         }
         let _ = self.db.touch_bot(&bot.id, now, None);
-        Some(AgentId::for_bot(&bot, &row.scope))
+        Some(AgentId::for_bot(&bot))
     }
 }
 
@@ -184,8 +151,9 @@ pub async fn require_bearer(
 }
 
 /// 401 for `/mcp`. The `error_description` and the body both carry the
-/// bot-addressed guidance (confirm the email, then retry or reconnect), since
-/// clients surface one or the other to the agent.
+/// bot-addressed guidance (the person needs an account; confirm the email,
+/// then sign in again), since clients surface one or the other to the
+/// agent. The body names the stable code `ACCOUNT_REQUIRED`.
 fn unauthorized(resource_metadata: &str, help: &str, setup: &str) -> Response {
     let www = format!(
         "Bearer realm=\"botwhisper\", error=\"invalid_token\", error_description=\"{help}\", resource_metadata=\"{resource_metadata}\""
@@ -200,7 +168,7 @@ fn unauthorized(resource_metadata: &str, help: &str, setup: &str) -> Response {
         StatusCode::UNAUTHORIZED,
         [(header::WWW_AUTHENTICATE, www)],
         format!(
-            "unauthorized: {help}\n\n{setup}\n\
+            "unauthorized (ACCOUNT_REQUIRED): {help}\n\n{setup}\n\
              Technical: send `Authorization: Bearer <token>` from the OAuth sign-in; see {resource_metadata}\n"
         ),
     )
@@ -234,7 +202,7 @@ mod tests {
                 kind: "access".into(),
                 client_id: "cl".into(),
                 account_id: "acct".into(),
-                scope: "room:r1".into(),
+                scope: "rooms".into(),
                 expires_at: now + 60,
                 bot_id: Some("bot_1".into()),
             },
@@ -256,7 +224,6 @@ mod tests {
         let a = auth.authenticate("tok").unwrap();
         assert_eq!(a.id, "acct:cl");
         assert_eq!(a.name.as_deref(), Some("Sam"));
-        assert_eq!(a.room_scope(), Some("r1"));
         assert_eq!(a.limit_key(), "acct");
         assert!(auth.authenticate("other").is_none());
     }

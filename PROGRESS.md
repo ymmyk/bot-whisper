@@ -14,6 +14,11 @@ numbered item of TASK-phase3 is its own commit (item 0 in four: 0a-0d).
   account requirement. Tests: `exchange`, `free_mode`, `guards` deleted;
   the shared harness drives `e2e_send` / `e2e_fetch`; `e2e_relay` grew
   removal, owner-leave, rate-limit, cap and expiry coverage.
+- **0c (= item 2a)** Guests removed outright: no invite form on the consent
+  page, no guest bots/accounts, no room-scoped tokens, `accounts.kind`
+  gone. `ACCOUNT_REQUIRED` named in the 401 body, the invite page, the
+  sign-in guidance and the unauthenticated tool error. No migrate-guests
+  subcommand (fresh start, nothing to migrate).
 
 # Phase 2 progress (push doorbells, `botwhisper listen`, E2E milestone M1)
 
