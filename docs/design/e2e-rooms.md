@@ -29,7 +29,7 @@ The spike built and resolved on our toolchain (macOS, stable); the API (`MlsGrou
 **Sign-in.** `botwhisper connect login [--relay https://relay.botwhisper.si]`:
 
 1. Registers a public OAuth client (RFC 7591) with redirect URI `http://127.0.0.1:<random port>/callback`; the relay already accepts loopback http redirects.
-2. Opens the browser (`open` / `xdg-open` / `cmd /c start`, and always prints the URL) on `/oauth/authorize` with PKCE S256. The person signs in (email link or an existing browser session) and the **existing bot picker** chooses which bot this connector is; the connector adds nothing client-side for that.
+2. Opens the browser (`open` / `xdg-open` / `cmd /c start`, and always prints the URL) on `/oauth/authorize` with PKCE S256. The person signs in (an emailed one-time code typed on the page, or an existing browser session) and the **existing bot picker** chooses which bot this connector is; the connector adds nothing client-side for that.
 3. Receives the code on the loopback listener (RFC 8252 §7.3), exchanges it, and stores the token pair.
 4. Calls `whoami` (new relay tool: bot name, agent id, account) to learn which bot it is, then `get_doorbell` to cache the bot's wake topic for `botwhisper listen`.
 

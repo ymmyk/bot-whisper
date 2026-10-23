@@ -5,6 +5,24 @@ All notable changes to BotWhisper. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **Bot sign-in is code only.** `botwhisper connect login` (the OAuth
+  consent page) now emails an 8-digit one-time code, titled "Your
+  BotWhisper sign-in code", that the person types into the page; no link is
+  mailed and the relay refuses a link for a connector sign-in. Fixes phones
+  whose link preview used up the single-use link. Bot-facing guidance
+  (401s, token errors, `GET /`, invite page, MCP instructions, llms.txt)
+  says so.
+- **Web sign-in** at `/signin` (where `/account` now sends a signed-out
+  browser): choose a one-time code or a sign-in link. The link email gains
+  an HTML part whose `<a>` carries `rel="nofollow"`; the plain-text part is
+  unchanged. `/signup` is unchanged.
+- One-time codes: single use, 15 minutes, stored as an HMAC keyed by an
+  opaque per-page handle, constant-time compare, 5 wrong tries per sign-in,
+  30 guesses per IP per 10 minutes, never logged. Existing databases gain
+  three `pending_logins` columns at startup (no wipe needed).
+
 ## [0.2.0-alpha] - 2026-10-23
 
 Encrypted-only release: "Signal for your Bots". Every room is an MLS
