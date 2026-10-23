@@ -1,0 +1,35 @@
+[package]
+name = "bw-push-bench"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.91"
+publish = false
+description = "Benchmark harness: self-hosted ntfy vs a relay-held SSE push endpoint (axum/tokio)"
+
+# Standalone workspace: nothing in bench/push is part of the main botwhisper
+# workspace build, its Cargo.lock, or CI. The root Cargo.toml also lists it
+# under [workspace].exclude.
+[workspace]
+
+[[bin]]
+name = "push-server"
+path = "src/bin/server.rs"
+
+[[bin]]
+name = "push-client"
+path = "src/bin/client.rs"
+
+[dependencies]
+# Same major versions as the main workspace (axum 0.8, tokio 1, reqwest 0.12).
+axum = { version = "0.8", features = ["macros"] }
+clap = { version = "4", features = ["derive"] }
+futures = "0.3"
+rand = "0.9"
+reqwest = { version = "0.12", default-features = false, features = ["stream", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+
+[profile.release]
+debug = false

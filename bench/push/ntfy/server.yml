@@ -1,0 +1,23 @@
+# ntfy config for the benchmark (self-hosted on this Mac, loopback only).
+# Rate limits are raised / loopback exempted so ntfy's per-visitor limits
+# (30 subscriptions, 60 requests burst) do not dominate the measurement.
+base-url: "http://127.0.0.1:9110"
+listen-http: "127.0.0.1:9110"
+# Message cache so `since=` catch-up works (ntfy.sh keeps 12 h).
+cache-file: "/tmp/bw-push-bench-ntfy/cache.db"
+cache-duration: "1h"
+# Synchronous cache writes (ntfy default) with WAL so the SQLite write path
+# is not the bottleneck; same spirit as a tuned production install.
+cache-startup-queries: "pragma journal_mode = WAL; pragma synchronous = normal; pragma temp_store = memory;"
+keepalive-interval: "30s"
+global-topic-limit: 100000
+visitor-subscription-limit: 100000
+visitor-request-limit-burst: 1000000
+visitor-request-limit-replenish: "1ms"
+visitor-request-limit-exempt-hosts: "127.0.0.1"
+visitor-message-daily-limit: 100000000
+log-level: "warn"
+# Per-visitor topic creation limiter (default burst 100): every bench bot is
+# its own topic, so raise it or the 101st subscriber gets HTTP 429 (code 42911).
+visitor-topic-creation-limit-burst: 1000000
+visitor-topic-creation-limit-replenish: "1ms"

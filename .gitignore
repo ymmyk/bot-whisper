@@ -17,3 +17,7 @@ ansible/inventory
 relay.log
 relay.pid
 __pycache__/
+claude-phase2.log
+claude-phase2.pid
+claude-bench.log
+claude-bench.pid
