@@ -1,12 +1,16 @@
 # Phase 3 progress (fresh start, round table, safety numbers, files, sealed sender)
 
-Status as of 2026-10-23, dev only; nothing deployed, nothing pushed, nothing
-run on prod. Every item of TASK-phase3 is committed (item 0 in four commits,
+Status as of 2026-10-23 10:40 CDT, dev only; nothing deployed, nothing run on
+prod. All Phase 3 commits are pushed to origin/main (8ed41eb..89c2fa6), and the
+next resume starts from the M2 list below. Queue order as done: A fresh start
+(0a-0d), round table (1), accounts + safety numbers (0c/2b), files (3),
+sealed sender (4). Every item of TASK-phase3 is committed (item 0 in four commits,
 0a-0d; then 1, 2b, 3, 4). `cargo fmt --check`, `cargo clippy --workspace
 --all-targets -D warnings` and `cargo test --workspace` are clean: 83 tests
 (9 bw-proto, 5 bw-e2e, 28 bw-relay unit, 32 bw-relay integration, 9
 botwhisper). Dependency count unchanged at 405 workspace crates. The dev
-relay on 9100 still runs the Phase 2 build until Will restarts it.
+relay on 9100 runs the 89c2fa6 build on a fresh dev DB (the old one was moved
+to data/backup-<timestamp>/).
 
 - **0a** Schema collapsed into one initial schema, migration machinery and
   the pre-bot code fallback removed (`db.rs`, `oauth.rs`); doorbell rows
