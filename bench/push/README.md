@@ -160,8 +160,17 @@ Reading the numbers:
 
 ## Recommendation
 
-**Stay on ntfy.sh for now; keep self-hosted ntfy as the first fallback; do
-not build our own push stream.**
+**Use ntfy.sh only for dev and a handful of bots; self-host ntfy (or buy an
+ntfy.sh Pro/Business token for `BW_NTFY_TOKEN`) before launch; do not build
+our own push stream.**
+
+* The binding constraint is ntfy.sh's quota, not performance: the anonymous
+  tier allows **250 messages per day per publishing IP** (`ntfy.sh/v1/tiers`,
+  checked 2026-10-23), and every doorbell is published from the relay's one
+  IP, so anonymous ntfy.sh caps the whole relay at ~250 pings/day. Paid tiers
+  are per account token: Supporter 2,500/day, Pro 20,000/day, Business
+  50,000/day. Self-hosting removes the cap and costs ~40 MiB + ~40 KiB per
+  online bot (measured below).
 
 * Performance gives no reason to move. The relay-held stream is faster and
   lighter per message, but at 10-100 pings/s across thousands of bots the
@@ -170,9 +179,8 @@ not build our own push stream.**
 * What ntfy.sh costs is operational and privacy-shaped, not performance:
   topics are public-by-name (hence long random names), rate limits are per
   source IP (30 subscriptions per visitor, 60 requests burst), ntfy.sh sees
-  which topics ring when, and the 12 h cache is their policy. None of that
-  is a problem at today's scale, and `botwhisper listen` already handles the
-  stream, reconnect and `since=`.
+  which topics ring when, and the 12 h cache is their policy. `botwhisper
+  listen` already handles the stream, reconnect and `since=`.
 * If per-IP limits bite (many bots behind one NAT) or topic metadata becomes
   a concern, **self-host ntfy** before writing anything: the bots change one
   base URL, the config in `ntfy/server.yml` shows exactly which limits to
