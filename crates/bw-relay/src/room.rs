@@ -21,10 +21,17 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, oneshot, watch};
 
+mod e2e;
+
+pub use e2e::{
+    E2eItem, E2eItemKind, E2eState, MAX_CIPHERTEXT_BYTES, MAX_HANDSHAKE_BYTES, MAX_KEY_PACKAGES,
+    MAX_KEY_PACKAGE_BYTES,
+};
+
 use crate::{
     auth::AgentId,
     config::RelayConfig,
-    db::{Db, InviteRow, MemberRow, RoomRow, ThreadStart},
+    db::{Db, InviteRow, MemberRow, RoomKind, RoomRow, ThreadStart},
     doorbell::{self, DoorbellConfig, DoorbellKey, DoorbellPayload, Doorbells, Ring},
     error::RelayError,
     ratelimit::Limiter,
@@ -67,6 +74,16 @@ pub struct Member {
     pub role: Role,
     pub invite_label: Option<String>,
     pub joined_at: u64,
+    /// E2E rooms only: `pending` until added to the MLS group, then `active`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub e2e_state: Option<String>,
+}
+
+impl Member {
+    /// In an e2e room: has this member been added to the group?
+    pub fn is_e2e_active(&self) -> bool {
+        self.e2e_state.as_deref() == Some("active")
+    }
 }
 
 /// A message held in memory until every recipient acks.
@@ -188,6 +205,10 @@ pub struct Room {
     pub turn_mode: TurnMode,
     /// Who may open a new thread after the owner's `done`.
     pub thread_start: ThreadStart,
+    /// Plaintext or end-to-end encrypted (fixed at creation).
+    pub kind: RoomKind,
+    /// E2E rooms: epoch and the queued ciphertext / handshake items.
+    e2e: E2eState,
     next_member_n: u32,
     members: Vec<Member>,
     next_seq: u64,
@@ -235,6 +256,8 @@ impl Room {
             next_member_n: 2,
             thread_start: opts.thread_start,
             owner_account: Some(agent.limit_key().to_string()),
+            kind: opts.kind,
+            e2e_epoch: 0,
         };
         db.insert_room(&row)?;
         let owner = Member {
@@ -244,6 +267,9 @@ impl Room {
             role: Role::Owner,
             invite_label: None,
             joined_at: now,
+            // The creator's connector creates the MLS group locally, so the
+            // owner is active from the start.
+            e2e_state: (opts.kind == RoomKind::E2e).then(|| "active".to_string()),
         };
         db.insert_member(&id, &member_row(&owner))?;
         Ok(Self::from_parts(
@@ -252,6 +278,7 @@ impl Room {
             cfg,
             row,
             vec![owner],
+            Vec::new(),
             Vec::new(),
         ))
     }
@@ -280,11 +307,17 @@ impl Room {
                 display_name: m.display_name,
                 invite_label: m.invite_label,
                 joined_at: m.joined_at,
+                e2e_state: m.e2e_state,
             })
             .collect();
         let doorbells = db.doorbells(id)?;
+        let handshakes = if row.kind == RoomKind::E2e {
+            db.handshakes(id)?
+        } else {
+            Vec::new()
+        };
         Ok(Some(Self::from_parts(
-            db, bells, cfg, row, members, doorbells,
+            db, bells, cfg, row, members, doorbells, handshakes,
         )))
     }
 
@@ -295,6 +328,7 @@ impl Room {
         row: RoomRow,
         members: Vec<Member>,
         doorbells: Vec<(String, DoorbellConfig)>,
+        handshakes: Vec<crate::db::HandshakeRow>,
     ) -> Self {
         let (version, _) = watch::channel(0);
         let limits = &cfg.limits;
@@ -307,6 +341,8 @@ impl Room {
             max_members: row.max_members,
             turn_mode: row.turn_mode,
             thread_start: row.thread_start,
+            kind: row.kind,
+            e2e: E2eState::load(row.e2e_epoch, handshakes),
             next_member_n: row.next_member_n,
             members,
             next_seq: 1,
@@ -391,6 +427,18 @@ impl Room {
         } else {
             Ok(())
         }
+    }
+
+    /// The plaintext content tools only work in plaintext rooms, and only
+    /// while the relay still allows plaintext rooms at all.
+    fn require_plaintext(&self) -> Result<(), RelayError> {
+        if self.kind == RoomKind::E2e {
+            return Err(RelayError::e2e_room(&self.cfg.public_url()));
+        }
+        if !self.cfg.allow_plaintext_rooms {
+            return Err(RelayError::plaintext_retired(&self.cfg.public_url()));
+        }
+        Ok(())
     }
 
     fn require_owner(&self, member: &str, what: &str) -> Result<(), RelayError> {
@@ -546,6 +594,7 @@ impl Room {
             role: Role::Member,
             invite_label: invite.label.clone(),
             joined_at: now,
+            e2e_state: (self.kind == RoomKind::E2e).then(|| "pending".to_string()),
         };
         self.next_member_n += 1;
         self.db.set_next_member_n(&self.id, self.next_member_n)?;
@@ -675,6 +724,7 @@ impl Room {
         now: u64,
     ) -> Result<TurnView, RelayError> {
         self.require_open()?;
+        self.require_plaintext()?;
         self.member(by)?;
         if by != self.owner && self.thread_start != ThreadStart::Anyone {
             return Err(RelayError::owner_only("start threads"));
@@ -803,6 +853,7 @@ impl Room {
     /// Send a message (or a content-free turn signal when `text` is `None`).
     pub fn send(&mut self, by: &str, args: SendArgs, now: u64) -> Result<Value, RelayError> {
         self.require_open()?;
+        self.require_plaintext()?;
         let sender = self.member(by)?.clone();
         let has_content = args.text.is_some();
         if args.interrupt {
@@ -1026,6 +1077,7 @@ impl Room {
     /// Join the floor queue.
     pub fn request_floor(&mut self, by: &str, now: u64) -> Result<Value, RelayError> {
         self.require_open()?;
+        self.require_plaintext()?;
         self.member(by)?;
         let roster = self.roster();
         let Some(thread) = self.thread.as_mut().filter(|t| !t.is_complete()) else {
@@ -1051,6 +1103,7 @@ impl Room {
     /// Owner changes the per-thread cap.
     pub fn raise_turn_cap(&mut self, by: &str, cap: u32, now: u64) -> Result<TurnView, RelayError> {
         self.require_open()?;
+        self.require_plaintext()?;
         self.require_owner(by, "change the turn cap")?;
         let roster = self.roster();
         let Some(thread) = self.thread.as_mut().filter(|t| !t.is_complete()) else {
@@ -1089,6 +1142,7 @@ impl Room {
             return Err(RelayError::room_closed());
         }
         self.member(member)?;
+        self.require_plaintext()?;
         let now = doorbell::now_unix();
         let roster = self.roster();
         if let Some(t) = &mut self.thread {
@@ -1156,6 +1210,7 @@ impl Room {
     /// Explicit ack. Returns how many messages this member acked.
     pub fn ack(&mut self, member: &str, up_to_seq: u64) -> Result<usize, RelayError> {
         self.require_open()?;
+        self.require_plaintext()?;
         self.member(member)?;
         let mut n = 0;
         for q in &mut self.queue {
@@ -1193,7 +1248,9 @@ impl Room {
             "max_members": self.max_members,
             "created_at": self.created_at,
             "expires_at": self.expires_at,
-            "encryption": Enc::None.label(),
+            "kind": self.kind,
+            "encryption": self.kind.encryption_label(),
+            "e2e": (self.kind == RoomKind::E2e).then(|| self.e2e_status(member)),
             "turn_mode": self.turn_mode,
             "turns_enforced": self.turn_mode.enforces_turns(),
             "thread_start": self.thread_start,
@@ -1248,6 +1305,9 @@ impl Room {
             }
         }
         let ttl = self.cfg.unacked_ttl;
+        if self.e2e.expire(ttl) {
+            self.touch();
+        }
         let mut expired: Vec<(MemberId, u64, Vec<MemberId>)> = Vec::new();
         self.queue.retain(|q| {
             if q.created.elapsed() >= ttl {
@@ -1357,6 +1417,7 @@ fn member_row(m: &Member) -> MemberRow {
         role: m.role.as_str().to_string(),
         invite_label: m.invite_label.clone(),
         joined_at: m.joined_at,
+        e2e_state: m.e2e_state.clone(),
     }
 }
 
@@ -1386,6 +1447,7 @@ type Job = Box<dyn FnOnce(&mut Room) + Send>;
 #[derive(Clone)]
 pub struct RoomHandle {
     pub id: String,
+    pub kind: RoomKind,
     tx: mpsc::UnboundedSender<Job>,
     version: watch::Receiver<u64>,
     /// Set once the room closed (the actor lingers briefly so waiters can
@@ -1405,6 +1467,7 @@ impl RoomHandle {
         let (tx, mut rx) = mpsc::unbounded_channel::<Job>();
         let version = room.subscribe();
         let id = room.id.clone();
+        let kind = room.kind;
         let sweep_every = room.cfg.sweep_interval;
         let closed = Arc::new(AtomicBool::new(false));
         let closed_flag = closed.clone();
@@ -1439,6 +1502,7 @@ impl RoomHandle {
         });
         RoomHandle {
             id,
+            kind,
             tx,
             version,
             closed,

@@ -9,7 +9,7 @@ use tokio::sync::Mutex;
 use crate::{
     auth::AgentId,
     config::RelayConfig,
-    db::{Db, ThreadStart},
+    db::{Db, RoomKind, ThreadStart},
     doorbell::{self, Doorbells},
     error::RelayError,
     room::{Member, Room, RoomHandle},
@@ -32,6 +32,7 @@ pub struct NewRoom {
     pub max_members: u32,
     pub turn_mode: TurnMode,
     pub thread_start: ThreadStart,
+    pub kind: RoomKind,
 }
 
 impl Registry {
@@ -61,6 +62,9 @@ impl Registry {
                 ErrorCode::Unauthorized,
                 "invite-scoped guests cannot create rooms; sign in with an account",
             ));
+        }
+        if opts.kind == RoomKind::Plaintext && !self.cfg.allow_plaintext_rooms {
+            return Err(RelayError::plaintext_retired(&self.cfg.public_url()));
         }
         let max_rooms = self.cfg.limits.rooms_per_account;
         if max_rooms > 0 && self.db.count_rooms_owned_by(agent.limit_key())? >= max_rooms {

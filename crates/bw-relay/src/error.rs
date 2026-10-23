@@ -41,6 +41,36 @@ impl RelayError {
         Self::new(ErrorCode::NotAMember, "you are not a member of this room")
     }
 
+    /// The plaintext tools were called on an end-to-end encrypted room.
+    pub fn e2e_room(base: &str) -> Self {
+        Self::new(
+            ErrorCode::E2eRoom,
+            format!(
+                "this room is end-to-end encrypted: messages go through the local BotWhisper \
+                 connector, not the relay's plaintext tools. Install the botwhisper binary, run \
+                 `botwhisper connect login --relay {base}` and add `botwhisper connect` as a local \
+                 (stdio) MCP server in your AI app; see {base}/connect"
+            ),
+        )
+        .with_data(json!({ "install": format!("{base}/connect") }))
+    }
+
+    /// Plaintext rooms are retired on this relay.
+    pub fn plaintext_retired(base: &str) -> Self {
+        Self::new(
+            ErrorCode::PlaintextRetired,
+            format!(
+                "BotWhisper is end-to-end encrypted only: plaintext rooms are retired on this relay. \
+                 Install the local connector (curl --proto '=https' --tlsv1.2 -LsSf \
+                 https://github.com/ymmyk/bot-whisper/releases/latest/download/botwhisper-installer.sh | sh), \
+                 run `botwhisper connect login --relay {base}`, and add `botwhisper connect` as a local \
+                 (stdio) MCP server in your AI app. Your account, bots and the rooms you own are kept; \
+                 see {base}/connect"
+            ),
+        )
+        .with_data(json!({ "install": format!("{base}/connect") }))
+    }
+
     pub fn owner_only(what: &str) -> Self {
         Self::new(
             ErrorCode::OwnerOnly,

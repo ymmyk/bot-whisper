@@ -114,6 +114,29 @@ CREATE TABLE IF NOT EXISTS sessions (
     account_id    TEXT NOT NULL,
     expires_at    INTEGER NOT NULL
 );
+-- End-to-end encrypted rooms (docs/design/e2e-rooms.md). The relay stores
+-- opaque MLS blobs only: key packages per bot (one-time use), and handshake
+-- messages (commits, Welcomes) per room until every recipient acked them.
+-- Application ciphertext never touches disk.
+CREATE TABLE IF NOT EXISTS e2e_key_packages (
+    id            TEXT PRIMARY KEY,
+    agent_id      TEXT NOT NULL,
+    data          BLOB NOT NULL,
+    created_at    INTEGER NOT NULL,
+    claimed_at    INTEGER
+);
+CREATE INDEX IF NOT EXISTS e2e_key_packages_by_agent ON e2e_key_packages(agent_id);
+CREATE TABLE IF NOT EXISTS e2e_handshakes (
+    room_id       TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+    seq           INTEGER NOT NULL,
+    kind          TEXT NOT NULL,
+    sender        TEXT NOT NULL,
+    epoch         INTEGER NOT NULL,
+    payload       BLOB NOT NULL,
+    pending       TEXT NOT NULL,
+    created_at    INTEGER NOT NULL,
+    PRIMARY KEY (room_id, seq)
+);
 -- A bot's default doorbell: applies to every room it is in, now and later,
 -- unless a room-specific doorbell overrides it. `config` is DoorbellConfig
 -- as JSON (secrets included; never logged, never shown).
@@ -137,7 +160,70 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE doorbells ADD COLUMN config TEXT",
     "ALTER TABLE doorbells ADD COLUMN status TEXT NOT NULL DEFAULT 'never'",
     "ALTER TABLE doorbells ADD COLUMN last_delivery_at INTEGER",
+    // Phase 2: room kind (plaintext | e2e) and MLS epoch; member E2E state
+    // (NULL in plaintext rooms, `pending` until added, then `active`).
+    "ALTER TABLE rooms ADD COLUMN kind TEXT NOT NULL DEFAULT 'plaintext'",
+    "ALTER TABLE rooms ADD COLUMN e2e_epoch INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE members ADD COLUMN e2e_state TEXT",
 ];
+
+/// Whether a room is relay-readable or an MLS group. Fixed at creation.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum RoomKind {
+    /// Today's behaviour: the relay sees plaintext while messages are in memory.
+    #[default]
+    Plaintext,
+    /// End-to-end encrypted: the relay stores and forwards ciphertext only.
+    E2e,
+}
+
+impl RoomKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RoomKind::Plaintext => "plaintext",
+            RoomKind::E2e => "e2e",
+        }
+    }
+
+    fn parse(s: &str) -> Self {
+        if s == "e2e" {
+            RoomKind::E2e
+        } else {
+            RoomKind::Plaintext
+        }
+    }
+
+    /// The encryption label shown in `get_status` and on messages.
+    pub fn encryption_label(self) -> &'static str {
+        match self {
+            RoomKind::Plaintext => bw_proto::Enc::None.label(),
+            RoomKind::E2e => bw_proto::Enc::Mls.label(),
+        }
+    }
+}
+
+/// A persisted E2E handshake message (commit or Welcome).
+#[derive(Debug, Clone)]
+pub struct HandshakeRow {
+    pub seq: u64,
+    pub kind: String,
+    pub sender: String,
+    pub epoch: u64,
+    pub payload: Vec<u8>,
+    pub pending: Vec<String>,
+    pub created_at: u64,
+}
 
 /// `oauth_tokens.revoked` values. `REVOKED` is a rotated or revoked token
 /// (replaying a rotated refresh token revokes its chain); `REPLACED` is a
@@ -301,6 +387,10 @@ pub struct RoomRow {
     pub thread_start: ThreadStart,
     /// Account that owns the room (rate limits). `None` for dev tokens.
     pub owner_account: Option<String>,
+    /// Plaintext or end-to-end encrypted.
+    pub kind: RoomKind,
+    /// Current MLS epoch (number of accepted commits) in an e2e room.
+    pub e2e_epoch: u64,
 }
 
 /// Who may start a new thread once the owner has ended one (fix 5c).
@@ -422,6 +512,9 @@ pub struct MemberRow {
     pub role: String,
     pub invite_label: Option<String>,
     pub joined_at: u64,
+    /// E2E rooms: `pending` until an existing member's commit adds this
+    /// member, then `active`. `None` in plaintext rooms.
+    pub e2e_state: Option<String>,
 }
 
 /// An invite row (secret stored hashed).
@@ -537,8 +630,8 @@ impl Db {
     pub fn insert_room(&self, room: &RoomRow) -> Result<()> {
         self.with(|c| {
             c.execute(
-                "INSERT INTO rooms (id, title, owner, created_at, expires_at, max_members, turn_mode, next_member_n, thread_start, owner_account)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                "INSERT INTO rooms (id, title, owner, created_at, expires_at, max_members, turn_mode, next_member_n, thread_start, owner_account, kind, e2e_epoch)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 params![
                     room.id,
                     room.title,
@@ -550,6 +643,8 @@ impl Db {
                     room.next_member_n,
                     room.thread_start.as_str(),
                     room.owner_account,
+                    room.kind.as_str(),
+                    room.e2e_epoch as i64,
                 ],
             )?;
             Ok(())
@@ -559,7 +654,7 @@ impl Db {
     pub fn get_room(&self, id: &str) -> Result<Option<RoomRow>> {
         self.with(|c| {
             c.query_row(
-                "SELECT id, title, owner, created_at, expires_at, max_members, turn_mode, next_member_n, thread_start, owner_account
+                "SELECT id, title, owner, created_at, expires_at, max_members, turn_mode, next_member_n, thread_start, owner_account, kind, e2e_epoch
                  FROM rooms WHERE id = ?1",
                 params![id],
                 |r| {
@@ -574,6 +669,8 @@ impl Db {
                         next_member_n: r.get(7)?,
                         thread_start: ThreadStart::parse(&r.get::<_, String>(8)?),
                         owner_account: r.get(9)?,
+                        kind: RoomKind::parse(&r.get::<_, String>(10)?),
+                        e2e_epoch: r.get::<_, i64>(11)? as u64,
                     })
                 },
             )
@@ -589,6 +686,16 @@ impl Db {
                 |r| r.get::<_, i64>(0),
             )
             .map(|v| v as u32)
+        })
+    }
+
+    pub fn set_e2e_epoch(&self, room_id: &str, epoch: u64) -> Result<()> {
+        self.with(|c| {
+            c.execute(
+                "UPDATE rooms SET e2e_epoch = ?2 WHERE id = ?1",
+                params![room_id, epoch as i64],
+            )?;
+            Ok(())
         })
     }
 
@@ -622,8 +729,8 @@ impl Db {
     pub fn insert_member(&self, room_id: &str, m: &MemberRow) -> Result<()> {
         self.with(|c| {
             c.execute(
-                "INSERT INTO members (room_id, member_id, agent_id, display_name, role, invite_label, joined_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO members (room_id, member_id, agent_id, display_name, role, invite_label, joined_at, e2e_state)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     room_id,
                     m.member_id,
@@ -631,7 +738,8 @@ impl Db {
                     m.display_name,
                     m.role,
                     m.invite_label,
-                    m.joined_at as i64
+                    m.joined_at as i64,
+                    m.e2e_state
                 ],
             )?;
             Ok(())
@@ -655,7 +763,7 @@ impl Db {
     pub fn members(&self, room_id: &str) -> Result<Vec<MemberRow>> {
         self.with(|c| {
             let mut stmt = c.prepare(
-                "SELECT member_id, agent_id, display_name, role, invite_label, joined_at
+                "SELECT member_id, agent_id, display_name, role, invite_label, joined_at, e2e_state
                  FROM members WHERE room_id = ?1 ORDER BY joined_at, member_id",
             )?;
             let rows = stmt.query_map(params![room_id], |r| {
@@ -666,9 +774,163 @@ impl Db {
                     role: r.get(3)?,
                     invite_label: r.get(4)?,
                     joined_at: r.get::<_, i64>(5)? as u64,
+                    e2e_state: r.get(6)?,
                 })
             })?;
             rows.collect()
+        })
+    }
+
+    pub fn set_member_e2e_state(&self, room_id: &str, member_id: &str, state: &str) -> Result<()> {
+        self.with(|c| {
+            c.execute(
+                "UPDATE members SET e2e_state = ?3 WHERE room_id = ?1 AND member_id = ?2",
+                params![room_id, member_id, state],
+            )?;
+            Ok(())
+        })
+    }
+
+    // ----- e2e: key packages and handshake messages -----
+
+    /// Store one key package for a bot. Keeps at most `keep` unclaimed ones
+    /// (oldest dropped). Returns how many unclaimed remain.
+    pub fn insert_key_package(
+        &self,
+        agent_id: &str,
+        data: &[u8],
+        now: u64,
+        keep: usize,
+    ) -> Result<usize> {
+        self.with(|c| {
+            c.execute(
+                "INSERT INTO e2e_key_packages (id, agent_id, data, created_at) VALUES (?1, ?2, ?3, ?4)",
+                params![uuid::Uuid::new_v4().to_string(), agent_id, data, now as i64],
+            )?;
+            c.execute(
+                "DELETE FROM e2e_key_packages WHERE agent_id = ?1 AND claimed_at IS NULL AND id NOT IN (
+                   SELECT id FROM e2e_key_packages WHERE agent_id = ?1 AND claimed_at IS NULL
+                   ORDER BY created_at DESC, rowid DESC LIMIT ?2)",
+                params![agent_id, keep as i64],
+            )?;
+            c.query_row(
+                "SELECT COUNT(*) FROM e2e_key_packages WHERE agent_id = ?1 AND claimed_at IS NULL",
+                params![agent_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|n| n as usize)
+        })
+    }
+
+    pub fn count_key_packages(&self, agent_id: &str) -> Result<usize> {
+        self.with(|c| {
+            c.query_row(
+                "SELECT COUNT(*) FROM e2e_key_packages WHERE agent_id = ?1 AND claimed_at IS NULL",
+                params![agent_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|n| n as usize)
+        })
+    }
+
+    /// Claim the oldest unclaimed key package of a bot (one-time use).
+    pub fn claim_key_package(&self, agent_id: &str, now: u64) -> Result<Option<Vec<u8>>> {
+        self.with(|c| {
+            let found: Option<(String, Vec<u8>)> = c
+                .query_row(
+                    "SELECT id, data FROM e2e_key_packages WHERE agent_id = ?1 AND claimed_at IS NULL
+                     ORDER BY created_at, rowid LIMIT 1",
+                    params![agent_id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            match found {
+                Some((id, data)) => {
+                    c.execute(
+                        "UPDATE e2e_key_packages SET claimed_at = ?2 WHERE id = ?1",
+                        params![id, now as i64],
+                    )?;
+                    Ok(Some(data))
+                }
+                None => Ok(None),
+            }
+        })
+    }
+
+    /// Forget claimed key packages older than `before` and unclaimed ones
+    /// older than their 90-day lifetime.
+    pub fn sweep_key_packages(&self, now: u64) -> Result<()> {
+        self.with(|c| {
+            c.execute(
+                "DELETE FROM e2e_key_packages WHERE (claimed_at IS NOT NULL AND claimed_at < ?1)
+                   OR created_at < ?2",
+                params![now as i64 - 86_400, now as i64 - 90 * 86_400],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn insert_handshake(&self, room_id: &str, h: &HandshakeRow) -> Result<()> {
+        self.with(|c| {
+            c.execute(
+                "INSERT INTO e2e_handshakes (room_id, seq, kind, sender, epoch, payload, pending, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    room_id,
+                    h.seq as i64,
+                    h.kind,
+                    h.sender,
+                    h.epoch as i64,
+                    h.payload,
+                    h.pending.join(","),
+                    h.created_at as i64
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn handshakes(&self, room_id: &str) -> Result<Vec<HandshakeRow>> {
+        self.with(|c| {
+            let mut st = c.prepare(
+                "SELECT seq, kind, sender, epoch, payload, pending, created_at
+                 FROM e2e_handshakes WHERE room_id = ?1 ORDER BY seq",
+            )?;
+            let rows = st.query_map(params![room_id], |r| {
+                let pending: String = r.get(5)?;
+                Ok(HandshakeRow {
+                    seq: r.get::<_, i64>(0)? as u64,
+                    kind: r.get(1)?,
+                    sender: r.get(2)?,
+                    epoch: r.get::<_, i64>(3)? as u64,
+                    payload: r.get(4)?,
+                    pending: pending
+                        .split(',')
+                        .filter(|s| !s.is_empty())
+                        .map(String::from)
+                        .collect(),
+                    created_at: r.get::<_, i64>(6)? as u64,
+                })
+            })?;
+            rows.collect()
+        })
+    }
+
+    /// Replace the pending set of a handshake row, deleting it when empty.
+    pub fn set_handshake_pending(&self, room_id: &str, seq: u64, pending: &[String]) -> Result<()> {
+        self.with(|c| {
+            if pending.is_empty() {
+                c.execute(
+                    "DELETE FROM e2e_handshakes WHERE room_id = ?1 AND seq = ?2",
+                    params![room_id, seq as i64],
+                )?;
+            } else {
+                c.execute(
+                    "UPDATE e2e_handshakes SET pending = ?3 WHERE room_id = ?1 AND seq = ?2",
+                    params![room_id, seq as i64, pending.join(",")],
+                )?;
+            }
+            Ok(())
         })
     }
 
@@ -1382,6 +1644,7 @@ impl Db {
     /// tokens are kept (hashed) until they expire so a replay is still
     /// recognised as reuse and can revoke its grant chain.
     pub fn sweep_auth(&self, now: u64) -> Result<()> {
+        self.sweep_key_packages(now)?;
         self.with(|c| {
             let n = now as i64;
             c.execute("DELETE FROM oauth_codes WHERE expires_at <= ?1", params![n])?;
@@ -1632,6 +1895,8 @@ mod tests {
             next_member_n: 2,
             thread_start: ThreadStart::Anyone,
             owner_account: Some("acct".into()),
+            kind: RoomKind::E2e,
+            e2e_epoch: 0,
         })
         .unwrap();
         assert_eq!(db.count_rooms_owned_by("acct").unwrap(), 1);
@@ -1644,9 +1909,51 @@ mod tests {
                 role: "owner".into(),
                 invite_label: None,
                 joined_at: 1,
+                e2e_state: Some("active".into()),
             },
         )
         .unwrap();
+        // E2E rows cascade with the room too.
+        db.insert_handshake(
+            "r1",
+            &HandshakeRow {
+                seq: 1,
+                kind: "commit".into(),
+                sender: "m1".into(),
+                epoch: 0,
+                payload: vec![1, 2, 3],
+                pending: vec!["m2".into()],
+                created_at: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(db.handshakes("r1").unwrap().len(), 1);
+        db.set_handshake_pending("r1", 1, &[]).unwrap();
+        assert!(db.handshakes("r1").unwrap().is_empty());
+        db.insert_handshake(
+            "r1",
+            &HandshakeRow {
+                seq: 2,
+                kind: "welcome".into(),
+                sender: "m1".into(),
+                epoch: 0,
+                payload: vec![9],
+                pending: vec!["m2".into(), "m3".into()],
+                created_at: 1,
+            },
+        )
+        .unwrap();
+        db.set_e2e_epoch("r1", 4).unwrap();
+        assert_eq!(db.insert_key_package("a", b"kp1", 1, 2).unwrap(), 1);
+        assert_eq!(db.insert_key_package("a", b"kp2", 2, 2).unwrap(), 2);
+        assert_eq!(
+            db.insert_key_package("a", b"kp3", 3, 2).unwrap(),
+            2,
+            "oldest dropped"
+        );
+        assert_eq!(db.claim_key_package("a", 10).unwrap().unwrap(), b"kp2");
+        assert_eq!(db.claim_key_package("a", 10).unwrap().unwrap(), b"kp3");
+        assert!(db.claim_key_package("a", 10).unwrap().is_none());
         db.insert_invite(&InviteRow {
             id: "i1".into(),
             room_id: "r1".into(),
@@ -1662,7 +1969,17 @@ mod tests {
         let room = db.get_room("r1").unwrap().unwrap();
         assert_eq!(room.turn_mode, TurnMode::Queue);
         assert_eq!(room.thread_start, ThreadStart::Anyone);
+        assert_eq!(room.kind, RoomKind::E2e);
+        assert_eq!(room.e2e_epoch, 4);
+        assert_eq!(
+            db.members("r1").unwrap()[0].e2e_state.as_deref(),
+            Some("active")
+        );
         db.delete_room("r1").unwrap();
+        assert!(
+            db.handshakes("r1").unwrap().is_empty(),
+            "handshakes cascade"
+        );
         assert!(db.get_room("r1").unwrap().is_none());
         assert!(db.members("r1").unwrap().is_empty());
         assert!(db.get_invite("i1").unwrap().is_none());
@@ -1818,9 +2135,12 @@ mod tests {
                  INSERT INTO oauth_clients VALUES ('bwc_grk', NULL, 'Cursor', '[]', 'none', 20);
                  INSERT INTO rooms (id, title, owner, created_at, max_members, turn_mode, next_member_n)
                    VALUES ('r1', 'Room', 'm1', 1, 8, 'free', 4);
-                 INSERT INTO members VALUES ('r1', 'm1', 'u1:bwc_cur', 'Will', 'owner', NULL, 1);
-                 INSERT INTO members VALUES ('r1', 'm2', 'api1:bw-api', 'API', 'member', NULL, 2);
-                 INSERT INTO members VALUES ('r1', 'm3', 'g1:bwc_grk', 'Sam', 'member', NULL, 3);
+                 INSERT INTO members (room_id, member_id, agent_id, display_name, role, invite_label, joined_at)
+                   VALUES ('r1', 'm1', 'u1:bwc_cur', 'Will', 'owner', NULL, 1);
+                 INSERT INTO members (room_id, member_id, agent_id, display_name, role, invite_label, joined_at)
+                   VALUES ('r1', 'm2', 'api1:bw-api', 'API', 'member', NULL, 2);
+                 INSERT INTO members (room_id, member_id, agent_id, display_name, role, invite_label, joined_at)
+                   VALUES ('r1', 'm3', 'g1:bwc_grk', 'Sam', 'member', NULL, 3);
                  INSERT INTO oauth_tokens (token_hash, kind, client_id, account_id, scope, expires_at)
                    VALUES ('h1', 'access', 'bwc_cur', 'u1', 'rooms', 9999999999);
                  INSERT INTO oauth_tokens (token_hash, kind, client_id, account_id, scope, expires_at)
