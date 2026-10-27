@@ -1,8 +1,14 @@
-//! `botwhisper connect login`: OAuth 2.1 with a loopback redirect (RFC 8252
-//! §7.3). Registers a public client, opens the browser on the relay's
-//! sign-in (which includes the "Which bot is connecting?" picker), receives
-//! the code on `http://127.0.0.1:<random port>/callback`, exchanges it with
-//! PKCE and stores the tokens.
+//! `botwhisper connect login`: two ways to sign in.
+//!
+//! * Browser (`login`): OAuth 2.1 with a loopback redirect (RFC 8252 §7.3).
+//!   Registers a public client, opens the browser on the relay's sign-in
+//!   (which includes the "Which bot is connecting?" picker), receives the
+//!   code on `http://127.0.0.1:<random port>/callback`, exchanges it with
+//!   PKCE and stores the tokens.
+//! * Device (`device_start` / `device_poll` / `device_login`, RFC 8628): no
+//!   browser on this machine. The relay hands back a short code and a link
+//!   for the person to open anywhere; this side polls until they approve.
+//!   The AI agent runs this one (the connector's `login` tool).
 
 use std::time::Duration;
 
@@ -111,7 +117,7 @@ pub async fn login(
 /// Refresh an access token (rotating refresh token).
 pub async fn refresh(relay: &str, t: &Tokens) -> anyhow::Result<Tokens> {
     let (Some(rt), Some(cid)) = (&t.refresh_token, &t.client_id) else {
-        anyhow::bail!("this token cannot be refreshed; run `botwhisper connect login`");
+        anyhow::bail!("this token cannot be refreshed; call the connector's `login` tool (or run `botwhisper connect login`)");
     };
     let http = reqwest::Client::new();
     let now = bw_relay::doorbell::now_unix();
@@ -126,7 +132,7 @@ pub async fn refresh(relay: &str, t: &Tokens) -> anyhow::Result<Tokens> {
         .await?
         .error_for_status()
         .map_err(|_| {
-            anyhow::anyhow!("the sign-in expired or was revoked; run `botwhisper connect login`")
+            anyhow::anyhow!("the sign-in expired or was revoked; call the connector's `login` tool (or run `botwhisper connect login`)")
         })?
         .json()
         .await?;
@@ -210,7 +216,7 @@ async fn accept_callback(listener: &tokio::net::TcpListener) -> anyhow::Result<(
     }
 }
 
-fn hostname() -> String {
+pub(crate) fn hostname() -> String {
     std::env::var("HOSTNAME")
         .or_else(|_| std::env::var("COMPUTERNAME"))
         .unwrap_or_else(|_| "this computer".into())
@@ -231,5 +237,223 @@ pub fn open_browser(url: &str) {
     };
     if result.is_err() {
         eprintln!("(could not launch a browser; paste the URL into one)");
+    }
+}
+
+// ----- device authorization (RFC 8628) -----
+
+const DEVICE_GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
+
+/// A started device authorization. `device_code` is the secret half: it
+/// stays in this process and is only ever sent to the token endpoint.
+#[derive(Clone)]
+pub struct DeviceStart {
+    pub client_id: String,
+    pub device_code: String,
+    /// `XXXX-XXXX`.
+    pub user_code: String,
+    pub verification_uri: String,
+    /// The link with the code in it; what the person should be sent.
+    pub verification_uri_complete: String,
+    pub expires_in: u64,
+    /// Seconds between polls (grows when the relay says `slow_down`).
+    pub interval: u64,
+}
+
+impl std::fmt::Debug for DeviceStart {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceStart")
+            .field("client_id", &self.client_id)
+            .field("expires_in", &self.expires_in)
+            .finish_non_exhaustive()
+    }
+}
+
+/// What one poll of the token endpoint said.
+#[derive(Debug)]
+pub enum DevicePoll {
+    /// Not approved yet; poll again after the interval.
+    Pending,
+    /// Poll slower: the interval is now this many seconds.
+    SlowDown(u64),
+    /// The person pressed Deny.
+    Denied,
+    /// The code expired (or is unknown to the relay now).
+    Expired,
+    /// Approved: here are the tokens.
+    Tokens(Tokens),
+    /// The relay could not be reached; try again.
+    Transient(String),
+    /// Anything else: start over.
+    Failed(String),
+}
+
+/// The relay's `error_description`, else its `error`, else the status.
+async fn oauth_failure(r: reqwest::Response, what: &str) -> anyhow::Error {
+    let status = r.status();
+    let v: Value = r.json().await.unwrap_or(Value::Null);
+    let detail = v["error_description"]
+        .as_str()
+        .or_else(|| v["error"].as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| status.to_string());
+    anyhow::anyhow!("{what}: {detail}")
+}
+
+/// Register a device client and start the authorization. `bot_name` is
+/// what this connector would like its bot called (the person decides).
+pub async fn device_start(relay: &str, bot_name: Option<&str>) -> anyhow::Result<DeviceStart> {
+    let relay = relay.trim_end_matches('/');
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .build()?;
+    let reg = http
+        .post(format!("{relay}/oauth/register"))
+        .json(&json!({
+            "client_name": format!("botwhisper connect ({})", hostname()),
+            "redirect_uris": [],
+            "token_endpoint_auth_method": "none",
+            "grant_types": [DEVICE_GRANT, "refresh_token"],
+        }))
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("cannot reach the relay at {relay}: {e}"))?;
+    if !reg.status().is_success() {
+        let e = oauth_failure(reg, "client registration failed").await;
+        anyhow::bail!(
+            "{e} (a relay older than 0.2.1 has no device login: use `botwhisper connect login --browser`)"
+        );
+    }
+    let reg: Value = reg.json().await?;
+    let client_id = reg["client_id"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("registration returned no client_id"))?
+        .to_string();
+    let mut form = vec![("client_id", client_id.as_str()), ("scope", "rooms")];
+    if let Some(n) = bot_name.filter(|n| !n.trim().is_empty()) {
+        form.push(("bot_name", n));
+    }
+    let r = http
+        .post(format!("{relay}/oauth/device_authorization"))
+        .form(&form)
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("cannot reach the relay at {relay}: {e}"))?;
+    if !r.status().is_success() {
+        return Err(oauth_failure(r, "device authorization failed").await);
+    }
+    let v: Value = r.json().await?;
+    let get = |k: &str| -> anyhow::Result<String> {
+        v[k].as_str()
+            .map(str::to_string)
+            .ok_or_else(|| anyhow::anyhow!("device authorization reply has no {k}"))
+    };
+    Ok(DeviceStart {
+        client_id,
+        device_code: get("device_code")?,
+        user_code: get("user_code")?,
+        verification_uri: get("verification_uri")?,
+        verification_uri_complete: v["verification_uri_complete"]
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                format!(
+                    "{}?code={}",
+                    v["verification_uri"].as_str().unwrap_or_default(),
+                    v["user_code"].as_str().unwrap_or_default()
+                )
+            }),
+        expires_in: v["expires_in"].as_u64().unwrap_or(600),
+        interval: v["interval"].as_u64().unwrap_or(5).max(1),
+    })
+}
+
+/// One poll of the token endpoint (the caller honors the interval).
+pub async fn device_poll(relay: &str, start: &DeviceStart) -> DevicePoll {
+    let http = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .build()
+    {
+        Ok(h) => h,
+        Err(e) => return DevicePoll::Failed(e.to_string()),
+    };
+    let now = bw_relay::doorbell::now_unix();
+    let r = match http
+        .post(format!("{}/oauth/token", relay.trim_end_matches('/')))
+        .form(&[
+            ("grant_type", DEVICE_GRANT),
+            ("device_code", start.device_code.as_str()),
+            ("client_id", start.client_id.as_str()),
+        ])
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return DevicePoll::Transient(e.to_string()),
+    };
+    let status = r.status();
+    let v: Value = match r.json().await {
+        Ok(v) => v,
+        Err(e) if status.is_server_error() => return DevicePoll::Transient(e.to_string()),
+        Err(e) => return DevicePoll::Failed(e.to_string()),
+    };
+    if status.is_success() {
+        let Some(access) = v["access_token"].as_str() else {
+            return DevicePoll::Failed("the relay sent no access_token".into());
+        };
+        return DevicePoll::Tokens(Tokens {
+            access_token: access.to_string(),
+            refresh_token: v["refresh_token"].as_str().map(str::to_string),
+            expires_at: now + v["expires_in"].as_u64().unwrap_or(3600),
+            client_id: Some(start.client_id.clone()),
+        });
+    }
+    let desc = v["error_description"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    match v["error"].as_str().unwrap_or_default() {
+        "authorization_pending" => DevicePoll::Pending,
+        "slow_down" => DevicePoll::SlowDown(
+            // The relay adds 5 s; if it said how long, trust it.
+            v["interval"]
+                .as_u64()
+                .unwrap_or(start.interval + 5)
+                .max(start.interval + 1),
+        ),
+        "access_denied" => DevicePoll::Denied,
+        "expired_token" | "invalid_grant" => DevicePoll::Expired,
+        "rate_limited" => DevicePoll::Transient("rate limited".into()),
+        other if status.is_server_error() => DevicePoll::Transient(other.to_string()),
+        other => DevicePoll::Failed(format!("{other}: {desc}")),
+    }
+}
+
+/// Run a whole device login (the CLI's `connect login --device`): start,
+/// call `show` so the caller can print the link and code, then poll until
+/// approved, denied or expired.
+pub async fn device_login(
+    relay: &str,
+    bot_name: Option<&str>,
+    show: impl FnOnce(&DeviceStart),
+) -> anyhow::Result<Tokens> {
+    let mut start = device_start(relay, bot_name).await?;
+    show(&start);
+    let deadline = std::time::Instant::now() + Duration::from_secs(start.expires_in);
+    loop {
+        tokio::time::sleep(Duration::from_secs(start.interval)).await;
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!("the code expired before it was approved; run the login again");
+        }
+        match device_poll(relay, &start).await {
+            DevicePoll::Tokens(t) => return Ok(t),
+            DevicePoll::Pending | DevicePoll::Transient(_) => {}
+            DevicePoll::SlowDown(i) => start.interval = i,
+            DevicePoll::Denied => anyhow::bail!("the login was denied"),
+            DevicePoll::Expired => {
+                anyhow::bail!("the code expired before it was approved; run the login again")
+            }
+            DevicePoll::Failed(e) => anyhow::bail!("login failed: {e}"),
+        }
     }
 }

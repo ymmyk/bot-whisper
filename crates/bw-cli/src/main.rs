@@ -34,21 +34,30 @@ enum Command {
 
 #[derive(Args, Debug)]
 struct ConnectArgs {
-    /// Relay base URL.
+    /// Relay base URL. Works before or after the subcommand
+    /// (`connect --relay X login` and `connect login --relay X`).
     #[arg(
         long,
+        global = true,
         env = "BOTWHISPER_RELAY",
         default_value = "https://relay.botwhisper.si"
     )]
     relay: String,
 
     /// Bot directory name under the relay's config dir (the agent id).
-    /// Default: the bot of the last `connect login` for this relay.
-    #[arg(long, env = "BOTWHISPER_BOT")]
+    /// Default: the bot of the last login for this relay.
+    #[arg(long, global = true, env = "BOTWHISPER_BOT")]
     bot: Option<String>,
 
+    /// The name this bot would like in BotWhisper (for example "Will's
+    /// Claude Code"). At login it preselects the person's bot of that name,
+    /// or fills in the new bot's name on the approval page; the person
+    /// still confirms.
+    #[arg(long, global = true, env = "BOTWHISPER_BOT_NAME")]
+    bot_name: Option<String>,
+
     /// Dev only: a static bearer token instead of a login.
-    #[arg(long, env = "BOTWHISPER_DEV_TOKEN", hide = true)]
+    #[arg(long, global = true, env = "BOTWHISPER_DEV_TOKEN", hide = true)]
     dev_token: Option<String>,
 
     #[command(subcommand)]
@@ -57,15 +66,38 @@ struct ConnectArgs {
 
 #[derive(Subcommand, Debug)]
 enum ConnectAction {
-    /// Sign in through the browser (OAuth, loopback redirect) and pick which
-    /// bot this connector is. Stores tokens and keys under the config dir.
-    Login,
+    /// Sign in from a terminal and pick which bot this connector is. Stores
+    /// tokens and keys under the config dir. Opens the browser here
+    /// (`--browser`, the default in a terminal), or prints a link and a code
+    /// to open anywhere (`--device`, the default without a terminal). An AI
+    /// agent does not need this: the connector's own `login` tool does it.
+    Login(LoginOpts),
     /// Show the stored login, the MLS key fingerprint and the config dir.
     Status,
 }
 
 #[derive(Args, Debug)]
+struct LoginOpts {
+    /// Sign in through a browser on this machine (OAuth with a loopback
+    /// redirect). The default when run in a terminal.
+    #[arg(long, conflicts_with = "device")]
+    browser: bool,
+    /// Print a link and a short code and wait while the person approves on
+    /// any device (RFC 8628). The default when there is no terminal.
+    #[arg(long)]
+    device: bool,
+}
+
+#[derive(Args, Debug)]
 struct ListenArgs {
+    /// Relay base URL (to find the doorbell cached by the last login).
+    #[arg(
+        long,
+        env = "BOTWHISPER_RELAY",
+        default_value = "https://relay.botwhisper.si"
+    )]
+    relay: String,
+
     /// ntfy server.
     #[arg(
         long,
@@ -192,6 +224,12 @@ struct RelayArgs {
     #[arg(long, env = "BW_ALLOW_INSECURE_DOORBELLS", default_value_t = false)]
     allow_insecure_doorbells: bool,
 
+    /// Let any OAuth client register and sign in. By default only the local
+    /// `botwhisper connect` connector may; other MCP apps get a clear
+    /// "install the connector" error instead of a sign-in that goes nowhere.
+    #[arg(long, env = "BW_ALLOW_ANY_OAUTH_CLIENT", default_value_t = false)]
+    allow_any_oauth_client: bool,
+
     /// Allowed Host header values for the MCP endpoint (DNS-rebinding guard).
     /// Empty allows any host, which suits a Tailscale-only relay.
     #[arg(long = "allowed-host", env = "BW_ALLOWED_HOSTS", value_delimiter = ',')]
@@ -259,7 +297,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn connect(args: ConnectArgs) -> anyhow::Result<()> {
-    use botwhisper::connect::{login, relay::RelayClient, store::BotStore, Connector};
+    use botwhisper::connect::{login, relay::RelayClient, Connector};
     let config = botwhisper::paths::config_dir();
     let relay = args.relay.trim_end_matches('/').to_string();
     // Logging goes to stderr; stdout is the MCP channel.
@@ -269,52 +307,46 @@ async fn connect(args: ConnectArgs) -> anyhow::Result<()> {
         .with_target(false)
         .init();
     match args.action {
-        Some(ConnectAction::Login) => {
-            let tokens = login::login(
-                &relay,
-                |url| login::open_browser(&url),
-                Duration::from_secs(600),
-            )
-            .await?;
+        Some(ConnectAction::Login(opts)) => {
+            use std::io::IsTerminal;
+            let device = opts.device
+                || (!opts.browser
+                    && !(std::io::stdin().is_terminal() && std::io::stderr().is_terminal()));
+            let tokens = if device {
+                login::device_login(&relay, args.bot_name.as_deref(), |d| {
+                    eprintln!(
+                        "Open this link on any device and approve the login (only if you started it):\n\n  {}\n\nCode: {}   (expires in {} minutes)\n\nWaiting for approval...",
+                        d.verification_uri_complete,
+                        d.user_code,
+                        d.expires_in / 60
+                    );
+                })
+                .await?
+            } else {
+                login::login(
+                    &relay,
+                    |url| login::open_browser(&url),
+                    Duration::from_secs(600),
+                )
+                .await?
+            };
             // Which bot did the person pick? Ask the relay, then file the
             // tokens under that bot and make it the current one.
-            let client = RelayClient::new(&relay, tokens.clone(), None);
-            let who = client.call("whoami", serde_json::json!({})).await?;
-            let agent_id = who["agent_id"].as_str().unwrap_or("bot").to_string();
-            let store = BotStore::new(&config, &relay, &agent_id);
-            store.save_tokens(&tokens)?;
-            store.set_current()?;
-            let identity = store.load_or_create_identity(&agent_id)?;
-            // Make sure the bot can be woken: cache (or create) its doorbell.
-            let bell = match client.call("get_doorbell", serde_json::json!({})).await {
-                Ok(v) if v["doorbell"].is_object() => v["doorbell"].clone(),
-                _ => client
-                    .call("set_doorbell", serde_json::json!({}))
-                    .await
-                    .map(|v| v["doorbell"].clone())
-                    .unwrap_or(serde_json::Value::Null),
-            };
-            if let (Some(topic), Some(server)) = (bell["topic"].as_str(), bell["server"].as_str()) {
-                let _ = store.save_doorbell(&botwhisper::connect::store::CachedDoorbell {
-                    server: server.to_string(),
-                    topic: topic.to_string(),
-                    has_token: bell["secret"] == "set",
-                });
-            }
-            client.close().await;
+            let signed =
+                botwhisper::connect::gateway::finish_sign_in(&config, &relay, &tokens).await?;
             eprintln!(
                 "Signed in as bot {} ({}) on {relay}.\nKeys and tokens: {}\nMLS key fingerprint: {}\n\nNext: add this as a local MCP server in your AI app, e.g.\n  claude mcp add botwhisper -- botwhisper connect --relay {relay}\nWake-ups: `botwhisper listen` (no flags) now follows this bot's doorbell.",
-                who["bot_name"].as_str().unwrap_or("?"),
-                agent_id,
-                store.dir.display(),
-                identity.fingerprint(),
+                signed.who["bot_name"].as_str().unwrap_or("?"),
+                signed.agent_id,
+                signed.store.dir.display(),
+                signed.fingerprint,
             );
             Ok(())
         }
         Some(ConnectAction::Status) => {
             let Some(store) = current_store(&config, &relay, args.bot.as_deref()) else {
                 eprintln!(
-                    "Not signed in to {relay}. Run `botwhisper connect login --relay {relay}`."
+                    "Not signed in to {relay}. Run `botwhisper connect login --relay {relay}`, or start the connector and call its `login` tool."
                 );
                 std::process::exit(2);
             };
@@ -337,27 +369,39 @@ async fn connect(args: ConnectArgs) -> anyhow::Result<()> {
             Ok(())
         }
         None => {
-            let (client, store) = match &args.dev_token {
-                Some(t) => (RelayClient::with_token(&relay, t), None),
+            use botwhisper::connect::Gateway;
+            // Always start: signed out the connector offers `login`,
+            // `login_status` and `whoami`; the room tools follow a login.
+            let gateway = match &args.dev_token {
+                Some(t) => {
+                    let client = RelayClient::with_token(&relay, t);
+                    let connector = Connector::new(client, None, Some(&config)).await?;
+                    Gateway::with_connector(&relay, config.clone(), connector)
+                }
                 None => {
-                    let Some(store) = current_store(&config, &relay, args.bot.as_deref()) else {
-                        anyhow::bail!("not signed in to {relay}: run `botwhisper connect login --relay {relay}` first");
-                    };
-                    let Some(tokens) = store.load_tokens() else {
-                        anyhow::bail!(
-                            "no tokens in {}: run `botwhisper connect login`",
-                            store.dir.display()
-                        );
-                    };
-                    (
-                        RelayClient::new(&relay, tokens, Some(store.clone())),
-                        Some(store),
-                    )
+                    let gateway = Gateway::new(
+                        &relay,
+                        config.clone(),
+                        args.bot.clone(),
+                        args.bot_name.clone(),
+                    );
+                    match gateway.resume().await {
+                        Ok(true) => {}
+                        Ok(false) => tracing::info!(
+                            "botwhisper connect: not signed in yet; the `login` tool starts it"
+                        ),
+                        Err(e) => tracing::warn!(
+                            "botwhisper connect: the stored sign-in is not usable ({e}); the `login` tool starts a new one"
+                        ),
+                    }
+                    gateway
                 }
             };
-            let connector = Connector::new(client, store, Some(&config)).await?;
-            tracing::info!(bot = %connector.agent_id(), "botwhisper connect: serving MCP over stdio");
-            connector.run_on(rmcp::transport::stdio()).await
+            tracing::info!(
+                signed_in = gateway.is_signed_in(),
+                "botwhisper connect: serving MCP over stdio"
+            );
+            gateway.run_on(rmcp::transport::stdio()).await
         }
     }
 }
@@ -378,8 +422,7 @@ async fn listen(args: ListenArgs) -> anyhow::Result<i32> {
     use botwhisper::listen::{Action, ListenOpts};
     // Zero-config: after `connect login` the bot's doorbell topic is cached.
     let cached = if args.topic.as_deref().is_none_or(|t| t.trim().is_empty()) {
-        let relay = std::env::var("BOTWHISPER_RELAY")
-            .unwrap_or_else(|_| "https://relay.botwhisper.si".into());
+        let relay = args.relay.trim_end_matches('/').to_string();
         botwhisper::connect::store::BotStore::current(&botwhisper::paths::config_dir(), &relay)
             .and_then(|s| s.load_doorbell())
     } else {
@@ -514,6 +557,7 @@ async fn relay(args: RelayArgs) -> anyhow::Result<()> {
         max_members: args.max_members,
         default_turn_cap: args.turn_cap,
         allow_insecure_doorbells: args.allow_insecure_doorbells,
+        connector_only: !args.allow_any_oauth_client,
         allowed_hosts: args
             .allowed_hosts
             .into_iter()

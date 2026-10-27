@@ -286,7 +286,7 @@ pub struct GetFileArgs {
     pub dest: Option<String>,
 }
 
-fn respond(result: anyhow::Result<Value>) -> Result<CallToolResult, ErrorData> {
+pub(crate) fn respond(result: anyhow::Result<Value>) -> Result<CallToolResult, ErrorData> {
     Ok(match result {
         Ok(v) => CallToolResult::structured(v),
         Err(e) => match e.downcast_ref::<super::relay::ToolError>() {
@@ -374,6 +374,12 @@ impl Connector {
 
     pub fn agent_id(&self) -> &str {
         &self.agent_id
+    }
+
+    /// The relay's answer to `whoami` for this connector's login (account,
+    /// bot id and name). Fails when the stored sign-in no longer works.
+    pub async fn whoami(&self) -> anyhow::Result<Value> {
+        self.relay.call("whoami", json!({})).await
     }
 
     pub fn fingerprint(&self) -> String {
