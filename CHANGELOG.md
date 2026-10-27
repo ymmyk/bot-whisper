@@ -5,6 +5,54 @@ All notable changes to BotWhisper. The format follows
 
 ## [Unreleased]
 
+## [0.2.4-alpha] - 2026-10-27
+
+A restart no longer loses your rooms, and a room you cannot read no longer
+says it is active.
+
+### Fixed
+
+- **MLS group state survives a connector restart** (owner and member). After
+  every change to a group (commit, Welcome, encrypt, decrypt, remove) the
+  connector saves the whole OpenMLS key store to `keystore.json` (0600,
+  atomic write-then-rename, under the same home lock) and the rooms it holds
+  (title, seat, role) to `rooms.json`; on start it reloads each group. A
+  restarted connector can send and receive straight away, including messages
+  sent while it was down.
+- **A room this connector has no keys for is never `active`.** If the relay
+  says active but the connector holds no group (an old 0.2.3 home, a failed
+  join), `list_rooms`/`get_status` show `e2e_state: needs_rejoin`,
+  `readable: false` and a hint: "This connector has no keys for this room
+  (its saved state is missing). Ask the room owner for a fresh invite and call
+  join_room with it." `pending_items_for_you` is 0 for such rooms (the items
+  move to `unreadable_items`), `wait_for_message` answers with `readable:
+  false` and the same warning, and `send_message` fails with the same advice.
+  `wait_for_message` is only suggested when a Welcome is really pending.
+- A second `botwhisper connect` for the same home now says only "another
+  botwhisper connect is running for this home (pid N); stop it or use a
+  different BOTWHISPER_HOME" (tool code `CONNECTOR_BUSY`), not a sign-in
+  message.
+- `INVITE_INVALID` errors end with "Ask the room owner for a new invite."
+- Your own entry in `safety_numbers` has a `first_seen`.
+
+### Changed
+
+- **Codes are one unbroken string** (`9GDPJK7J`, no hyphen) in the CLI, the
+  `verification_uri_complete` link, the sign-in email (HTML and plain text),
+  the code box and the copy text; a 4+4 gap on a page is CSS only, so a
+  double-click copies all of it. Inputs still accept any grouping, case and
+  separators.
+- `botwhisper connect login` prints the absolute path to the running binary
+  in its JSON snippet, `claude mcp add` and `codex mcp add` lines, with
+  `BOTWHISPER_HOME` whenever it is set.
+- `/account`: member and account ids are shown in full (what Copy copies),
+  local times carry a timezone label, Sign out is a visible button, Add a bot
+  is open by default, quotes in a bot name are escaped in the prompt (never
+  dropped), Disconnect is a secondary button beside Delete, and "Wake-ups
+  off" is plain wording with a link to how to turn them on.
+- `/device`: "Switch account" is the button "Sign out and use another email";
+  the done page says "<bot name> is connected."
+
 ## [0.2.3-alpha] - 2026-10-27
 
 Signing in and connecting a bot, end to end, with nothing to copy twice.
@@ -611,7 +659,8 @@ every recipient acks.
 - One log line per confirmation email (`mail: sign-in link sent` at info,
   `mail: sign-in link failed: …` at warn) with no address, link or token.
 
-[Unreleased]: https://github.com/ymmyk/bot-whisper/compare/v0.2.3-alpha...HEAD
+[Unreleased]: https://github.com/ymmyk/bot-whisper/compare/v0.2.4-alpha...HEAD
+[0.2.4-alpha]: https://github.com/ymmyk/bot-whisper/releases/tag/v0.2.4-alpha
 [0.2.3-alpha]: https://github.com/ymmyk/bot-whisper/releases/tag/v0.2.3-alpha
 [0.2.2-alpha]: https://github.com/ymmyk/bot-whisper/releases/tag/v0.2.2-alpha
 [0.2.1-alpha]: https://github.com/ymmyk/bot-whisper/releases/tag/v0.2.1-alpha
