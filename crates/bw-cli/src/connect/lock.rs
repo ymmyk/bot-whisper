@@ -10,7 +10,6 @@
 
 use std::{
     fs::{File, OpenOptions, TryLockError},
-    io::{Read, Seek, Write},
     path::{Path, PathBuf},
 };
 
@@ -19,6 +18,7 @@ use std::{
 pub struct ConfigLock {
     file: File,
     path: PathBuf,
+    pid_path: PathBuf,
 }
 
 /// The lock is held by another process.
@@ -52,6 +52,13 @@ impl ConfigLock {
         bot_dir.join("connect.lock")
     }
 
+    /// `<bot dir>/connect.pid`: who holds the lock. A separate file because
+    /// Windows locks are mandatory, so the locked file itself cannot be read
+    /// by the process that was refused.
+    pub fn pid_path_in(bot_dir: &Path) -> PathBuf {
+        bot_dir.join("connect.pid")
+    }
+
     /// Take the lock, or fail with [`LockHeld`] (downcastable) when another
     /// process has it.
     pub fn acquire(bot_dir: &Path) -> anyhow::Result<ConfigLock> {
@@ -64,12 +71,12 @@ impl ConfigLock {
             use std::os::unix::fs::OpenOptionsExt;
             opts.mode(0o600);
         }
-        let mut file = opts.open(&path)?;
+        let file = opts.open(&path)?;
+        let pid_path = Self::pid_path_in(bot_dir);
         match file.try_lock() {
             Ok(()) => {}
             Err(TryLockError::WouldBlock) => {
-                let mut s = String::new();
-                let _ = file.read_to_string(&mut s);
+                let s = std::fs::read_to_string(&pid_path).unwrap_or_default();
                 return Err(LockHeld {
                     pid: s.trim().parse().ok(),
                 }
@@ -77,17 +84,22 @@ impl ConfigLock {
             }
             Err(TryLockError::Error(e)) => return Err(e.into()),
         }
-        file.set_len(0)?;
-        file.rewind()?;
-        write!(file, "{}", std::process::id())?;
-        file.flush()?;
-        Ok(ConfigLock { file, path })
+        std::fs::write(&pid_path, std::process::id().to_string())?;
+        Ok(ConfigLock {
+            file,
+            path,
+            pid_path,
+        })
     }
 }
 
 impl Drop for ConfigLock {
     fn drop(&mut self) {
-        // Remove the file while still holding the lock, then release.
+        let _ = std::fs::remove_file(&self.pid_path);
+        // On Unix, remove the file while still holding the lock, then release
+        // (so nobody can lock a file we are about to unlink). Windows cannot
+        // delete an open file; a leftover empty file is not a lock.
+        #[cfg(unix)]
         let _ = std::fs::remove_file(&self.path);
         let _ = self.file.unlock();
     }
@@ -122,7 +134,9 @@ mod tests {
         // Released (and the file removed) once the holder is gone: no stale lock.
         let again = ConfigLock::acquire(&dir).unwrap();
         drop(again);
+        #[cfg(unix)]
         assert!(!ConfigLock::path_in(&dir).exists());
+        assert!(!ConfigLock::pid_path_in(&dir).exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
