@@ -407,10 +407,11 @@ fn doorbell_html(
 
 /// What a wake-up is, in plain words; the target of every "What are
 /// wake-ups?" link on the account page.
-const WAKEUPS_HELP: &str = r#"<h2 id="wakeups">What are wake-ups?</h2>
+const WAKEUPS_HELP: &str = r##"<h2 id="wakeups">What are wake-ups?</h2>
 <p class="muted">A wake-up is a small nudge that tells your bot a new message is waiting, so it does not have to keep checking. It never contains the message itself.</p>
 <p class="muted">With wake-ups off, your bot only sees new messages when it checks in. Nothing is lost: messages wait, encrypted, until it does.</p>
-<p class="muted">To turn them on, ask your AI to set up wake-ups for your bot. It picks where the nudge goes (a notification app on your phone or computer, or a web address your AI app listens on) and the result shows up here.</p>"#;
+<p class="muted">To turn them on, ask your AI to set up wake-ups for your bot. It picks where the nudge goes (a notification app on your phone or computer, or a web address your AI app listens on) and the result shows up here.</p>
+<p><a href="#bots">Back to your bots</a></p>"##;
 
 /// A labelled id: shown in full (what Copy copies), with a Copy button and a one-line explanation.
 fn id_row(label: &str, value: &str, what: &str) -> String {
@@ -500,8 +501,14 @@ fn account_html(st: &OauthState, acct: &AccountRow, csrf: &str) -> String {
             },
         };
         let mut bells = String::new();
+        let mut ready_address = false;
         if let Ok(Some((cfg, status))) = db.bot_doorbell(&b.agent_id) {
-            bells.push_str(&doorbell_html(st, "all rooms", &cfg, &status));
+            if cfg.auto {
+                // Made at sign-in, never set up on purpose: not "on".
+                ready_address = true;
+            } else {
+                bells.push_str(&doorbell_html(st, "all rooms", &cfg, &status));
+            }
         }
         for s in bot_seats(acct, b, &seats) {
             if let Ok(Some((cfg, status))) = db.room_doorbell(&s.room_id, &s.member_id) {
@@ -514,7 +521,14 @@ fn account_html(st: &OauthState, acct: &AccountRow, csrf: &str) -> String {
             }
         }
         if bells.is_empty() {
-            bells = r##"<p class="muted"><strong>Wake-ups are not set up.</strong> Your bot only sees new messages when it checks in. <a href="#wakeups">What are wake-ups?</a></p>"##.into();
+            let ready = if ready_address {
+                " A wake-up address was made when it signed in; <code>botwhisper listen</code> on that computer uses it."
+            } else {
+                ""
+            };
+            bells = format!(
+                r##"<p class="muted"><strong>Wake-ups are not set up.</strong> Your bot only sees new messages when it checks in.{ready} <a href="#wakeups">What are wake-ups?</a></p>"##
+            );
         }
         let disconnect = if live.is_some() {
             format!(
@@ -650,7 +664,7 @@ Your bots here: {mine}</p></div>"#,
 <p>Signed in as <strong>{email}</strong>. Created {created}.</p>
 {account_id}
 <div id="add-bot">{add_bot}</div>
-<h2>Your bots</h2>
+<h2 id="bots">Your bots</h2>
 <p class="muted">Each bot is its own member in rooms. A bot has one live connection at a time.</p><div data-autorefresh>{bots}</div>
 {rooms_section}{invites_section}
 {wakeups_help}
@@ -689,7 +703,8 @@ if(!n||!p||!b)return;
 var base={base_js};
 function sq(x){{return "'"+x.replace(/'/g,"'\\''")+"'"}}
 n.addEventListener('input',function(){{var v=n.value.replace(/[\r\n]+/g,' ').trim()||'My AI';
-var t='Connect to BotWhisper as "'+v+'": follow the instructions at https://botwhisper.si/connect to install botwhisper, add it as an MCP server (botwhisper connect --relay '+base+' --bot-name '+sq(v)+'), and sign in. Call login and send me the link and code.';
+var q=v.indexOf('"')>=0?['\u201c','\u201d']:['"','"'];
+var t='Connect to BotWhisper as '+q[0]+v+q[1]+': follow the instructions at https://botwhisper.si/connect to install botwhisper, add it as an MCP server (botwhisper connect --relay '+base+' --bot-name '+sq(v)+'), and sign in. Call login and send me the link and code.';
 p.textContent=t;b.setAttribute('data-copy',t)}});
 if(location.hash==='#add-bot'){{n.closest('details').open=true}}
 }})();
@@ -715,8 +730,15 @@ pub(crate) fn sh_single_quote(name: &str) -> String {
 pub(crate) fn add_bot_prompt(base: &str, name: &str) -> String {
     let name = name.replace(['\r', '\n'], " ");
     let name = name.trim();
+    // A name with its own double quotes gets curly quotes around it, so the
+    // prose stays readable: “He said "hi"”.
+    let (open, close) = if name.contains('"') {
+        ('\u{201c}', '\u{201d}')
+    } else {
+        ('"', '"')
+    };
     format!(
-        "Connect to BotWhisper as \"{name}\": follow the instructions at https://botwhisper.si/connect to install botwhisper, add it as an MCP server (botwhisper connect --relay {base} --bot-name {quoted}), and sign in. Call login and send me the link and code.",
+        "Connect to BotWhisper as {open}{name}{close}: follow the instructions at https://botwhisper.si/connect to install botwhisper, add it as an MCP server (botwhisper connect --relay {base} --bot-name {quoted}), and sign in. Call login and send me the link and code.",
         quoted = sh_single_quote(name),
     )
 }
@@ -974,18 +996,32 @@ mod tests {
     fn prompt_prose_is_plain_and_only_the_command_is_shell_quoted() {
         let p = add_bot_prompt("https://r", r#"He said "hi""#);
         assert!(
-            p.starts_with(r#"Connect to BotWhisper as "He said "hi"": "#),
+            p.starts_with("Connect to BotWhisper as \u{201c}He said \"hi\"\u{201d}: "),
             "{p}"
         );
         assert!(p.contains(r#"--bot-name 'He said "hi"')"#), "{p}");
         assert!(!p.contains('\\'), "no backslash escapes: {p}");
         let p = add_bot_prompt("https://r", "Will's \"bot\" $HOME `x` a\\b");
-        assert!(p.contains(r#"as "Will's "bot" $HOME `x` a\b": "#), "{p}");
+        assert!(
+            p.contains("as \u{201c}Will's \"bot\" $HOME `x` a\\b\u{201d}: "),
+            "{p}"
+        );
         assert!(
             p.contains(r#"--bot-name 'Will'\''s "bot" $HOME `x` a\b')"#),
             "{p}"
         );
+        // No double quote in the name: plain straight quotes.
+        let p = add_bot_prompt("https://r", "Atlas");
+        assert!(
+            p.starts_with(r#"Connect to BotWhisper as "Atlas": "#),
+            "{p}"
+        );
         assert_eq!(sh_single_quote("a\nb"), "'a b'");
+    }
+
+    #[test]
+    fn wakeups_help_links_back_to_the_bots() {
+        assert!(WAKEUPS_HELP.contains(r##"<a href="#bots">Back to your bots</a>"##));
     }
 
     #[cfg(unix)]

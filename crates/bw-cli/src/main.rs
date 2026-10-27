@@ -14,6 +14,11 @@ use tracing_subscriber::EnvFilter;
     about = "BotWhisper: a relay that lets AI agents hold a conversation"
 )]
 struct Cli {
+    /// Where keys, tokens, rooms and the lock live (overrides
+    /// BOTWHISPER_HOME; default: the per-user config directory). One home
+    /// per bot keeps bots apart on one machine.
+    #[arg(long, global = true, value_name = "DIR")]
+    home: Option<std::path::PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -292,6 +297,9 @@ async fn main() -> anyhow::Result<()> {
     // Real environment variables win over the file.
     let _ = dotenvy::from_path(".env");
     let cli = Cli::parse();
+    if let Some(h) = cli.home.clone().filter(|h| !h.as_os_str().is_empty()) {
+        botwhisper::paths::set_home_flag(h);
+    }
     match cli.command {
         Command::Relay(args) => relay(*args).await,
         Command::Listen(args) => {
@@ -345,9 +353,8 @@ async fn connect(args: ConnectArgs) -> anyhow::Result<()> {
             let next = if botwhisper::next_steps::connector_already_configured() {
                 "Your AI app already has BotWhisper set up: restart its connector, or call `login` again, and you are done.".to_string()
             } else {
-                let home = std::env::var("BOTWHISPER_HOME")
-                    .ok()
-                    .filter(|h| !h.is_empty());
+                let home =
+                    botwhisper::paths::explicit_home().map(|h| h.to_string_lossy().to_string());
                 botwhisper::next_steps::next_steps(
                     &botwhisper::next_steps::current_exe_path(),
                     &relay,
@@ -418,10 +425,17 @@ async fn connect(args: ConnectArgs) -> anyhow::Result<()> {
                             }
                         }
                         Err(e) => {
-                            if e.downcast_ref::<botwhisper::connect::lock::LockHeld>()
-                                .is_some()
+                            if let Some(held) =
+                                e.downcast_ref::<botwhisper::connect::lock::LockHeld>()
                             {
-                                tracing::warn!("botwhisper connect: {e}");
+                                // Never serve this bot signed out (or as
+                                // another bot): refuse to start.
+                                eprintln!(
+                                    "botwhisper connect: not starting: {held}.\nThis connector would share keys with the running one. Stop that process, or give this bot its own home (--home DIR or BOTWHISPER_HOME=DIR)."
+                                );
+                                std::process::exit(3);
+                            } else if e.downcast_ref::<botwhisper::connect::WrongBot>().is_some() {
+                                eprintln!("botwhisper connect: {e}");
                             } else {
                                 tracing::warn!(
                                     "botwhisper connect: the stored sign-in is not usable ({e}); the `login` tool starts a new one"

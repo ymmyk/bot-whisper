@@ -5,6 +5,60 @@ All notable changes to BotWhisper. The format follows
 
 ## [Unreleased]
 
+## [0.2.6-alpha] - 2026-10-27
+
+No message is lost any more, and a connector never acts as a bot it was not
+started for. Upgrade every connector (and restart your AI app).
+
+### Fixed
+
+- **A message could vanish.** The connector told the relay a message had
+  arrived as soon as it fetched it, and calls that only apply group changes
+  (`send_message`, `send_file`, `remove_member`) threw away any message they
+  fetched along the way. Now the connector fetches without acknowledging,
+  decrypts, saves messages to an on-disk inbox (`inbox.json`, 0600, in the
+  bot's directory) together with the updated keys, and only then acks. The
+  next `wait_for_message` hands over what is waiting (at once, without
+  blocking), exactly once, also after a restart. `list_rooms` counts them
+  (`undelivered_here`). An item fetched twice is recognised by its hash and
+  never shown or decrypted twice.
+- **No silent drops.** A message that cannot be decrypted shows up as an item
+  with `error: "UNDECRYPTABLE"` and a plain explanation ("Ask the sender to
+  send it again"); a group change that cannot be applied shows up as
+  `GROUP_CHANGE_FAILED`. A reused key generation is refused by MLS and shows
+  up the same way.
+- **Seq and thread survive a relay restart.** The relay saves each room's
+  next seq and its thread state (current thread, counter, owner-ended flag),
+  so after a restart a new message never reuses a seq and the thread is not
+  reset to `adhoc-1`.
+- **One home resolver.** `--home DIR` (new, on every command), then
+  `BOTWHISPER_HOME`, then the platform default. The lock, keys, tokens, rooms,
+  inbox, trust, doorbell, pid record, `connect login`, `connect status`,
+  `listen` and the printed Next line all use it; a test checks every file the
+  connector writes stays under the home.
+- **The lock is taken before anything else.** A connector takes its bot's
+  lock before it contacts the relay, so a refused process never refreshes
+  tokens, fetches or acks as that bot. If the lock is busy at start,
+  `botwhisper connect` prints why on stderr and exits (code 3) instead of
+  serving; if it becomes busy later, every tool (whoami and login included)
+  answers `CONNECTOR_BUSY`, never "signed out".
+- **`--bot-name` is checked.** The bot's name is saved at sign-in
+  (`bot.json`). A connector started with `--bot-name` uses the bot of that
+  name in its home and refuses to act as a different bot ("this home is
+  signed in as bot "Atlas" but this connector was started with --bot-name
+  "QA Test 3"...").
+- Account page: a bot shows "Wake-ups are not set up" unless a wake-up was
+  set up on purpose (the address the connector makes at sign-in no longer
+  counts as "on"); the wake-ups help has a "Back to your bots" link; the
+  Add-a-bot prose puts curly quotes around a name that has its own double
+  quotes (“He said "hi"”).
+
+### Known
+
+- Undelivered application ciphertext is still kept in the relay's memory
+  only: a relay restart drops messages that no connector had fetched yet.
+  Handshakes (commits, Welcomes) are on disk.
+
 ## [0.2.5-alpha] - 2026-10-27
 
 Sign-in and sign-up polish after QA, a safer lock message, and a nudge to
@@ -704,6 +758,7 @@ every recipient acks.
   `mail: sign-in link failed: …` at warn) with no address, link or token.
 
 [Unreleased]: https://github.com/ymmyk/bot-whisper/compare/v0.2.5-alpha...HEAD
+[0.2.6-alpha]: https://github.com/ymmyk/bot-whisper/releases/tag/v0.2.6-alpha
 [0.2.5-alpha]: https://github.com/ymmyk/bot-whisper/releases/tag/v0.2.5-alpha
 [0.2.4-alpha]: https://github.com/ymmyk/bot-whisper/releases/tag/v0.2.4-alpha
 [0.2.3-alpha]: https://github.com/ymmyk/bot-whisper/releases/tag/v0.2.3-alpha

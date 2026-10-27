@@ -31,7 +31,7 @@ use tokio::sync::Mutex;
 use super::{
     lock::ConfigLock,
     relay::{tool_error_code, RelayClient},
-    store::{BotStore, CachedDoorbell, RoomMeta},
+    store::{item_fingerprint, BotStore, CachedDoorbell, Inbox, RoomMeta},
     trust::{Observation, TrustStore},
 };
 
@@ -82,6 +82,8 @@ struct ReceivedFile {
 
 #[derive(Default)]
 struct State {
+    /// Undelivered messages and processed-item fingerprints (inbox.json).
+    inbox: Inbox,
     rooms: HashMap<String, RoomState>,
     pending: HashMap<String, Pending>,
     files: HashMap<String, ReceivedFile>,
@@ -348,8 +350,6 @@ pub(crate) fn respond(result: anyhow::Result<Value>) -> Result<CallToolResult, E
 
 /// What one fetch of a room's queue produced.
 struct Drained {
-    messages: Vec<Value>,
-    events: Vec<Value>,
     closed: bool,
     /// The round table view (`null` when no thread is open).
     turn: Value,
@@ -380,6 +380,27 @@ struct Inner {
     file: Option<FileRef>,
 }
 
+/// This home's saved sign-in belongs to a different bot than the one the
+/// connector was started for (`--bot-name`).
+#[derive(Debug)]
+pub struct WrongBot {
+    pub home: String,
+    pub home_bot: String,
+    pub wanted: String,
+}
+
+impl std::fmt::Display for WrongBot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "this home ({}) is signed in as bot \"{}\" but this connector was started with --bot-name \"{}\"; it will not act as \"{}\". Give each bot its own home (--home DIR or BOTWHISPER_HOME=DIR), or fix --bot-name",
+            self.home, self.home_bot, self.wanted, self.home_bot
+        )
+    }
+}
+
+impl std::error::Error for WrongBot {}
+
 #[tool_router]
 impl Connector {
     /// Build a connector for an authenticated relay client.
@@ -388,37 +409,83 @@ impl Connector {
         store: Option<BotStore>,
         config_dir_identity: Option<&std::path::Path>,
     ) -> anyhow::Result<Self> {
+        Self::new_for(relay, store, config_dir_identity, None).await
+    }
+
+    /// Like [`Connector::new`], refusing ([`WrongBot`]) when the home's bot
+    /// is not `expect_bot` (the `--bot-name` the app started us with).
+    pub async fn new_for(
+        relay: RelayClient,
+        store: Option<BotStore>,
+        config_dir_identity: Option<&std::path::Path>,
+        expect_bot: Option<&str>,
+    ) -> anyhow::Result<Self> {
+        // One connector per bot: take the lock before anything else (before
+        // the relay is called, so a refused process never refreshes the
+        // tokens, fetches or acks as this bot).
+        let take_lock = |s: &BotStore, bot: String| -> anyhow::Result<Arc<ConfigLock>> {
+            // <home>/<relay host>/<bot>: the home is two levels up.
+            let home = s
+                .dir
+                .parent()
+                .and_then(|p| p.parent())
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or_else(|| s.dir.clone());
+            Ok(Arc::new(ConfigLock::acquire(
+                &s.dir,
+                &super::lock::LockWho { home, bot },
+            )?))
+        };
+        let early_lock = match &store {
+            Some(s) => {
+                let bot = s.load_bot_name().unwrap_or_else(|| {
+                    s.dir
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default()
+                });
+                Some(take_lock(s, bot)?)
+            }
+            None => None,
+        };
         let who = relay.call("whoami", json!({})).await?;
         let agent_id = who["agent_id"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("relay did not say who we are"))?
             .to_string();
-        let store = match store {
-            Some(s) => Some(s),
-            None => config_dir_identity.map(|d| BotStore::new(d, &relay.relay, &agent_id)),
-        };
-        // One connector per bot: take the lock before touching the key
-        // material or publishing anything.
-        let lock = match &store {
-            Some(s) => {
-                // <home>/<relay host>/<bot>: the home is two levels up.
-                let home = s
-                    .dir
-                    .parent()
-                    .and_then(|p| p.parent())
-                    .map(std::path::Path::to_path_buf)
-                    .unwrap_or_else(|| s.dir.clone());
-                let bot = who["bot_name"]
-                    .as_str()
-                    .filter(|n| !n.trim().is_empty())
-                    .unwrap_or(&agent_id)
-                    .to_string();
-                Some(Arc::new(ConfigLock::acquire(
-                    &s.dir,
-                    &super::lock::LockWho { home, bot },
-                )?))
+        let bot_name = who["bot_name"]
+            .as_str()
+            .filter(|n| !n.trim().is_empty())
+            .map(str::to_string);
+        if let (Some(want), Some(have)) = (expect_bot, bot_name.as_deref()) {
+            if want.trim() != have.trim() {
+                let home = store
+                    .as_ref()
+                    .and_then(|s| s.dir.parent().and_then(|p| p.parent()))
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default();
+                return Err(WrongBot {
+                    home,
+                    home_bot: have.to_string(),
+                    wanted: want.to_string(),
+                }
+                .into());
             }
-            None => None,
+        }
+        if let (Some(s), Some(n)) = (&store, bot_name.as_deref()) {
+            let _ = s.save_bot_name(n);
+        }
+        let (store, lock) = match (store, early_lock) {
+            (Some(s), l) => (Some(s), l),
+            (None, _) => match config_dir_identity
+                .map(|d| BotStore::new(d, &relay.relay, &agent_id))
+            {
+                Some(s) => {
+                    let l = take_lock(&s, bot_name.clone().unwrap_or_else(|| agent_id.clone()))?;
+                    (Some(s), Some(l))
+                }
+                None => (None, None),
+            },
         };
         let identity = match &store {
             Some(s) => s.load_or_create_identity(&agent_id)?,
@@ -441,6 +508,9 @@ impl Connector {
         {
             let mut st = c.state.lock().await;
             c.load_saved_rooms(&mut st);
+            if let Some(s) = &c.store {
+                st.inbox = s.load_inbox();
+            }
         }
         // Replace whatever earlier runs left on the relay with fresh key
         // packages whose private halves this process (and keystore.json) holds.
@@ -505,6 +575,38 @@ impl Connector {
                 tracing::warn!("could not save rooms.json: {e}");
             }
         }
+    }
+
+    /// Save the undelivered inbox (0600, atomic).
+    fn persist_inbox(&self, st: &State) {
+        if let Some(s) = &self.store {
+            if let Err(e) = s.save_inbox(&st.inbox) {
+                tracing::warn!("could not save inbox.json: {e}");
+            }
+        }
+    }
+
+    /// Hand over (and forget) what is waiting for a room.
+    async fn take_inbox(&self, room_id: &str) -> (Vec<Value>, Vec<Value>) {
+        let mut st = self.state.lock().await;
+        let Some(ri) = st.inbox.rooms.get_mut(room_id) else {
+            return (Vec::new(), Vec::new());
+        };
+        if ri.items.is_empty() && ri.events.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
+        let out = (
+            std::mem::take(&mut ri.items),
+            std::mem::take(&mut ri.events),
+        );
+        self.persist_inbox(&st);
+        out
+    }
+
+    /// Undelivered messages held on this computer for a room.
+    async fn undelivered(&self, room_id: &str) -> usize {
+        let st = self.state.lock().await;
+        st.inbox.rooms.get(room_id).map_or(0, |r| r.items.len())
     }
 
     /// Reload every saved group (after a restart).
@@ -597,7 +699,8 @@ impl Connector {
             .relay
             .call_timeout(
                 "e2e_fetch",
-                json!({ "room_id": room_id, "timeout_s": timeout.as_secs(), "confirm_welcome": true }),
+                // Ack only after the items are decrypted and saved (below).
+                json!({ "room_id": room_id, "timeout_s": timeout.as_secs(), "confirm_welcome": true, "auto_ack": false }),
                 timeout + Duration::from_secs(10),
             )
             .await?;
@@ -611,10 +714,24 @@ impl Connector {
         let had_items = !items.is_empty();
         let mut st = self.state.lock().await;
         let mut files_seen = Vec::new();
+        let mut max_seq = 0u64;
+        let mut warnings = Vec::new();
         for item in items {
+            max_seq = max_seq.max(item["seq"].as_u64().unwrap_or(0));
             let Some(bytes) = item["payload"].as_str().and_then(|p| B64.decode(p).ok()) else {
                 continue;
             };
+            // Fetched before but not acked (a crash, a lost ack, two calls at
+            // once): it was already processed and saved; never twice.
+            let fp = item_fingerprint(&bytes);
+            if st.inbox.rooms.get(room_id).is_some_and(|r| r.saw(&fp)) {
+                continue;
+            }
+            st.inbox
+                .rooms
+                .entry(room_id.to_string())
+                .or_default()
+                .mark(fp);
             // Application items carry no sender: it is whoever MLS
             // authenticated, mapped to a seat through the roster below.
             match item["kind"].as_str().unwrap_or_default() {
@@ -673,6 +790,16 @@ impl Connector {
                     if let Some(r) = st.rooms.get_mut(room_id) {
                         if let Err(e) = r.group.process(&self.identity, &bytes) {
                             tracing::warn!("commit could not be applied: {e}");
+                            messages.push(json!({
+                                "room_id": room_id,
+                                "seq": item["seq"],
+                                "error": "GROUP_CHANGE_FAILED",
+                                "readable": false,
+                                "content": format!(
+                                    "A group change (seq {}) could not be applied on this computer ({e}). Later messages in this room may not decrypt; if they don't, ask the room owner for a fresh invite.",
+                                    item["seq"]
+                                ),
+                            }));
                         }
                     }
                 }
@@ -728,7 +855,21 @@ impl Connector {
                             }
                         }
                         Ok(_) => {}
-                        Err(e) => tracing::warn!("message could not be decrypted: {e}"),
+                        Err(e) => {
+                            // Never a silent drop: the agent sees that a
+                            // message arrived and could not be read.
+                            tracing::warn!("message could not be decrypted: {e}");
+                            messages.push(json!({
+                                "room_id": room_id,
+                                "seq": item["seq"],
+                                "error": "UNDECRYPTABLE",
+                                "readable": false,
+                                "content": format!(
+                                    "A message (seq {}) arrived but could not be decrypted on this computer ({e}). Ask the sender to send it again.",
+                                    item["seq"]
+                                ),
+                            }));
+                        }
                     }
                 }
             }
@@ -736,18 +877,38 @@ impl Connector {
         for f in files_seen {
             st.files.insert(f.file.blob_id.clone(), f);
         }
+        // Nothing is handed over here: messages and events go to the on-disk
+        // inbox first (wait_for_message takes them from there), so a call
+        // that only applies commits (send_message, send_file, ...) or a
+        // restart never loses one.
+        if !messages.is_empty() || !events.is_empty() || had_items {
+            let ri = st.inbox.rooms.entry(room_id.to_string()).or_default();
+            ri.items.extend(messages);
+            ri.events.extend(events);
+            self.persist_inbox(&st);
+        }
         if had_items {
             // Application messages advance the message ratchets: save them.
             self.persist_rooms(&st);
             self.persist_keys();
+            // Only now tell the relay they arrived.
+            if max_seq > 0 {
+                if let Err(e) = self
+                    .relay
+                    .call(
+                        "e2e_ack",
+                        json!({ "room_id": room_id, "up_to_seq": max_seq }),
+                    )
+                    .await
+                {
+                    tracing::warn!("could not ack items in {room_id}: {e}");
+                }
+            }
         }
-        let warnings = match st.rooms.get(room_id) {
-            Some(r) => self.audit_keys(room_id, &r.group, &seats).await,
-            None => Vec::new(),
-        };
+        if let Some(r) = st.rooms.get(room_id) {
+            warnings.extend(self.audit_keys(room_id, &r.group, &seats).await);
+        }
         Ok(Drained {
-            messages,
-            events,
             closed,
             turn,
             mode,
@@ -946,6 +1107,13 @@ impl Connector {
             let Some(id) = r["room_id"].as_str().map(str::to_string) else {
                 continue;
             };
+            // Messages already fetched and saved here count as pending too.
+            let here = st.inbox.rooms.get(&id).map_or(0, |ri| ri.items.len());
+            if here > 0 {
+                let relay_n = r["pending_items_for_you"].as_u64().unwrap_or(0);
+                r["pending_items_for_you"] = json!(relay_n + here as u64);
+                r["undelivered_here"] = json!(here);
+            }
             let relay_state = r["e2e_state"].as_str().unwrap_or("active").to_string();
             let owner = r["role"] == "owner";
             let Some((state, hint)) =
@@ -1354,6 +1522,13 @@ impl Connector {
                 for r in &rooms {
                     added_all.extend(self.add_pending_joiners(r).await?);
                 }
+                // Something already waiting here (fetched by another call,
+                // or before a restart)? Then do not block.
+                let mut waiting = false;
+                for r in &rooms {
+                    waiting |= self.undelivered(r).await > 0;
+                }
+                let timeout = if waiting { Duration::ZERO } else { timeout };
                 // One long poll per room, concurrently.
                 let polls = rooms.iter().map(|r| {
                     let c = self.clone();
@@ -1362,8 +1537,9 @@ impl Connector {
                 });
                 for (room, res) in futures_join(polls).await {
                     let d = res?;
-                    any |= !d.messages.is_empty() || !d.events.is_empty() || d.closed || !d.warnings.is_empty();
-                    let mut r = json!({ "room_id": room, "messages": d.messages, "events": d.events, "closed": d.closed, "mode": d.mode, "turn": d.turn });
+                    let (messages, events) = self.take_inbox(&room).await;
+                    any |= !messages.is_empty() || !events.is_empty() || d.closed || !d.warnings.is_empty();
+                    let mut r = json!({ "room_id": room, "messages": messages, "events": events, "closed": d.closed, "mode": d.mode, "turn": d.turn });
                     if !d.warnings.is_empty() {
                         r["warnings"] = json!(d.warnings);
                     }

@@ -256,6 +256,12 @@ async fn e2e_room_lifecycle_through_the_relay() {
         ("application".into(), String::new(), "CT-after-add".into())
     );
     let commit_seq = f["items"][0]["seq"].as_u64().unwrap();
+    let app_seq = f["items"][1]["seq"].as_u64().unwrap();
+    let thread_before = bob.ok("get_status", json!({ "room_id": room })).await["thread"].clone();
+    assert!(
+        thread_before["thread"].is_string(),
+        "a thread is open: {thread_before}"
+    );
 
     let (cfg, db) = relay.shutdown().await;
     let relay = TestRelay::start_on(cfg, db).await;
@@ -278,6 +284,43 @@ async fn e2e_room_lifecycle_through_the_relay() {
         "the unacked commit survived the restart; the application ciphertext (memory only) did not"
     );
     assert_eq!(f["items"][0]["seq"], commit_seq);
+    // The seq counter and the open thread survive the restart: a new item
+    // never reuses a seq, and the thread is not reset to adhoc-1.
+    let st = bob.ok("get_status", json!({ "room_id": room })).await;
+    assert_eq!(
+        st["thread"]["thread"], thread_before["thread"],
+        "thread persisted: {st}"
+    );
+    assert_eq!(
+        st["thread"]["turns_used"], thread_before["turns_used"],
+        "{st}"
+    );
+    alice
+        .ok(
+            "e2e_send",
+            json!({ "room_id": room, "ciphertext": b64("CT-after-restart") }),
+        )
+        .await;
+    let f = bob
+        .ok(
+            "e2e_fetch",
+            json!({ "room_id": room, "timeout_s": 5, "auto_ack": false }),
+        )
+        .await;
+    let after = f["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["kind"] == "application")
+        .expect("the new message")["seq"]
+        .as_u64()
+        .unwrap();
+    assert!(
+        after > app_seq,
+        "seq is monotonic across restarts: {after} > {app_seq}"
+    );
+    bob.ok("e2e_ack", json!({ "room_id": room, "up_to_seq": after }))
+        .await;
     let f = carol
         .ok("e2e_fetch", json!({ "room_id": room, "timeout_s": 1 }))
         .await;

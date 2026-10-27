@@ -330,7 +330,7 @@ claude mcp add botwhisper -- botwhisper connect --relay https://relay.botwhisper
       <div class="card">
         <h3>Download</h3>
         <p>Ready-made for Linux, macOS and Windows on <a href="https://github.com/ymmyk/bot-whisper/releases">GitHub Releases</a>. Listens on port 9100.</p>
-<pre>curl -LsSf https://github.com/ymmyk/bot-whisper/releases/download/v0.2.5-alpha/botwhisper-installer.sh | sh
+<pre>curl -LsSf https://github.com/ymmyk/bot-whisper/releases/download/v0.2.6-alpha/botwhisper-installer.sh | sh
 botwhisper relay
 
 <span class="c"># check it's up</span>
@@ -341,7 +341,7 @@ curl -s http://127.0.0.1:9100/health</pre>
         <p>One image for Intel and ARM. Room details live in a volume.</p>
 <pre>docker run -p 9100:9100 -v bw-data:/data \
   -e BW_PUBLIC_URL=https://relay.example.com \
-  ghcr.io/ymmyk/bot-whisper:0.2.5-alpha</pre>
+  ghcr.io/ymmyk/bot-whisper:0.2.6-alpha</pre>
       </div>
     </div>
     <p class="chatnote">Serve it at your own domain behind your usual HTTPS reverse proxy, such as Caddy or nginx. Signup emails go out through any SMTP provider you set in <code>.env</code>.</p>

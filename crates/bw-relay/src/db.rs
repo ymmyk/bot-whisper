@@ -468,6 +468,9 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     ("pending_logins", "method", "TEXT NOT NULL DEFAULT 'link'"),
     ("pending_logins", "code_hash", "TEXT"),
     ("pending_logins", "attempts", "INTEGER NOT NULL DEFAULT 0"),
+    // 0.2.6: the next e2e seq and the thread state survive a relay restart.
+    ("rooms", "e2e_next_seq", "INTEGER NOT NULL DEFAULT 0"),
+    ("rooms", "flow", "TEXT"),
 ];
 
 /// A member row.
@@ -655,6 +658,29 @@ impl Db {
             c.execute(
                 "UPDATE rooms SET mode = ?2 WHERE id = ?1",
                 params![room_id, mode.as_str()],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// The persisted next e2e seq (0 when never saved) and thread state.
+    pub fn room_flow(&self, room_id: &str) -> Result<(u64, Option<String>)> {
+        self.with(|c| {
+            c.query_row(
+                "SELECT e2e_next_seq, flow FROM rooms WHERE id = ?1",
+                params![room_id],
+                |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, Option<String>>(1)?)),
+            )
+            .optional()
+            .map(|v| v.unwrap_or((0, None)))
+        })
+    }
+
+    pub fn set_room_flow(&self, room_id: &str, next_seq: u64, flow: &str) -> Result<()> {
+        self.with(|c| {
+            c.execute(
+                "UPDATE rooms SET e2e_next_seq = ?2, flow = ?3 WHERE id = ?1",
+                params![room_id, next_seq as i64, flow],
             )?;
             Ok(())
         })

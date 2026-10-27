@@ -272,6 +272,10 @@ pub struct SetDoorbellArgs {
     /// Email doorbells are not implemented.
     #[serde(default)]
     pub email: Option<String>,
+    /// Set by the connector when it makes a ready address at sign-in (not
+    /// a wake-up anyone set up on purpose). Omit.
+    #[serde(default)]
+    pub auto: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -870,6 +874,7 @@ impl BotWhisperServer {
         agent: AgentId,
         a: SetDoorbellArgs,
     ) -> Result<Value, RelayError> {
+        let auto = a.auto == Some(true);
         if a.email.is_some() {
             return Err(RelayError::invalid(
                 "email doorbells are not implemented; use the default (ntfy) or a webhook",
@@ -980,7 +985,11 @@ impl BotWhisperServer {
                         )));
                     }
                 }
-                Some(DoorbellConfig { target, events })
+                Some(DoorbellConfig {
+                    target,
+                    events,
+                    auto,
+                })
             }
         };
         let scope = match &a.room_id {

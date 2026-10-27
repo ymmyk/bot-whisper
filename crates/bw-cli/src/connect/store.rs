@@ -84,6 +84,43 @@ impl BotStore {
         Some(BotStore::new(config_dir, relay_url, &bot))
     }
 
+    /// The saved bot in this home whose name (from sign-in) is `name`.
+    pub fn find_by_name(config_dir: &Path, relay_url: &str, name: &str) -> Option<Self> {
+        let host = config_dir.join(paths::safe_segment(&relay_host(relay_url)));
+        let want = name.trim();
+        for e in std::fs::read_dir(host).ok()?.flatten() {
+            let s = BotStore { dir: e.path() };
+            if s.dir.is_dir() && s.load_bot_name().is_some_and(|n| n.trim() == want) {
+                return Some(s);
+            }
+        }
+        None
+    }
+
+    /// `bot.json`: the bot's name as the relay reported it at sign-in.
+    pub fn bot_name_path(&self) -> PathBuf {
+        self.dir.join("bot.json")
+    }
+
+    pub fn load_bot_name(&self) -> Option<String> {
+        let v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(self.bot_name_path()).ok()?).ok()?;
+        v["bot_name"]
+            .as_str()
+            .map(str::to_string)
+            .filter(|n| !n.trim().is_empty())
+    }
+
+    pub fn save_bot_name(&self, name: &str) -> std::io::Result<()> {
+        if self.load_bot_name().as_deref() == Some(name) {
+            return Ok(());
+        }
+        paths::write_private(
+            &self.bot_name_path(),
+            &serde_json::to_vec(&serde_json::json!({ "bot_name": name })).expect("json"),
+        )
+    }
+
     pub fn set_current(&self) -> std::io::Result<()> {
         let name = self
             .dir
@@ -111,6 +148,11 @@ impl BotStore {
     /// Per-room facts (title, own seat, ownership) next to the saved groups.
     pub fn rooms_path(&self) -> PathBuf {
         self.dir.join("rooms.json")
+    }
+    /// Decrypted messages (and events) not yet handed to the agent, so a
+    /// restart or a call that only applies commits never loses one.
+    pub fn inbox_path(&self) -> PathBuf {
+        self.dir.join("inbox.json")
     }
     pub fn doorbell_path(&self) -> PathBuf {
         self.dir.join("doorbell.json")
@@ -179,6 +221,20 @@ impl BotStore {
         )
     }
 
+    pub fn load_inbox(&self) -> Inbox {
+        std::fs::read(self.inbox_path())
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save_inbox(&self, inbox: &Inbox) -> std::io::Result<()> {
+        paths::write_private(
+            &self.inbox_path(),
+            &serde_json::to_vec(inbox).expect("json"),
+        )
+    }
+
     pub fn load_doorbell(&self) -> Option<CachedDoorbell> {
         let bytes = std::fs::read(self.doorbell_path()).ok()?;
         serde_json::from_slice(&bytes).ok()
@@ -236,4 +292,47 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+/// How many processed-item fingerprints to remember per room.
+const SEEN_PER_ROOM: usize = 1000;
+
+/// Undelivered messages per room plus fingerprints of what was already
+/// processed (so an item fetched twice is neither shown twice nor fed to
+/// MLS twice). Written 0600 before the relay is told the items arrived.
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Inbox {
+    #[serde(default)]
+    pub rooms: std::collections::BTreeMap<String, RoomInbox>,
+}
+
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RoomInbox {
+    /// Messages and error items, oldest first.
+    #[serde(default)]
+    pub items: Vec<serde_json::Value>,
+    /// Relay events (content-free) not yet shown.
+    #[serde(default)]
+    pub events: Vec<serde_json::Value>,
+    /// SHA-256 prefixes of item payloads already processed.
+    #[serde(default)]
+    pub seen: std::collections::VecDeque<String>,
+}
+
+impl RoomInbox {
+    pub fn saw(&self, fp: &str) -> bool {
+        self.seen.iter().any(|s| s == fp)
+    }
+    pub fn mark(&mut self, fp: String) {
+        self.seen.push_back(fp);
+        while self.seen.len() > SEEN_PER_ROOM {
+            self.seen.pop_front();
+        }
+    }
+}
+
+/// A short fingerprint of a fetched item's bytes.
+pub fn item_fingerprint(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    hex::encode(&sha2::Sha256::digest(bytes)[..16])
 }

@@ -1124,3 +1124,53 @@ async fn pages_have_no_missing_favicon_to_log() {
         "{page}"
     );
 }
+
+/// Wake-ups show "on" only when one was really set up: a new bot with none,
+/// or with only the ready address its connector made at sign-in, says
+/// "Wake-ups are not set up"; setting one up on purpose turns it on.
+#[tokio::test]
+async fn wakeups_state_reflects_a_real_doorbell() {
+    let relay = TestRelay::start().await;
+    let base = relay.base();
+    let alice = browser();
+    let alice_id = web_sign_up(&relay, &alice, "wake@example.com").await;
+    let tok = connect_bot(&relay, &alice_id, "bwc_wake1", "Wake Bot");
+    let page = |c: Client| {
+        let base = base.clone();
+        async move {
+            c.get(format!("{base}/account"))
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap()
+        }
+    };
+    let p = page(alice.clone()).await;
+    assert!(
+        p.contains("<strong>Wake-ups are not set up.</strong>"),
+        "none yet"
+    );
+    assert!(!p.contains("Wake-ups: on"));
+    let bot = relay.bot(&tok).await;
+    bot.ok("set_doorbell", json!({ "auto": true })).await;
+    let p = page(alice.clone()).await;
+    assert!(
+        p.contains("<strong>Wake-ups are not set up.</strong>"),
+        "auto address only"
+    );
+    assert!(p.contains("A wake-up address was made when it signed in"));
+    assert!(!p.contains("Wake-ups: on"));
+    assert!(
+        p.contains(r##"<a href="#bots">Back to your bots</a>"##) && p.contains(r#"<h2 id="bots">"#)
+    );
+    bot.ok("set_doorbell", json!({ "type": "ntfy" })).await;
+    let p = page(alice.clone()).await;
+    assert!(
+        p.contains("<strong>Wake-ups: on</strong> (all rooms)"),
+        "set up on purpose"
+    );
+    assert!(!p.contains("Wake-ups are not set up"));
+    relay.shutdown().await;
+}

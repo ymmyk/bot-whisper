@@ -97,13 +97,16 @@ pub async fn finish_sign_in(
         let agent_id = who["agent_id"].as_str().unwrap_or("bot").to_string();
         let store = BotStore::new(config, relay, &agent_id);
         store.save_tokens(tokens)?;
+        if let Some(n) = who["bot_name"].as_str().filter(|n| !n.trim().is_empty()) {
+            store.save_bot_name(n)?;
+        }
         store.set_current()?;
         let identity = store.load_or_create_identity(&agent_id)?;
         // Make sure the bot can be woken: cache (or create) its doorbell.
         let bell = match client.call("get_doorbell", json!({})).await {
             Ok(v) if v["doorbell"].is_object() => v["doorbell"].clone(),
             _ => client
-                .call("set_doorbell", json!({}))
+                .call("set_doorbell", json!({ "auto": true }))
                 .await
                 .map(|v| v["doorbell"].clone())
                 .unwrap_or(Value::Null),
@@ -339,16 +342,38 @@ impl Gateway {
     /// Use the stored login, if there is one. `Ok(false)`: nothing stored.
     pub async fn resume(&self) -> anyhow::Result<bool> {
         let i = &self.inner;
-        let store = match i.bot.as_deref() {
-            Some(b) => Some(BotStore::new(&i.config, &i.relay, b)),
-            None => BotStore::current(&i.config, &i.relay),
+        // --bot picks the directory; else the bot saved under --bot-name;
+        // else the one this home last signed in. With --bot-name the home's
+        // bot must be that bot (checked before anything is fetched).
+        let (store, expect) = match (i.bot.as_deref(), i.bot_name.as_deref()) {
+            (Some(b), _) => (Some(BotStore::new(&i.config, &i.relay, b)), None),
+            (None, Some(n)) => (
+                BotStore::find_by_name(&i.config, &i.relay, n)
+                    .or_else(|| BotStore::current(&i.config, &i.relay)),
+                Some(n),
+            ),
+            (None, None) => (BotStore::current(&i.config, &i.relay), None),
         };
         let Some(store) = store else { return Ok(false) };
         let Some(tokens) = store.load_tokens() else {
             return Ok(false);
         };
+        // A saved name that differs: refuse before the relay is called.
+        if let (Some(want), Some(have)) = (expect, store.load_bot_name()) {
+            if want.trim() != have.trim() {
+                let e = super::server::WrongBot {
+                    home: i.config.display().to_string(),
+                    home_bot: have,
+                    wanted: want.to_string(),
+                };
+                *i.resume_note.lock().expect("lock") = Some(format!(
+                    "{e}. Call `login` only if you want to sign in a bot named \"{want}\" in this home."
+                ));
+                return Err(e.into());
+            }
+        }
         let client = RelayClient::new(&i.relay, tokens, Some(store.clone()));
-        match Connector::new(client, Some(store), Some(&i.config)).await {
+        match Connector::new_for(client, Some(store), Some(&i.config), expect).await {
             Ok(c) => {
                 *i.connector.write().expect("lock") = Some(c);
                 *i.resume_note.lock().expect("lock") = None;
@@ -360,6 +385,11 @@ impl Gateway {
                     // Not a sign-in problem: say only who is in the way.
                     *i.busy.lock().expect("lock") = Some(held.to_string());
                     *i.resume_note.lock().expect("lock") = None;
+                } else if let Some(w) = e.downcast_ref::<super::server::WrongBot>() {
+                    *i.resume_note.lock().expect("lock") = Some(format!(
+                        "{w}. Call `login` only if you want to sign in a bot named \"{}\" in this home.",
+                        w.wanted
+                    ));
                 } else {
                     *i.resume_note.lock().expect("lock") = Some(format!(
                         "The stored sign-in could not be used ({e}). Call `login` to sign in again."
@@ -877,6 +907,22 @@ impl Gateway {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
         self.remember_peer(&context.peer);
+        // Another process serves this bot: every tool (whoami and login
+        // included) says so, never "signed out" with a login hint.
+        if self.connector().is_none() && self.inner.busy.lock().expect("lock").is_some() {
+            // The other process may have stopped since: try again first.
+            let _ = self.resume().await;
+        }
+        if self.connector().is_none() {
+            let busy = self.inner.busy.lock().expect("lock").clone();
+            if let Some(message) = busy {
+                return Ok(CallToolResult::structured_error(json!({
+                    "error": "CONNECTOR_BUSY",
+                    "message": message,
+                }))
+                .into());
+            }
+        }
         let router = Self::tool_router();
         if router.has_route(&request.name) {
             let tcc = ToolCallContext::new(self, request, context);

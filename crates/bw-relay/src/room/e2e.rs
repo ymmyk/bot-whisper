@@ -95,7 +95,7 @@ pub struct E2eState {
 
 impl E2eState {
     /// Rebuild from the persisted handshake rows (after a restart).
-    pub fn load(epoch: u64, rows: Vec<HandshakeRow>) -> Self {
+    pub fn load(epoch: u64, rows: Vec<HandshakeRow>, saved_next_seq: u64) -> Self {
         let items: Vec<E2eItem> = rows
             .into_iter()
             .map(|r| E2eItem {
@@ -108,7 +108,9 @@ impl E2eState {
                 created: Instant::now(),
             })
             .collect();
-        let next_seq = items.iter().map(|i| i.seq).max().unwrap_or(0) + 1;
+        // Never hand out a seq twice: the saved counter wins over the
+        // handshakes still queued (application items are not on disk).
+        let next_seq = (items.iter().map(|i| i.seq).max().unwrap_or(0) + 1).max(saved_next_seq);
         E2eState {
             epoch,
             next_seq,
@@ -127,6 +129,11 @@ impl E2eState {
 
     pub fn queued(&self) -> usize {
         self.items.len()
+    }
+
+    /// The next seq to hand out.
+    pub fn next_seq(&self) -> u64 {
+        self.next_seq
     }
 
     /// The last seq handed out (0 before anything was queued).
@@ -183,6 +190,7 @@ impl Room {
     ) -> Result<u64, RelayError> {
         let seq = self.e2e.next_seq;
         self.e2e.next_seq += 1;
+        self.save_flow();
         if pending.is_empty() {
             // Nobody to deliver to; nothing to keep.
             return Ok(seq);

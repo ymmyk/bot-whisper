@@ -134,6 +134,10 @@ impl DoorbellTarget {
 pub struct DoorbellConfig {
     pub target: DoorbellTarget,
     pub events: Vec<String>,
+    /// Made by the connector at sign-in (a ready address), not set up on
+    /// purpose; the account page says wake-ups are not set up.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub auto: bool,
 }
 
 impl DoorbellConfig {
@@ -987,6 +991,7 @@ mod tests {
                 token: Some("tk_secret".into()),
             },
             events: vec!["message".into()],
+            auto: false,
         };
         assert_eq!(cfg.masked_topic().unwrap().chars().count(), 8);
         let view = serde_json::to_string(&cfg.bot_view("https://ntfy.sh")).unwrap();

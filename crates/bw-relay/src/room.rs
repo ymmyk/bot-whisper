@@ -29,6 +29,14 @@ pub use e2e::{
     MAX_KEY_PACKAGES, MAX_KEY_PACKAGE_BYTES,
 };
 
+/// What `save_flow` keeps in `rooms.flow`.
+#[derive(Serialize, Deserialize, Default)]
+struct SavedFlow {
+    thread: Option<ThreadState>,
+    thread_counter: u32,
+    owner_ended_thread: bool,
+}
+
 use crate::{
     auth::AgentId,
     config::RelayConfig,
@@ -220,6 +228,7 @@ impl Room {
             vec![owner],
             Vec::new(),
             Vec::new(),
+            0,
         ))
     }
 
@@ -252,11 +261,19 @@ impl Room {
             .collect();
         let doorbells = db.doorbells(id)?;
         let handshakes = db.handshakes(id)?;
-        Ok(Some(Self::from_parts(
-            db, bells, cfg, row, members, doorbells, handshakes,
-        )))
+        let (next_seq, flow) = db.room_flow(id)?;
+        let mut room = Self::from_parts(
+            db, bells, cfg, row, members, doorbells, handshakes, next_seq,
+        );
+        if let Some(f) = flow.and_then(|f| serde_json::from_str::<SavedFlow>(&f).ok()) {
+            room.thread = f.thread;
+            room.thread_counter = f.thread_counter;
+            room.owner_ended_thread = f.owner_ended_thread;
+        }
+        Ok(Some(room))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn from_parts(
         db: Db,
         bells: Doorbells,
@@ -265,6 +282,7 @@ impl Room {
         members: Vec<Member>,
         doorbells: Vec<(String, DoorbellConfig)>,
         handshakes: Vec<crate::db::HandshakeRow>,
+        saved_next_seq: u64,
     ) -> Self {
         let (version, _) = watch::channel(0);
         let limits = &cfg.limits;
@@ -276,7 +294,7 @@ impl Room {
             max_members: row.max_members,
             mode: row.mode,
             thread_start: row.thread_start,
-            e2e: E2eState::load(row.e2e_epoch, handshakes),
+            e2e: E2eState::load(row.e2e_epoch, handshakes, saved_next_seq),
             next_member_n: row.next_member_n,
             members,
             thread: None,
@@ -328,7 +346,22 @@ impl Room {
     }
 
     fn touch(&self) {
+        self.save_flow();
         self.version.send_modify(|v| *v += 1);
+    }
+
+    /// Save the seq counter and the thread state, so a relay restart never
+    /// reuses a seq or starts the thread over.
+    fn save_flow(&self) {
+        let flow = SavedFlow {
+            thread: self.thread.clone(),
+            thread_counter: self.thread_counter,
+            owner_ended_thread: self.owner_ended_thread,
+        };
+        let json = serde_json::to_string(&flow).unwrap_or_default();
+        if let Err(e) = self.db.set_room_flow(&self.id, self.e2e.next_seq(), &json) {
+            tracing::warn!("could not save room flow state: {e}");
+        }
     }
 
     fn member_ids(&self) -> Vec<MemberId> {

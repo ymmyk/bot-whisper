@@ -315,10 +315,56 @@ async fn gated_inner() {
         "{err}"
     );
     assert!(err.to_string().contains("BOTWHISPER_HOME"), "{err}");
+    // If it serves anyway, EVERY tool (whoami and login too) says
+    // CONNECTOR_BUSY; never "signed out" with a login hint.
+    let (busy_svc, _) = serve(refused).await;
+    for tool in [
+        "whoami",
+        "login",
+        "login_status",
+        "list_rooms",
+        "create_room",
+    ] {
+        let r = raw(&busy_svc, tool, json!({})).await;
+        let v = r.structured_content.unwrap_or_default();
+        assert_eq!(v["error"], "CONNECTOR_BUSY", "{tool}: {v}");
+        assert!(!v.to_string().contains("NOT_SIGNED_IN"), "{tool}: {v}");
+    }
+    busy_svc.cancel().await.ok();
+    // The bot's name is saved at sign-in.
+    assert_eq!(store.load_bot_name().as_deref(), Some("Gateway Bot"));
     // ... and a new process picks the stored login up with no `login` once
     // the first has stopped.
     svc.cancel().await.ok();
     tokio::time::sleep(Duration::from_millis(500)).await;
+    // A connector started for a different bot never acts as this one.
+    let other = Gateway::new(
+        &relay.base(),
+        config.clone(),
+        None,
+        Some("Other Bot".into()),
+    );
+    let err = other.resume().await.expect_err("wrong bot is refused");
+    assert!(
+        err.downcast_ref::<botwhisper::connect::WrongBot>()
+            .is_some(),
+        "{err}"
+    );
+    assert!(
+        err.to_string().contains("\"Gateway Bot\"") && err.to_string().contains("\"Other Bot\""),
+        "{err}"
+    );
+    assert!(!other.is_signed_in());
+    // The right name finds the bot's directory.
+    let named = Gateway::new(
+        &relay.base(),
+        config.clone(),
+        None,
+        Some("Gateway Bot".into()),
+    );
+    assert!(named.resume().await.unwrap());
+    drop(named);
+    tokio::time::sleep(Duration::from_millis(300)).await;
     let gw2 = Gateway::new(&relay.base(), config.clone(), None, None);
     assert!(gw2.resume().await.unwrap());
     let (svc2, _) = serve(gw2).await;
@@ -582,4 +628,90 @@ async fn running_connector_notices_its_binary_was_upgraded() {
     // Room tools get it too, signed out or not.
     let r = raw(&svc, "list_rooms", json!({})).await;
     assert_eq!(r.structured_content.unwrap()["notice"], line);
+}
+
+/// Every file the connector writes (tokens, identity, keystore, rooms,
+/// inbox, trust, doorbell, current marker, bot name, lock and pid record,
+/// saved login) lands under the resolved `BOTWHISPER_HOME`, never under
+/// HOME or XDG_CONFIG_HOME.
+#[tokio::test]
+async fn every_file_stays_under_botwhisper_home() {
+    tokio::time::timeout(Duration::from_secs(90), async {
+        let root = tmp_dir("home-paths");
+        let home = root.join("home");
+        let fake_home = root.join("fakehome");
+        let xdg = root.join("xdg");
+        std::fs::create_dir_all(&fake_home).unwrap();
+        std::fs::create_dir_all(&xdg).unwrap();
+        // Only this test reads the environment; the others pass explicit
+        // config directories.
+        std::env::set_var("BOTWHISPER_HOME", &home);
+        std::env::set_var("HOME", &fake_home);
+        std::env::set_var("XDG_CONFIG_HOME", &xdg);
+        let config = botwhisper::paths::config_dir();
+        assert_eq!(config, home);
+
+        let relay = TestRelay::start_with(cfg()).await;
+        let (svc, _) = serve(Gateway::new(
+            &relay.base(),
+            config.clone(),
+            None,
+            Some("Home Bot".into()),
+        ))
+        .await;
+        let l = call(&svc, "login", json!({})).await;
+        let code = l["user_code"].as_str().unwrap().to_string();
+        let url = l["verification_url"].as_str().unwrap().to_string();
+        person(&relay, &url, &code, "approve", "Home Bot").await;
+        let room = call(&svc, "create_room", json!({ "title": "paths" })).await;
+        assert!(room["room_id"].is_string(), "{room}");
+        call(
+            &svc,
+            "send_message",
+            json!({ "room_id": room["room_id"], "text": "hi" }),
+        )
+        .await;
+        call(&svc, "list_rooms", json!({})).await;
+
+        fn walk(d: &std::path::Path, out: &mut Vec<PathBuf>) {
+            for e in std::fs::read_dir(d).into_iter().flatten().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else {
+                    out.push(p);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        walk(&root, &mut files);
+        assert!(!files.is_empty());
+        for f in &files {
+            assert!(
+                f.starts_with(&home),
+                "{} is outside BOTWHISPER_HOME",
+                f.display()
+            );
+        }
+        let names: Vec<String> = files
+            .iter()
+            .map(|f| f.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        for want in [
+            "tokens.json",
+            "rooms.json",
+            "keystore.json",
+            "connect.lock",
+            "connect.pid",
+            "current",
+            "bot.json",
+        ] {
+            assert!(names.iter().any(|n| n == want), "{want} in {names:?}");
+        }
+        svc.cancel().await.ok();
+        let _ = std::fs::remove_dir_all(&root);
+        relay.shutdown().await;
+    })
+    .await
+    .expect("the test must not hang");
 }

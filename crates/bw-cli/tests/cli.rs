@@ -256,3 +256,109 @@ fn connect_help_describes_the_stdio_then_login_flow() {
     assert!(out.contains("Optional: sign in from a terminal"), "{out}");
     let _ = std::fs::remove_dir_all(&h);
 }
+
+/// A signed-in-looking bot directory (fake tokens; nothing is contacted).
+fn fake_bot(home: &std::path::Path, bot: &str) -> botwhisper::connect::store::BotStore {
+    use botwhisper::connect::store::{BotStore, Tokens};
+    let s = BotStore::new(home, NOWHERE, bot);
+    s.save_tokens(&Tokens {
+        access_token: "fake".into(),
+        refresh_token: None,
+        expires_at: u64::MAX,
+        client_id: None,
+    })
+    .unwrap();
+    s.set_current().unwrap();
+    s
+}
+
+/// One resolver: `--home` wins over BOTWHISPER_HOME, which wins over the
+/// platform default; `connect status` reports the store under it.
+#[test]
+fn home_flag_wins_over_the_environment() {
+    let env_home = home("env-home");
+    let flag_home = home("flag-home");
+    fake_bot(&flag_home, "flagbot");
+    let flag = flag_home.to_string_lossy().to_string();
+    let (code, out) = run(
+        &env_home,
+        &["--home", &flag, "connect", "--relay", NOWHERE, "status"],
+    );
+    assert_eq!(code, 0, "{out}");
+    assert!(
+        out.contains(&format!(
+            "config dir: {}",
+            flag_home.join("127.0.0.1_9").join("flagbot").display()
+        )) || out.contains(&flag),
+        "{out}"
+    );
+    // The flag also works after the subcommand.
+    let (code, out) = run(
+        &env_home,
+        &["connect", "--relay", NOWHERE, "status", "--home", &flag],
+    );
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains(&flag), "{out}");
+    // Without it, BOTWHISPER_HOME (no bot there) is used, not the flag home.
+    let (code, out) = run(&env_home, &["connect", "--relay", NOWHERE, "status"]);
+    assert_eq!(code, 2, "{out}");
+    assert!(out.contains("Not signed in"), "{out}");
+    let _ = std::fs::remove_dir_all(&env_home);
+    let _ = std::fs::remove_dir_all(&flag_home);
+}
+
+/// When another process holds the bot's lock, `connect` refuses to start:
+/// a clear stderr message and exit 3, never a signed-out server. The lock is
+/// taken before the relay is contacted (nothing listens at NOWHERE).
+#[test]
+fn a_busy_bot_refuses_to_start() {
+    use botwhisper::connect::lock::{ConfigLock, LockWho};
+    let h = home("busy");
+    let s = fake_bot(&h, "busybot");
+    let _held = ConfigLock::acquire(
+        &s.dir,
+        &LockWho {
+            home: h.clone(),
+            bot: "Busy Bot".into(),
+        },
+    )
+    .unwrap();
+    let mut child = Command::new(BIN)
+        .args(["connect", "--relay", NOWHERE])
+        .env("BOTWHISPER_HOME", &h)
+        .env_remove("BOTWHISPER_RELAY")
+        .env_remove("BOTWHISPER_BOT")
+        .env_remove("BOTWHISPER_BOT_NAME")
+        .env_remove("BOTWHISPER_DEV_TOKEN")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let start = std::time::Instant::now();
+    let status = loop {
+        if let Some(st) = child.try_wait().unwrap() {
+            break st;
+        }
+        assert!(
+            start.elapsed().as_secs() < 20,
+            "connect kept running while busy"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    let mut err = String::new();
+    std::io::Read::read_to_string(child.stderr.as_mut().unwrap(), &mut err).unwrap();
+    let mut out = String::new();
+    std::io::Read::read_to_string(child.stdout.as_mut().unwrap(), &mut out).unwrap();
+    assert_eq!(status.code(), Some(3), "{err}");
+    assert!(
+        err.contains("not starting") && err.contains(&format!("pid {}", std::process::id())),
+        "{err}"
+    );
+    assert!(err.contains("--home"), "{err}");
+    assert!(
+        !err.contains("login") && out.is_empty(),
+        "no signed-out server: {err}{out}"
+    );
+    let _ = std::fs::remove_dir_all(&h);
+}

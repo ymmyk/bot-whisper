@@ -13,4 +13,4 @@ pub mod trust;
 pub mod upgrade;
 
 pub use gateway::Gateway;
-pub use server::Connector;
+pub use server::{Connector, WrongBot};

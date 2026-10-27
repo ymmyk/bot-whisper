@@ -1,15 +1,35 @@
-//! Where the local tooling keeps its files: `BOTWHISPER_HOME` if set, else
-//! the platform's per-user config directory plus `botwhisper`. Everything
+//! Where the local tooling keeps its files, resolved in one place: the
+//! `--home` flag, else `BOTWHISPER_HOME`, else the platform's per-user config
+//! directory plus `botwhisper`. Everything
 //! under it is per relay host and per bot. Files that hold secrets are
 //! written 0600 and directories 0700 (unix); Windows relies on the profile's
 //! ACL.
 
 use std::path::{Path, PathBuf};
 
-/// The root config directory.
+static HOME_FLAG: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Set the home from `--home` (once, at startup, before anything resolves a
+/// path). Later calls are ignored.
+pub fn set_home_flag(home: PathBuf) {
+    let _ = HOME_FLAG.set(home);
+}
+
+/// The home the person chose explicitly (`--home`, else `BOTWHISPER_HOME`),
+/// for messages and the Next line; `None` means the platform default.
+pub fn explicit_home() -> Option<PathBuf> {
+    HOME_FLAG.get().cloned().or_else(|| {
+        std::env::var_os("BOTWHISPER_HOME")
+            .filter(|h| !h.is_empty())
+            .map(PathBuf::from)
+    })
+}
+
+/// The root config directory: every file the connector, `connect login`,
+/// `connect status` and `listen` use lives under it.
 pub fn config_dir() -> PathBuf {
-    if let Some(h) = std::env::var_os("BOTWHISPER_HOME").filter(|h| !h.is_empty()) {
-        return PathBuf::from(h);
+    if let Some(h) = explicit_home() {
+        return h;
     }
     let home = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))

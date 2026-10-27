@@ -926,6 +926,227 @@ async fn restart_keeps_rooms_working_for_owner_and_member() {
     .expect("the test must not hang");
 }
 
+/// Every message reaches a member exactly once: messages fetched by a call
+/// that only applies commits (send_message) are kept for wait_for_message,
+/// a member that restarts gets what was sent while it was down and right
+/// after, a relay restart never reuses a seq, and an item fetched again
+/// (never acked) is not shown twice. A home without inbox.json (0.2.5 and
+/// older) just starts with an empty inbox.
+#[tokio::test]
+async fn messages_arrive_exactly_once_across_restarts_and_sends() {
+    tokio::time::timeout(Duration::from_secs(150), async {
+        let relay = TestRelay::start().await;
+        let dir = tmp_dir("exactly-once");
+        let store = |who: &str| BotStore::new(&dir, &relay.base(), who);
+        let base = relay.base();
+        let start = |t: &'static str, who: &'static str| {
+            let c = RelayClient::with_token(&base, t);
+            let st = BotStore::new(&dir, &base, who);
+            async move { serve_connector(Connector::new(c, Some(st), None).await.unwrap()).await }
+        };
+        // Collect everything bob is handed until `n` messages (or a quiet poll).
+        async fn collect(
+            svc: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+            room: &str,
+            n: usize,
+        ) -> Vec<String> {
+            let mut out = Vec::new();
+            for _ in 0..8 {
+                let got = call(
+                    svc,
+                    "wait_for_message",
+                    json!({ "room_id": room, "timeout_s": 2 }),
+                )
+                .await;
+                for m in got["messages"].as_array().cloned().unwrap_or_default() {
+                    out.push(m["content"].as_str().unwrap_or("").to_string());
+                }
+                if out.len() >= n {
+                    break;
+                }
+            }
+            out
+        }
+
+        let alice = start(TOKENS[0], "alice").await;
+        let bob = start(TOKENS[1], "bob").await;
+        let created = call(&alice, "create_room", json!({ "title": "Once" })).await;
+        let room = created["room_id"].as_str().unwrap().to_string();
+        let inv = call(&alice, "create_invite", json!({ "room_id": room })).await;
+        call(
+            &bob,
+            "join_room",
+            json!({ "invite_url": inv["invite_url"] }),
+        )
+        .await;
+        call(
+            &alice,
+            "wait_for_message",
+            json!({ "room_id": room, "timeout_s": 3 }),
+        )
+        .await;
+        call(
+            &bob,
+            "wait_for_message",
+            json!({ "room_id": room, "timeout_s": 3 }),
+        )
+        .await;
+
+        // 1. A send_message drain must not swallow an incoming message.
+        call(
+            &alice,
+            "send_message",
+            json!({ "room_id": room, "text": "one" }),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let sent = call(
+            &bob,
+            "send_message",
+            json!({ "room_id": room, "text": "reply" }),
+        )
+        .await;
+        assert!(sent["error"].is_null(), "{sent}");
+        let rooms = call(&bob, "list_rooms", json!({})).await;
+        assert_eq!(rooms["rooms"][0]["undelivered_here"], 1, "{rooms}");
+        assert!(store("bob").inbox_path().exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(store("bob").inbox_path())
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        assert_eq!(collect(&bob, &room, 1).await, vec!["one"]);
+        assert_eq!(collect(&alice, &room, 1).await, vec!["reply"]);
+
+        // 2. Bob restarts; alice sends while he is down and right after.
+        stop(bob).await;
+        call(
+            &alice,
+            "send_message",
+            json!({ "room_id": room, "text": "down-1" }),
+        )
+        .await;
+        call(
+            &alice,
+            "send_message",
+            json!({ "room_id": room, "text": "down-2" }),
+        )
+        .await;
+        // An upgrade from a home with no inbox.json.
+        let _ = std::fs::remove_file(store("bob").inbox_path());
+        let bob = start(TOKENS[1], "bob").await;
+        call(
+            &alice,
+            "send_message",
+            json!({ "room_id": room, "text": "after-1" }),
+        )
+        .await;
+        let got = collect(&bob, &room, 3).await;
+        assert_eq!(
+            got,
+            vec!["down-1", "down-2", "after-1"],
+            "exactly once, in order"
+        );
+        let again = call(
+            &bob,
+            "wait_for_message",
+            json!({ "room_id": room, "timeout_s": 2 }),
+        )
+        .await;
+        assert_eq!(again["messages"], json!([]), "nothing twice: {again}");
+
+        // 3. Bob fetched and saved a message but crashed before handing it
+        //    over: after the restart it is still delivered, once.
+        call(
+            &alice,
+            "send_message",
+            json!({ "room_id": room, "text": "saved" }),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        call(
+            &bob,
+            "send_message",
+            json!({ "room_id": room, "text": "x" }),
+        )
+        .await;
+        stop(bob).await;
+        let bob = start(TOKENS[1], "bob").await;
+        assert_eq!(collect(&bob, &room, 1).await, vec!["saved"]);
+        assert_eq!(collect(&alice, &room, 1).await, vec!["x"]);
+
+        // 4. The relay restarts; the sender then restarts and sends: the
+        //    receiver gets it (no seq reuse, no stale generation).
+        let (cfg, db) = relay.shutdown().await;
+        let relay = TestRelay::start_on(cfg, db).await;
+        stop(alice).await;
+        let alice = start(TOKENS[0], "alice").await;
+        call(
+            &alice,
+            "send_message",
+            json!({ "room_id": room, "text": "post-relay-restart" }),
+        )
+        .await;
+        assert_eq!(collect(&bob, &room, 1).await, vec!["post-relay-restart"]);
+        call(
+            &bob,
+            "send_message",
+            json!({ "room_id": room, "text": "back" }),
+        )
+        .await;
+        assert_eq!(collect(&alice, &room, 1).await, vec!["back"]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        relay.shutdown().await;
+    })
+    .await
+    .expect("the test must not hang");
+}
+
+/// A message that cannot be decrypted is shown as an error item, never
+/// dropped silently.
+#[tokio::test]
+async fn an_undecryptable_message_is_visible() {
+    tokio::time::timeout(Duration::from_secs(90), async {
+        let relay = TestRelay::start().await;
+        let dir = tmp_dir("undecryptable");
+        let base = relay.base();
+        let start = |t: &'static str, who: &'static str| {
+            let c = RelayClient::with_token(&base, t);
+            let st = BotStore::new(&dir, &base, who);
+            async move { serve_connector(Connector::new(c, Some(st), None).await.unwrap()).await }
+        };
+        let alice = start(TOKENS[0], "alice").await;
+        let bob = start(TOKENS[1], "bob").await;
+        let created = call(&alice, "create_room", json!({ "title": "Garbled" })).await;
+        let room = created["room_id"].as_str().unwrap().to_string();
+        let inv = call(&alice, "create_invite", json!({ "room_id": room })).await;
+        call(&bob, "join_room", json!({ "invite_url": inv["invite_url"] })).await;
+        call(&alice, "wait_for_message", json!({ "room_id": room, "timeout_s": 3 })).await;
+        call(&bob, "wait_for_message", json!({ "room_id": room, "timeout_s": 3 })).await;
+        // Alice's token, but bytes that are not an MLS message for this group.
+        let raw = relay.bot(TOKENS[0]).await;
+        raw.ok(
+            "e2e_send",
+            json!({ "room_id": room, "ciphertext": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"not an mls message at all") }),
+        )
+        .await;
+        let got = call(&bob, "wait_for_message", json!({ "room_id": room, "timeout_s": 5 })).await;
+        let m = &got["messages"][0];
+        assert_eq!(m["error"], "UNDECRYPTABLE", "{got}");
+        assert_eq!(m["readable"], false);
+        assert!(m["content"].as_str().unwrap().contains("send it again"), "{got}");
+        let _ = std::fs::remove_dir_all(&dir);
+        relay.shutdown().await;
+    })
+    .await
+    .expect("the test must not hang");
+}
+
 /// When group state is truly missing (a home from 0.2.3, or a fresh home),
 /// the room is `needs_rejoin`, unreadable, and every error says how to
 /// recover: a fresh invite and join_room, never wait_for_message.
