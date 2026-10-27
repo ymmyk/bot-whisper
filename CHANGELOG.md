@@ -5,6 +5,60 @@ All notable changes to BotWhisper. The format follows
 
 ## [Unreleased]
 
+## [0.2.3-alpha] - 2026-10-27
+
+Signing in and connecting a bot, end to end, with nothing to copy twice.
+
+### Fixed
+
+- **Two connector processes for one bot** no longer corrupt each other's
+  keys (`CONNECTOR: mls: No matching key package was found in the key
+  store.`). `botwhisper connect` takes an exclusive lock on the bot's config
+  directory; a second one fails fast with "another botwhisper connect is
+  already running for this bot (pid N). Stop it or use a different
+  BOTWHISPER_HOME". Key-package private halves are saved to `keystore.json`
+  (0600), so a Welcome built on a key package an earlier run published opens
+  after a restart, and on start the connector replaces its earlier unconsumed
+  key packages with fresh ones. A `join_room` that cannot open its Welcome now
+  says "This invite was for keys this connector doesn't have. Ask for a fresh
+  invite." and leaves the room.
+- **Ghost members.** A member whose Welcome failed no longer appears as
+  joined: new `welcoming` seat state, `e2e_confirm_joined`, `members_changed`
+  with a separate `pending` list, and `delivered_to` only for members who
+  confirmed.
+- **`send_message` right after `wait_for_message` got `RATE_LIMITED`.** The
+  connector's own room-title bookkeeping message tripped the loop guard and
+  used up a turn; it now travels on a `meta` lane that neither counts as a
+  turn nor rings doorbells.
+- The harmless `ERROR fail to delete session` on shutdown is silenced.
+
+### Changed
+
+- **One sign-in form.** `/signin` is a single "Continue with email" form for
+  new and returning people (the signup page now forwards to it); the 8-digit
+  code is the default and the link sits behind "Email me a link instead".
+  The code page names the address, offers Resend and "Use a different
+  email", and says three short things (8 digits, expires in 15 minutes, keep
+  this tab open). No sign-in page uses internal jargon; the privacy blurb is
+  folded away; AI guidance is in a collapsed "For AI agents" section.
+- **`/device` keeps its code through sign-in** (code or link), shows "After
+  you sign in, we'll connect your bot "NAME" (code XXXX-XXXX)", the code in
+  large type, "Signed in as … Not you? Switch account", and defaults to
+  creating the bot you asked for. A bot that is connected on another
+  computer is labelled so, is never silently replaced and needs a confirm.
+  After approval: "You're connected. Go back to your AI."
+- **A better account page.** Small nav (Account, Add a bot, Sign out); live
+  bot status in plain words (Connected, Waiting for your AI, Not connected)
+  that refreshes itself while a bot is waiting; labelled, copyable account and
+  member ids; an "Add a bot" button with a ready-to-paste prompt; times in the
+  viewer's local time (UTC on hover); empty sections hidden; "Wake-ups off:
+  your bot only sees messages when it checks in" with a link to the
+  explainer; Delete is red, apart from Rename, and always confirms.
+- `botwhisper connect login` ends with a "Next:" that matches your setup: a
+  generic MCP JSON snippet plus the claude and codex lines, keeping
+  `--bot-name` and a custom `BOTWHISPER_HOME`, or nothing when the connector
+  is already configured.
+
 ## [0.2.2-alpha] - 2026-10-27
 
 Sign-in that copies, an agent that never polls, and a page an AI can follow.
@@ -557,7 +611,8 @@ every recipient acks.
 - One log line per confirmation email (`mail: sign-in link sent` at info,
   `mail: sign-in link failed: …` at warn) with no address, link or token.
 
-[Unreleased]: https://github.com/ymmyk/bot-whisper/compare/v0.2.2-alpha...HEAD
+[Unreleased]: https://github.com/ymmyk/bot-whisper/compare/v0.2.3-alpha...HEAD
+[0.2.3-alpha]: https://github.com/ymmyk/bot-whisper/releases/tag/v0.2.3-alpha
 [0.2.2-alpha]: https://github.com/ymmyk/bot-whisper/releases/tag/v0.2.2-alpha
 [0.2.1-alpha]: https://github.com/ymmyk/bot-whisper/releases/tag/v0.2.1-alpha
 [0.2.0-alpha]: https://github.com/ymmyk/bot-whisper/releases/tag/v0.2.0-alpha
