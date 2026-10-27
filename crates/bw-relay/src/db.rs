@@ -630,7 +630,7 @@ impl Db {
                 let Ok(mut cfg) = serde_json::from_str::<DoorbellConfig>(&raw) else {
                     continue;
                 };
-                if is_sign_in_default(&cfg) && !cfg.auto {
+                if is_sign_in_default(&cfg) && !cfg.auto && !cfg.manual {
                     cfg.auto = true;
                     conn.execute(
                         "UPDATE bot_doorbells SET config = ?2 WHERE agent_id = ?1",
@@ -2339,6 +2339,44 @@ mod tests {
         let db = Db::open(&path).unwrap();
         assert!(!read(&db, "later").auto, "the migration ran once");
         assert!(read(&db, "legacy").auto);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn manual_doorbells_are_never_re_marked_automatic() {
+        let dir = std::env::temp_dir().join(format!("bw-manual-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("relay.sqlite3");
+        let events = r#"["thread_started","message","turn","thread_done","stalled"]"#;
+        // Looks exactly like a sign-in default, but was set up by hand.
+        let manual = format!(
+            r#"{{"target":{{"type":"ntfy","topic":"bw-manual"}},"events":{events},"manual":true}}"#
+        );
+        {
+            let db = Db::open(&path).unwrap();
+            db.with(|c| {
+                c.execute_batch("PRAGMA user_version = 0;")?;
+                c.execute(
+                    "INSERT INTO bot_doorbells (agent_id, config) VALUES ('m', ?1)",
+                    params![manual],
+                )
+            })
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        let cfg = db
+            .all_bot_doorbells()
+            .unwrap()
+            .into_iter()
+            .find(|(a, _, _)| a == "m")
+            .unwrap()
+            .1;
+        assert!(cfg.manual && !cfg.auto && !cfg.is_automatic());
+        // The flag survives a round trip through serde.
+        let back: DoorbellConfig =
+            serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
+        assert!(back.manual);
         drop(db);
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -188,6 +188,43 @@ impl RelayConfig {
     }
 }
 
+/// `2026-10-27T14:35:33Z` (UTC, seconds).
+pub fn iso_utc(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    // Howard Hinnant's civil_from_days.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+        rem / 3600,
+        (rem % 3600) / 60,
+        rem % 60
+    )
+}
+
+/// A retention period in words: `7 days`, `1 day`, `36 hours`, `1 hour`.
+pub fn ttl_words(ttl: Duration) -> String {
+    let s = ttl.as_secs();
+    let plural = |n: u64, unit: &str| format!("{n} {unit}{}", if n == 1 { "" } else { "s" });
+    if s >= 86_400 && s.is_multiple_of(86_400) {
+        plural(s / 86_400, "day")
+    } else if s >= 3600 && s.is_multiple_of(3600) {
+        plural(s / 3600, "hour")
+    } else if s >= 60 && s.is_multiple_of(60) {
+        plural(s / 60, "minute")
+    } else {
+        plural(s, "second")
+    }
+}
+
 /// Parse a human duration such as `1h`, `7d`, `30m`, `90s`, or `never`.
 /// Returns `Ok(None)` for `never`.
 pub fn parse_expiry(s: &str) -> Result<Option<Duration>, String> {
@@ -212,6 +249,15 @@ pub fn parse_expiry(s: &str) -> Result<Option<Duration>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn iso_and_ttl_words() {
+        assert_eq!(iso_utc(0), "1970-01-01T00:00:00Z");
+        assert_eq!(iso_utc(1_793_115_333), "2026-10-27T15:35:33Z");
+        assert_eq!(ttl_words(Duration::from_secs(7 * 86_400)), "7 days");
+        assert_eq!(ttl_words(Duration::from_secs(86_400)), "1 day");
+        assert_eq!(ttl_words(Duration::from_secs(36 * 3600)), "36 hours");
+    }
 
     #[test]
     fn parses_expiry() {

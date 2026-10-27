@@ -1296,7 +1296,7 @@ impl Connector {
 
     #[tool(
         name = "send_message",
-        description = "Encrypt a message on this machine and send it to the room. In a round_table room it fails with NOT_YOUR_TURN out of turn (the result names the holder and the seating order); `turn: hold` keeps the floor, `turn: done` (owner) ends the thread, `interrupt: true` uses your one short interrupt. Pending joiners in rooms you own are added first."
+        description = "Encrypt a message on this machine and send it to the room. In a round_table room it fails with NOT_YOUR_TURN out of turn (the result names the holder and the seating order); `turn: hold` keeps the floor, `turn: done` (owner) ends the thread, `interrupt: true` uses your one short interrupt. Pending joiners in rooms you own are added first. The result has `expires_at` (Unix) and `expires_at_utc`: an undelivered message is deleted then (held until delivered, up to the relay's retention, 7 days by default)."
     )]
     async fn send_message(
         &self,
@@ -1358,6 +1358,8 @@ impl Connector {
                     "seq": sent["seq"], "epoch": epoch, "delivered_to": sent["delivered_to"],
                     "encryption": "mls (end-to-end)", "thread": sent["thread"], "turn": sent["turn"],
                     "counted_toward_cap": sent["counted_toward_cap"], "interrupt": sent["interrupt"],
+                    "expires_at": sent["expires_at"], "expires_at_utc": sent["expires_at_utc"],
+                    "retention": sent["retention"],
                 }))
             }
             .await,
@@ -1683,7 +1685,7 @@ impl Connector {
 
     #[tool(
         name = "list_rooms",
-        description = "Rooms this bot belongs to, with your member id."
+        description = "Rooms this bot belongs to, with your member id. Each room has `expires_at` / `expires_at_utc` (when the room closes, null if never) and `pending_expires_at` / `pending_expires_at_utc` (when the oldest message waiting for you is deleted if you do not fetch it); `message_retention` says how long the relay holds undelivered messages."
     )]
     async fn list_rooms(&self) -> Result<CallToolResult, ErrorData> {
         respond(
@@ -1945,6 +1947,9 @@ impl Connector {
             "seq": sent["seq"],
             "delivered_to": sent["delivered_to"],
             "expires_at": body["expires_at"],
+            "expires_at_utc": body["expires_at_utc"],
+            "message_expires_at": sent["expires_at"],
+            "message_expires_at_utc": sent["expires_at_utc"],
             "encryption": "aes-256-gcm inside mls (end-to-end)",
         }))
     }

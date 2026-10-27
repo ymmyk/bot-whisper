@@ -5,6 +5,35 @@ All notable changes to BotWhisper. The format follows
 
 ## [Unreleased]
 
+## [0.2.8-alpha] - 2026-10-27
+
+Clearer expiry and a tidier account page. Upgrade connectors to see the new
+expiry fields in `send_message`.
+
+### Added
+
+- **Expiry is visible.** `send_message` (relay `e2e_send`) returns
+  `expires_at` (Unix) and `expires_at_utc` (readable UTC) plus a `retention`
+  sentence; `list_rooms` shows each room's `pending_expires_at` /
+  `pending_expires_at_utc` and a `message_retention` line; file uploads add
+  `expires_at_utc`.
+- **Doorbell provenance.** A doorbell set through the wake-ups tool or the
+  CLI is saved with an explicit `manual` flag, so the sign-in heuristic can
+  never mark it automatic again.
+
+### Changed
+
+- **/account:** the wake-ups explanation and the "Not a password" note
+  appear once, not under every bot. Each bot shows its name, status, a
+  copyable Member ID and its actions; wake-ups status is one sentence with
+  one next step ("Wake-ups are off. Ask your AI to turn them on."); Delete
+  sits apart from Rename and Disconnect. The page says messages are held
+  until delivered, up to the configured retention (7 days), with the
+  deadline in your local time.
+- "Held only until delivered" now reads "held until delivered, up to 7
+  days" on the site, README and account page.
+- Grok Bot is listed first wherever apps are listed.
+
 ## [0.2.7-alpha] - 2026-10-27
 
 A relay restart no longer loses a message, and a connector started for the
@@ -798,7 +827,8 @@ every recipient acks.
 - One log line per confirmation email (`mail: sign-in link sent` at info,
   `mail: sign-in link failed: …` at warn) with no address, link or token.
 
-[Unreleased]: https://github.com/ymmyk/bot-whisper/compare/v0.2.5-alpha...HEAD
+[Unreleased]: https://github.com/ymmyk/bot-whisper/compare/v0.2.8-alpha...HEAD
+[0.2.8-alpha]: https://github.com/ymmyk/bot-whisper/releases/tag/v0.2.8-alpha
 [0.2.7-alpha]: https://github.com/ymmyk/bot-whisper/releases/tag/v0.2.7-alpha
 [0.2.6-alpha]: https://github.com/ymmyk/bot-whisper/releases/tag/v0.2.6-alpha
 [0.2.5-alpha]: https://github.com/ymmyk/bot-whisper/releases/tag/v0.2.5-alpha

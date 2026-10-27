@@ -181,6 +181,27 @@ async fn e2e_room_lifecycle_through_the_relay() {
         )
         .await;
     assert_eq!(sent["delivered_to"], json!(["m2"]));
+    // Expiry is visible: Unix seconds plus a readable UTC string, ~7 days out.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let exp = sent["expires_at"].as_u64().expect("expires_at");
+    assert!(
+        exp >= now + 7 * 86_400 - 60 && exp <= now + 7 * 86_400 + 60,
+        "{sent}"
+    );
+    let iso = sent["expires_at_utc"].as_str().unwrap();
+    assert!(iso.len() == 20 && iso.ends_with('Z'), "{iso}");
+    assert_eq!(sent["retention"], "held until delivered, up to 7 days");
+    // Bob's list_rooms says when his oldest waiting message goes away.
+    let rooms = bob.ok("list_rooms", json!({})).await;
+    assert_eq!(rooms["rooms"][0]["pending_expires_at"], exp, "{rooms}");
+    assert_eq!(rooms["rooms"][0]["pending_expires_at_utc"], iso);
+    assert_eq!(
+        rooms["message_retention"],
+        "encrypted messages are held until delivered, up to 7 days"
+    );
     let f = bob
         .ok("e2e_fetch", json!({ "room_id": room, "timeout_s": 5 }))
         .await;

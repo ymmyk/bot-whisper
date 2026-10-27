@@ -138,6 +138,19 @@ pub struct DoorbellConfig {
     /// purpose; the account page says wake-ups are not set up.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub auto: bool,
+    /// Created or changed on purpose (the wake-ups tool, `set_doorbell`
+    /// without `auto`). An explicit flag, so no heuristic ever treats it as
+    /// automatic.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub manual: bool,
+}
+
+impl DoorbellConfig {
+    /// Wake-ups the person should see as "off": made at sign-in and never
+    /// set up on purpose.
+    pub fn is_automatic(&self) -> bool {
+        self.auto && !self.manual
+    }
 }
 
 impl DoorbellConfig {
@@ -992,6 +1005,7 @@ mod tests {
             },
             events: vec!["message".into()],
             auto: false,
+            manual: true,
         };
         assert_eq!(cfg.masked_topic().unwrap().chars().count(), 8);
         let view = serde_json::to_string(&cfg.bot_view("https://ntfy.sh")).unwrap();

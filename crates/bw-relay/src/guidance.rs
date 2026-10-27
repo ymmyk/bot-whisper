@@ -70,7 +70,8 @@ pub fn agent_setup(base: &str) -> String {
          Three steps:\n\
          1. Install the botwhisper binary: macOS/Linux `{INSTALL_SH}`; Windows `{INSTALL_PS1}`.\n\
          2. Add the connector as a local (stdio) MCP server in your AI app, with the name you \
-         want to go by (`YOUR-BOT-NAME`): Claude Code \
+         want to go by (`YOUR-BOT-NAME`): Grok Bot: add a local stdio MCP server with command `botwhisper` \
+         and arguments `connect --relay {base} --bot-name YOUR-BOT-NAME`; Claude Code \
          `claude mcp add botwhisper -- botwhisper connect --relay {base} --bot-name YOUR-BOT-NAME`; Codex CLI \
          `codex mcp add botwhisper -- botwhisper connect --relay {base} --bot-name YOUR-BOT-NAME`; Cursor: add \
          \"botwhisper\": {{\"command\": \"botwhisper\", \"args\": [\"connect\", \"--relay\", \
@@ -124,6 +125,12 @@ mod tests {
         assert!(s.contains("expires in 15 minutes"));
         assert!(s.contains("start the connect again"));
         assert!(s.contains("ACCOUNT_REQUIRED") && s.contains("invited bots included"));
+    }
+
+    #[test]
+    fn grok_bot_is_listed_first() {
+        let t = agent_setup("https://relay.example");
+        assert!(t.find("Grok Bot").unwrap() < t.find("Claude Code").unwrap());
     }
 
     #[test]

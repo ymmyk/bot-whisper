@@ -378,7 +378,7 @@ fn doorbell_html(
         ""
     };
     let mut html = format!(
-        r##"<p class="muted"><strong>Wake-ups: on</strong> ({scope}), sent to {how}. Last wake-up sent: {last}.{health}{secret} <a href="#wakeups">What are wake-ups?</a>"##,
+        r##"<p class="muted"><strong>Wake-ups are on</strong> ({scope}), sent to {how}. Last wake-up sent: {last}.{health}{secret}"##,
         scope = esc(scope),
     );
     if let DoorbellTarget::Ntfy {
@@ -422,6 +422,18 @@ fn id_row(label: &str, value: &str, what: &str) -> String {
         shown = esc(value),
         copy = copy_button(value, "Copy"),
         what = esc(what),
+    )
+}
+
+/// A labelled, copyable id without its own explanation (the bots list
+/// explains the member id once, above every bot).
+fn id_row_compact(label: &str, value: &str) -> String {
+    format!(
+        r#"<div class="idrow"><span>{label}</span> <code class="fullid" title="{full}">{shown}</code> {copy}</div>"#,
+        label = esc(label),
+        full = esc(value),
+        shown = esc(value),
+        copy = copy_button(value, "Copy"),
     )
 }
 
@@ -501,12 +513,9 @@ fn account_html(st: &OauthState, acct: &AccountRow, csrf: &str) -> String {
             },
         };
         let mut bells = String::new();
-        let mut ready_address = false;
         if let Ok(Some((cfg, status))) = db.bot_doorbell(&b.agent_id) {
-            if cfg.auto {
-                // Made at sign-in, never set up on purpose: not "on".
-                ready_address = true;
-            } else {
+            // Made at sign-in and never set up on purpose: not "on".
+            if !cfg.is_automatic() {
                 bells.push_str(&doorbell_html(st, "all rooms", &cfg, &status));
             }
         }
@@ -521,14 +530,7 @@ fn account_html(st: &OauthState, acct: &AccountRow, csrf: &str) -> String {
             }
         }
         if bells.is_empty() {
-            let ready = if ready_address {
-                " A wake-up address was made when it signed in; <code>botwhisper listen</code> on that computer uses it."
-            } else {
-                ""
-            };
-            bells = format!(
-                r##"<p class="muted"><strong>Wake-ups are not set up.</strong> Your bot only sees new messages when it checks in.{ready} <a href="#wakeups">What are wake-ups?</a></p>"##
-            );
+            bells = r#"<p class="muted"><strong>Wake-ups are off.</strong> Ask your AI to turn them on.</p>"#.into();
         }
         let disconnect = if live.is_some() {
             format!(
@@ -554,21 +556,17 @@ fn account_html(st: &OauthState, acct: &AccountRow, csrf: &str) -> String {
             String::new()
         };
         bots.push_str(&format!(
-            r#"<div class="row"><p><strong>{name}</strong> {pill}</p>
-<p class="muted">{detail}<br>Created {created}<br>In rooms: {seats}</p>
+            r#"<div class="row bot"><p><strong>{name}</strong> {pill}</p>
+<p class="muted">{detail} Created {created}. In rooms: {seats}.</p>
 {id_row}
 {bells}{reconnect}
-<form method="post" action="/account/bots/rename"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="bot_id" value="{id}"><label for="name-{id}">Name</label><input id="name-{id}" name="name" type="text" maxlength="60" value="{name}"><button type="submit" class="ghost small">Rename</button></form>
-<div class="danger-zone actions">{disconnect}<form class="inline" method="post" action="/account/bots/delete"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="bot_id" value="{id}"><button type="submit" class="danger small">Delete this bot…</button></form></div></div>"#,
+<div class="actions"><form class="inline" method="post" action="/account/bots/rename"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="bot_id" value="{id}"><label for="name-{id}">Name</label><input id="name-{id}" name="name" type="text" maxlength="60" value="{name}"><button type="submit" class="ghost small">Rename</button></form>{disconnect}</div>
+<div class="danger-zone"><form class="inline" method="post" action="/account/bots/delete"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="bot_id" value="{id}"><button type="submit" class="danger small">Delete this bot…</button></form></div></div>"#,
             name = esc(&b.name),
             pill = status_pill(&status),
             detail = detail,
             created = time_html(b.created_at),
-            id_row = id_row(
-                "Member ID",
-                &b.agent_id,
-                "Your bot's identity in every room it joins: this is what the other members' bots see. Not a password."
-            ),
+            id_row = id_row_compact("Member ID", &b.agent_id),
             id = esc(&b.id),
             seats = if my_seats.is_empty() {
                 "none".to_string()
@@ -665,17 +663,19 @@ Your bots here: {mine}</p></div>"#,
 {account_id}
 <div id="add-bot">{add_bot}</div>
 <h2 id="bots">Your bots</h2>
-<p class="muted">Each bot is its own member in rooms. A bot has one live connection at a time.</p><div data-autorefresh>{bots}</div>
+<p class="muted">Each bot is its own member in rooms. A bot has one live connection at a time. A bot's Member ID is its identity in every room it joins: it is what the other members' bots see. Not a password. <a href="#wakeups">What are wake-ups?</a></p><div data-autorefresh>{bots}</div>
 {rooms_section}{invites_section}
 {wakeups_help}
 <hr>
-<p class="muted">Messages are end-to-end encrypted and held only until delivered, so there is no history here.</p>{refresh}"##,
+<p class="muted" id="retention">Messages are end-to-end encrypted and held until delivered, up to {ttl}, so there is no history here. A message sent now that no bot fetches is deleted by {retention_until}.</p>{refresh}"##,
+        ttl = crate::config::ttl_words(st.cfg.unacked_ttl),
+        retention_until = time_html(now + st.cfg.unacked_ttl.as_secs()),
         email = esc(&acct.email),
         created = time_html(acct.created_at),
         account_id = id_row(
             "Account ID",
             &acct.id,
-            "Identifies your account to BotWhisper (share it only when asking for support). Not a password."
+            "Identifies your account to BotWhisper (share it only when asking for support)."
         ),
         csrf = esc(csrf),
         wakeups_help = WAKEUPS_HELP,

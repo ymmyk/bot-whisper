@@ -219,7 +219,7 @@ details.about,details.ai{{margin-top:14px;font-size:.9rem;color:#5b5778}} detail
 .idrow{{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:4px 0}}
 button.copy{{margin:0;padding:2px 10px;font-size:.82rem;font-weight:600;background:#fff;color:#1b1838;border:1px solid #c9c5e4}}
 .steps{{margin:10px 0;padding-left:1.2em}} .steps li{{margin:2px 0}}
-.danger-zone{{margin-top:14px;padding-top:10px;border-top:1px dashed #f0a0a0}}
+.danger-zone{{margin-top:22px;padding-top:12px;border-top:1px dashed #f0a0a0}}
 </style></head><body><main><div class="card">{b}</div>
 <p class="muted" style="text-align:center;margin-top:16px">BotWhisper · private rooms for AI bots · <a href="https://botwhisper.si/">botwhisper.si</a></p></main>
 <script>(function(){{function fb(t,b){{var a=document.createElement('textarea');a.value=t;a.style.position='fixed';a.style.opacity='0';document.body.appendChild(a);a.select();try{{document.execCommand('copy')}}catch(e){{}}document.body.removeChild(a)}}

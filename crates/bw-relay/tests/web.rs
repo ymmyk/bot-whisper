@@ -200,8 +200,14 @@ async fn confirm_link_signs_in_once_and_expired_links_fail() {
         .id;
     assert!(page.contains("<span>Account ID</span>"));
     assert!(page.contains(&format!(r#"data-copy="{acct_id}""#)));
-    assert!(page.contains("Not a password."));
+    assert_eq!(page.matches("Not a password.").count(), 1, "said once");
     assert!(page.contains(r#"<time datetime=""#));
+    // Retention: up to the configured TTL, with a local-time deadline.
+    assert!(page.contains("held until delivered, up to 7 days"));
+    assert!(
+        page.contains(r#"A message sent now that no bot fetches is deleted by <time datetime=""#)
+    );
+    assert!(!page.contains("held only until delivered"));
     assert!(
         !page.contains("location.reload"),
         "no polling with no bots waiting"
@@ -265,7 +271,7 @@ async fn confirm_link_signs_in_once_and_expired_links_fail() {
         .await
         .unwrap();
     assert!(acct.contains("me@example.com"));
-    assert!(acct.contains("end-to-end encrypted and held only until delivered"));
+    assert!(acct.contains("end-to-end encrypted and held until delivered, up to 7 days"));
     assert!(acct.contains(r#"<time datetime=""#));
 
     // Single use.
@@ -405,8 +411,20 @@ async fn account_page_shows_only_own_data_and_disconnect_needs_csrf() {
         )),
         "member id shown in full"
     );
-    // Disconnect (secondary) sits next to Delete in one row.
-    assert!(page.contains(r#"<div class="danger-zone actions"><form class="inline" method="post" action="/account/disconnect">"#));
+    // Rename and Disconnect share one row; Delete sits apart in its own
+    // danger zone.
+    assert!(page.contains(
+        r#"Rename</button></form><form class="inline" method="post" action="/account/disconnect">"#
+    ));
+    assert!(page.contains(r#"<div class="danger-zone"><form class="inline" method="post" action="/account/bots/delete">"#));
+    // Shared explanations once, not per bot.
+    assert_eq!(page.matches("Not a password.").count(), 1);
+    assert_eq!(
+        page.matches(r##"<a href="#wakeups">What are wake-ups?</a>"##)
+            .count(),
+        1
+    );
+    assert_eq!(page.matches("identity in every room it joins").count(), 1);
     assert!(!page.contains("Wake-ups off"), "plain wording instead");
     assert!(page.contains(&room_id));
     assert!(page.contains("you own it") && page.contains("for Sam") && page.contains("unused"));
@@ -427,7 +445,7 @@ async fn account_page_shows_only_own_data_and_disconnect_needs_csrf() {
     // Doorbells: type, host, masked topic and status, never secrets, paths
     // or other people's doorbells.
     assert!(
-        page.contains("<strong>Wake-ups: on</strong> (all rooms), sent to a phone or desktop notification app. Last wake-up sent: never.")
+        page.contains("<strong>Wake-ups are on</strong> (all rooms), sent to a phone or desktop notification app. Last wake-up sent: never.")
             && page.contains("An access token is saved for it.")
     );
     assert!(
@@ -594,12 +612,11 @@ async fn account_page_shows_only_own_data_and_disconnect_needs_csrf() {
     // Delete: always asks first (red button, apart from Rename); a bot in a
     // room says what leaving does, and its owned room closes.
     assert!(
-        page.contains(r#"<div class="danger-zone actions">"#)
+        page.contains(r#"<div class="danger-zone">"#)
             && page.contains(r#"class="danger small">Delete this bot"#)
     );
     assert!(
-        page.find("Rename</button>").unwrap()
-            < page.find(r#"<div class="danger-zone actions">"#).unwrap(),
+        page.find("Rename</button>").unwrap() < page.find(r#"<div class="danger-zone">"#).unwrap(),
         "Delete sits apart from Rename"
     );
     let delete = |bot: &str, confirm: bool| {
@@ -1127,7 +1144,8 @@ async fn pages_have_no_missing_favicon_to_log() {
 
 /// Wake-ups show "on" only when one was really set up: a new bot with none,
 /// or with only the ready address its connector made at sign-in, says
-/// "Wake-ups are not set up"; setting one up on purpose turns it on.
+/// "Wake-ups are off. Ask your AI to turn them on."; setting one up on
+/// purpose turns it on and marks it manual for good.
 #[tokio::test]
 async fn wakeups_state_reflects_a_real_doorbell() {
     let relay = TestRelay::start().await;
@@ -1147,30 +1165,34 @@ async fn wakeups_state_reflects_a_real_doorbell() {
                 .unwrap()
         }
     };
+    let off = "<strong>Wake-ups are off.</strong> Ask your AI to turn them on.";
     let p = page(alice.clone()).await;
-    assert!(
-        p.contains("<strong>Wake-ups are not set up.</strong>"),
-        "none yet"
-    );
-    assert!(!p.contains("Wake-ups: on"));
+    assert!(p.contains(off), "none yet");
+    assert!(!p.contains("Wake-ups are on"));
     let bot = relay.bot(&tok).await;
     bot.ok("set_doorbell", json!({ "auto": true })).await;
     let p = page(alice.clone()).await;
+    assert!(p.contains(off), "auto address only");
     assert!(
-        p.contains("<strong>Wake-ups are not set up.</strong>"),
-        "auto address only"
+        !p.contains("wake-up address was made"),
+        "one sentence, one step"
     );
-    assert!(p.contains("A wake-up address was made when it signed in"));
-    assert!(!p.contains("Wake-ups: on"));
+    assert!(!p.contains("Wake-ups are on"));
+    let bot_id = format!("{alice_id}:bwc_wake1");
+    let (cfg, _) = relay.db.bot_doorbell(&bot_id).unwrap().unwrap();
+    assert!(cfg.auto && !cfg.manual && cfg.is_automatic());
     assert!(
         p.contains(r##"<a href="#bots">Back to your bots</a>"##) && p.contains(r#"<h2 id="bots">"#)
     );
     bot.ok("set_doorbell", json!({ "type": "ntfy" })).await;
     let p = page(alice.clone()).await;
     assert!(
-        p.contains("<strong>Wake-ups: on</strong> (all rooms)"),
+        p.contains("<strong>Wake-ups are on</strong> (all rooms)"),
         "set up on purpose"
     );
-    assert!(!p.contains("Wake-ups are not set up"));
+    assert!(!p.contains("Wake-ups are off"));
+    // Provenance: a doorbell set through the tool is explicitly manual.
+    let (cfg, _) = relay.db.bot_doorbell(&bot_id).unwrap().unwrap();
+    assert!(cfg.manual && !cfg.auto && !cfg.is_automatic());
     relay.shutdown().await;
 }

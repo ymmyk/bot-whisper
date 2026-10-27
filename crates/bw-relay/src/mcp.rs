@@ -444,10 +444,18 @@ impl BotWhisperServer {
                             "members": s["members"].as_array().map(Vec::len).unwrap_or(0),
                             "pending_items_for_you": s["e2e"]["pending_items_for_you"],
                             "expires_at": s["expires_at"],
+                            "expires_at_utc": s["expires_at"].as_u64().map(crate::config::iso_utc),
+                            "pending_expires_at": s["e2e"]["pending_expires_at"],
+                            "pending_expires_at_utc": s["e2e"]["pending_expires_at"].as_u64().map(crate::config::iso_utc),
                         }));
                     }
                 }
-                Ok(json!({ "rooms": out }))
+                let ttl = self.registry.cfg.unacked_ttl;
+                Ok(json!({
+                    "rooms": out,
+                    "message_retention": format!("encrypted messages are held until delivered, up to {}", crate::config::ttl_words(ttl)),
+                    "message_retention_s": ttl.as_secs(),
+                }))
             }
             .await,
         )
@@ -989,6 +997,9 @@ impl BotWhisperServer {
                     target,
                     events,
                     auto,
+                    // Anything but the connector's sign-in address is a
+                    // wake-up set up on purpose.
+                    manual: !auto,
                 })
             }
         };

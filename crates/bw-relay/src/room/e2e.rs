@@ -249,6 +249,11 @@ impl Room {
             "welcoming": self.members.iter().filter(|m| m.e2e_state == SeatState::Welcoming).map(|m| m.member.clone()).collect::<Vec<_>>(),
             "joined": self.joined_ids(),
             "pending_items_for_you": self.e2e.items.iter().filter(|i| i.pending.contains(member)).count(),
+            // When the oldest message waiting for you is deleted undelivered.
+            "pending_expires_at": self.e2e.items.iter()
+                .filter(|i| i.kind == E2eItemKind::Application && i.pending.contains(member))
+                .map(|i| i.created_at + self.cfg.unacked_ttl.as_secs())
+                .min(),
         })
     }
 
@@ -462,6 +467,12 @@ impl Room {
         Ok(json!({ "seq": seq, "epoch": self.e2e.epoch, "delivered_to": [], "meta": true }))
     }
 
+    /// When a message queued `now` is deleted if still undelivered.
+    fn message_expiry(&self, now: u64) -> (u64, String) {
+        let at = now + self.cfg.unacked_ttl.as_secs();
+        (at, crate::config::iso_utc(at))
+    }
+
     /// Queue application ciphertext for every active member but the sender,
     /// after the round table has accepted the send. With `ciphertext`
     /// `None` this is a content-free turn signal (`pass`, `hold`, `done`).
@@ -580,6 +591,9 @@ impl Room {
             "counted_toward_cap": outcome.counted,
             "interrupt": outcome.interrupt,
             "turn": turn_view,
+            "expires_at": seq.map(|_| self.message_expiry(now).0),
+            "expires_at_utc": seq.map(|_| self.message_expiry(now).1),
+            "retention": format!("held until delivered, up to {}", crate::config::ttl_words(self.cfg.unacked_ttl)),
         }))
     }
 

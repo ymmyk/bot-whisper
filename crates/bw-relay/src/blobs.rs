@@ -167,6 +167,7 @@ async fn upload(
             "blob_id": row.id,
             "size": row.size,
             "expires_at": row.expires_at,
+            "expires_at_utc": crate::config::iso_utc(row.expires_at),
             "pending": pending,
         })),
     )

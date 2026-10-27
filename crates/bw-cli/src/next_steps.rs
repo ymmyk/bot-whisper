@@ -55,6 +55,7 @@ pub fn next_steps(exe: &str, relay: &str, bot_name: Option<&str>, home: Option<&
         .join("\n");
     format!(
         "Next: add BotWhisper to your AI app as a local MCP server (it runs `{cmd}`):\n\n\
+         Grok Bot: ask it to add a local MCP server with the command `{cmd}`\n\n\
          Any MCP app (JSON config):\n{indented}\n\n\
          Claude Code:\n  claude mcp add botwhisper{claude_env} -- {cmd}\n\n\
          Codex CLI:\n  codex mcp add botwhisper{codex_env} -- {cmd}\n\n\
@@ -111,6 +112,14 @@ mod tests {
             ),
             "{t}"
         );
+    }
+
+    #[test]
+    fn grok_bot_is_listed_first() {
+        let t = next_steps("botwhisper", "https://r.example", None, None);
+        let grok = t.find("Grok Bot").expect("Grok Bot listed");
+        assert!(grok < t.find("Any MCP app").unwrap());
+        assert!(grok < t.find("Claude Code").unwrap());
     }
 
     #[test]
