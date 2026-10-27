@@ -1188,7 +1188,9 @@ async fn code_page_resend_and_live_bot_status() {
         .await
         .unwrap();
     assert!(
-        acct.contains(r#"<span class="status wait" data-waiting>Waiting for your AI</span>"#),
+        acct.contains(
+            r#"<span class="seen wait" data-waiting><span class="dot" aria-hidden="true"></span>Waiting for your AI</span>"#
+        ),
         "{acct}"
     );
     assert!(acct.contains("location.reload"), "refreshes while waiting");
@@ -1207,8 +1209,14 @@ async fn code_page_resend_and_live_bot_status() {
         .await
         .unwrap();
     assert!(
-        acct.contains(r#"<span class="status on">Connected</span>"#),
+        acct.contains(
+            r#"<span class="seen on"><span class="dot" aria-hidden="true"></span>Last seen <time datetime=""#
+        ),
         "{acct}"
+    );
+    assert!(
+        acct.contains(">just now</time>"),
+        "seen by its last relay call"
     );
     assert!(!acct.contains("location.reload"));
     assert!(!acct.contains("last used never") && !acct.contains("Last seen never"));

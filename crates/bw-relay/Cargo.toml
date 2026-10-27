@@ -44,3 +44,7 @@ reqwest = { workspace = true, features = ["cookies"] }
 url = { workspace = true }
 rmcp = { workspace = true, features = ["client", "transport-streamable-http-client-reqwest", "reqwest"] }
 tracing-subscriber = { workspace = true }
+rcgen = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs"] }
+time = "0.3"

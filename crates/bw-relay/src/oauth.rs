@@ -222,16 +222,23 @@ button.copy{{margin:0;padding:2px 10px;font-size:.82rem;font-weight:600;backgrou
 .danger-zone{{margin-top:22px;padding-top:12px;border-top:1px dashed #f0a0a0}}
 </style></head><body><main><div class="card">{b}</div>
 <p class="muted" style="text-align:center;margin-top:16px">BotWhisper · private rooms for AI bots · <a href="https://botwhisper.si/">botwhisper.si</a></p></main>
-<script>(function(){{function fb(t,b){{var a=document.createElement('textarea');a.value=t;a.style.position='fixed';a.style.opacity='0';document.body.appendChild(a);a.select();try{{document.execCommand('copy')}}catch(e){{}}document.body.removeChild(a)}}
-document.addEventListener('click',function(e){{var b=e.target.closest&&e.target.closest('[data-copy]');if(!b)return;var t=b.getAttribute('data-copy'),o=b.getAttribute('data-label')||b.textContent;
-function ok(){{b.textContent='Copied';setTimeout(function(){{b.textContent=o}},1500)}}
-if(navigator.clipboard&&navigator.clipboard.writeText){{navigator.clipboard.writeText(t).then(ok,function(){{fb(t,b);ok()}})}}else{{fb(t,b);ok()}}}});
-document.querySelectorAll('time[datetime]').forEach(function(el){{var d=new Date(el.getAttribute('datetime'));if(isNaN(d))return;el.title=el.textContent;el.textContent=d.toLocaleString([],{{year:'numeric',month:'short',day:'numeric',hour:'numeric',minute:'2-digit',timeZoneName:'short'}})}});}})();</script></body></html>"#,
+{script}</body></html>"#,
         t = esc(title),
         icon = FAVICON_DATA_URI,
-        b = body
+        b = body,
+        script = PAGE_SCRIPT,
     ))
 }
+
+/// The script every page shares: Copy buttons (`data-copy`) and local
+/// times. A `<time>` shows the viewer's local time with a zone label; a
+/// `data-rel` one keeps its relative text ("5 minutes ago") and gets the
+/// exact local time and zone as its tooltip.
+pub(crate) const PAGE_SCRIPT: &str = r#"<script>(function(){function fb(t,b){var a=document.createElement('textarea');a.value=t;a.style.position='fixed';a.style.opacity='0';document.body.appendChild(a);a.select();try{document.execCommand('copy')}catch(e){}document.body.removeChild(a)}
+document.addEventListener('click',function(e){var b=e.target.closest&&e.target.closest('[data-copy]');if(!b)return;var t=b.getAttribute('data-copy'),o=b.getAttribute('data-label')||b.textContent;
+function ok(){b.textContent='Copied';setTimeout(function(){b.textContent=o},1500)}
+if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(t).then(ok,function(){fb(t,b);ok()})}else{fb(t,b);ok()}});
+document.querySelectorAll('time[datetime]').forEach(function(el){var d=new Date(el.getAttribute('datetime'));if(isNaN(d))return;var s=d.toLocaleString([],{year:'numeric',month:'short',day:'numeric',hour:'numeric',minute:'2-digit',timeZoneName:'short'});if(el.hasAttribute('data-rel')){el.title=s;return}el.title=el.textContent;el.textContent=s});})();</script>"#;
 
 /// A tiny inline icon, so browsers never request /favicon.ico (a 404 there is
 /// a console error on every page).

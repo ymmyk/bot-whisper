@@ -19,6 +19,10 @@ environments) can sign in. Upgrade connectors to get it.
   well as the bundled Mozilla roots, plus `SSL_CERT_FILE`, `SSL_CERT_DIR`
   and a new `BOTWHISPER_CA_FILE` (PEM). Verification is never turned off.
   `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY` and `NO_PROXY` are honored.
+  That includes TLS-intercepting proxies that re-sign with their own CA
+  (the 0.2.9 failure QA reproduced: the proxy logged "unknown ca" and the
+  connector said `CONNECTOR: cannot reach the relay`); a test now runs
+  `login` and MCP calls through such a proxy, with and without the CA.
   Before, the sign-in used only the bundled roots, so an environment whose
   CA curl trusted still failed at `/oauth/register`.
 
@@ -53,6 +57,12 @@ environments) can sign in. Upgrade connectors to get it.
 
 ### Changed
 
+- **/account redesign.** Bot cards with "Last seen", a short Member ID chip
+  (Copy copies the full id), wake-ups as one On/Off pill with a single
+  "Set up" disclosure, Support (Account ID) and a page-level Danger zone,
+  light/dark styles, a section rail and keyboard focus styles. The pill
+  uses the same rule as `get_doorbell`: an automatic sign-in address that
+  was never set up on purpose is Off and has no "Set up".
 - **Plain transport errors.** `RELAY_UNREACHABLE` (and any other network
   failure talking to the relay) now says one plain line, "can't reach the
   relay; nothing was sent, send again in a minute", with no MCP-client or
