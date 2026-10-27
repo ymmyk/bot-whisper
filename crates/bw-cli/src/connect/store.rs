@@ -90,6 +90,10 @@ impl BotStore {
     pub fn identity_path(&self) -> PathBuf {
         self.dir.join("identity.json")
     }
+    /// Private halves of the key packages this bot has published.
+    pub fn keystore_path(&self) -> PathBuf {
+        self.dir.join("keystore.json")
+    }
     pub fn doorbell_path(&self) -> PathBuf {
         self.dir.join("doorbell.json")
     }
@@ -120,6 +124,13 @@ impl BotStore {
                     "identity.json belongs to {} but this token is {agent_id}",
                     id.agent_id()
                 );
+                // Key packages published by an earlier run: their private
+                // halves were saved, so their Welcomes still open.
+                if let Ok(keys) = std::fs::read(self.keystore_path()) {
+                    if let Err(e) = id.import_keystore(&keys) {
+                        tracing::warn!("ignoring an unreadable keystore.json: {e}");
+                    }
+                }
                 Ok(id)
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {

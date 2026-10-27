@@ -29,6 +29,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
 use super::{
+    lock::ConfigLock,
     relay::{tool_error_code, RelayClient},
     store::{BotStore, CachedDoorbell},
     trust::{Observation, TrustStore},
@@ -86,6 +87,18 @@ struct State {
     files: HashMap<String, ReceivedFile>,
 }
 
+/// The text for a Welcome this connector cannot open.
+fn join_failure(detail: &str) -> String {
+    if detail.contains("No matching key package") {
+        "This invite was for keys this connector doesn't have. Ask for a fresh invite. \
+         (If more than one `botwhisper connect` has been running for this bot, that is the usual \
+         cause: keep just one running. This connector has left the room.)"
+            .to_string()
+    } else {
+        format!("could not join the room: {detail}. Ask for a fresh invite. This connector has left the room.")
+    }
+}
+
 /// The connector. Cheap to clone (one instance per MCP session).
 #[derive(Clone)]
 pub struct Connector {
@@ -96,6 +109,8 @@ pub struct Connector {
     /// Other members' last-seen keys and verified safety numbers.
     trust: Arc<Mutex<TrustStore>>,
     agent_id: String,
+    /// Held while this process serves the bot (see `lock.rs`).
+    _lock: Option<Arc<ConfigLock>>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -350,6 +365,12 @@ impl Connector {
             Some(s) => Some(s),
             None => config_dir_identity.map(|d| BotStore::new(d, &relay.relay, &agent_id)),
         };
+        // One connector per bot: take the lock before touching the key
+        // material or publishing anything.
+        let lock = match &store {
+            Some(s) => Some(Arc::new(ConfigLock::acquire(&s.dir)?)),
+            None => None,
+        };
         let identity = match &store {
             Some(s) => s.load_or_create_identity(&agent_id)?,
             None => Identity::new(&agent_id)?,
@@ -365,9 +386,10 @@ impl Connector {
             store: store.map(Arc::new),
             trust: Arc::new(Mutex::new(trust)),
             agent_id,
+            _lock: lock,
         };
-        // Key packages from an earlier process can never be used (their
-        // private halves lived in that process), so start clean.
+        // Replace whatever earlier runs left on the relay with fresh key
+        // packages whose private halves this process (and keystore.json) holds.
         c.top_up_key_packages(true).await?;
         Ok(c)
     }
@@ -392,6 +414,8 @@ impl Connector {
         let kps: Vec<String> = (0..KEY_PACKAGES_TO_KEEP)
             .map(|_| self.identity.key_package().map(|k| B64.encode(k)))
             .collect::<Result<_, _>>()?;
+        // Save the private halves before anyone can claim the public ones.
+        self.persist_keys();
         self.relay
             .call(
                 "e2e_publish_key_packages",
@@ -399,6 +423,18 @@ impl Connector {
             )
             .await?;
         Ok(())
+    }
+
+    /// Save the key store (0600) so a restart can open Welcomes built on
+    /// key packages this run published.
+    fn persist_keys(&self) {
+        if let Some(s) = &self.store {
+            if let Err(e) =
+                crate::paths::write_private(&s.keystore_path(), &self.identity.export_keystore())
+            {
+                tracing::warn!("could not save keystore.json: {e}");
+            }
+        }
     }
 
     /// Cache the bot's wake topic for `botwhisper listen`.
@@ -421,7 +457,7 @@ impl Connector {
             .relay
             .call_timeout(
                 "e2e_fetch",
-                json!({ "room_id": room_id, "timeout_s": timeout.as_secs() }),
+                json!({ "room_id": room_id, "timeout_s": timeout.as_secs(), "confirm_welcome": true }),
                 timeout + Duration::from_secs(10),
             )
             .await?;
@@ -445,7 +481,18 @@ impl Connector {
                     if st.rooms.contains_key(room_id) {
                         continue;
                     }
-                    let (group, inviter) = self.identity.join(&bytes)?;
+                    let (group, inviter) = match self.identity.join(&bytes) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            // Do not stay a ghost member of a room we cannot read.
+                            let _ = self
+                                .relay
+                                .call("leave_room", json!({ "room_id": room_id }))
+                                .await;
+                            st.pending.remove(room_id);
+                            anyhow::bail!(join_failure(&e.to_string()));
+                        }
+                    };
                     if let Some(p) = st.pending.remove(room_id) {
                         if let Some(expected) = p.expected_fingerprint {
                             if expected != inviter.fingerprint {
@@ -469,7 +516,16 @@ impl Connector {
                             owner: false,
                         },
                     );
+                    // The Welcome opened: only now does the relay count us as joined.
+                    if let Err(e) = self
+                        .relay
+                        .call("e2e_confirm_joined", json!({ "room_id": room_id }))
+                        .await
+                    {
+                        tracing::warn!("could not confirm joining {room_id}: {e}");
+                    }
                     self.top_up_key_packages(false).await?;
+                    self.persist_keys();
                 }
                 "commit" => {
                     if let Some(r) = st.rooms.get_mut(room_id) {
@@ -697,7 +753,9 @@ impl Connector {
                 self.relay
                     .call(
                         "e2e_send",
-                        json!({ "room_id": room_id, "ciphertext": B64.encode(ct) }),
+                        // Room metadata, not a turn: it must not use up the
+                        // owner's next send (loop guard / round table).
+                        json!({ "room_id": room_id, "ciphertext": B64.encode(ct), "meta": true }),
                     )
                     .await?;
             }

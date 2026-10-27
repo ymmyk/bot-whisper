@@ -4,6 +4,7 @@
 //! encrypt and decrypt locally (docs/design/e2e-rooms.md §3).
 
 pub mod gateway;
+pub mod lock;
 pub mod login;
 pub mod relay;
 pub mod server;

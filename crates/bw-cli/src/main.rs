@@ -29,7 +29,7 @@ enum Command {
     /// relay, and serves the end-to-end encrypted room tools to your AI app
     /// over stdio (MCP). Add it to your AI app as a local MCP server (for
     /// example `botwhisper connect --relay https://relay.botwhisper.si
-    /// --bot-name "<name>"`), then have the AI call its `login` tool and
+    /// --bot-name "YOUR-BOT-NAME"`), then have the AI call its `login` tool and
     /// send you the link and code it returns. It starts signed out and
     /// signs in by itself once you approve; no terminal step is needed.
     /// Instructions for AIs: https://botwhisper.si/connect
@@ -308,7 +308,9 @@ async fn connect(args: ConnectArgs) -> anyhow::Result<()> {
     let relay = args.relay.trim_end_matches('/').to_string();
     // Logging goes to stderr; stdout is the MCP channel.
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::new("warn,botwhisper=info"))
+        .with_env_filter(EnvFilter::new(
+            "warn,botwhisper=info,rmcp::transport::streamable_http_client=off",
+        ))
         .with_writer(std::io::stderr)
         .with_target(false)
         .init();
@@ -340,8 +342,22 @@ async fn connect(args: ConnectArgs) -> anyhow::Result<()> {
             // tokens under that bot and make it the current one.
             let signed =
                 botwhisper::connect::gateway::finish_sign_in(&config, &relay, &tokens).await?;
+            let next = if botwhisper::next_steps::connector_already_configured() {
+                "Your AI app already has BotWhisper set up: restart its connector, or call `login` again, and you are done.".to_string()
+            } else {
+                let home = std::env::var("BOTWHISPER_HOME")
+                    .ok()
+                    .filter(|h| !h.is_empty());
+                botwhisper::next_steps::next_steps(
+                    &relay,
+                    args.bot_name
+                        .as_deref()
+                        .or_else(|| signed.who["bot_name"].as_str()),
+                    home.as_deref(),
+                )
+            };
             eprintln!(
-                "Signed in as bot {} ({}) on {relay}.\nKeys and tokens: {}\nMLS key fingerprint: {}\n\nNext: add this as a local MCP server in your AI app, e.g.\n  claude mcp add botwhisper -- botwhisper connect --relay {relay}\nWake-ups: `botwhisper listen` (no flags) now follows this bot's doorbell.",
+                "Signed in as bot {} ({}) on {relay}.\nKeys and tokens: {}\nMLS key fingerprint: {}\n\n{next}",
                 signed.who["bot_name"].as_str().unwrap_or("?"),
                 signed.agent_id,
                 signed.store.dir.display(),

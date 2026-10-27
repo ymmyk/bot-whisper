@@ -663,3 +663,88 @@ async fn safety_numbers_inner() {
     let _ = std::fs::remove_dir_all(&config);
     relay.shutdown().await;
 }
+
+/// One connector per bot: a second process on the same config dir is refused
+/// with a plain message; and a join still succeeds after the connector
+/// restarts, when the Welcome was built on a key package an earlier run
+/// published (its private half lives in the saved key store).
+#[tokio::test]
+async fn second_process_is_refused_and_join_survives_a_restart() {
+    tokio::time::timeout(Duration::from_secs(90), async {
+        let relay = TestRelay::start().await;
+        let dir = tmp_dir("restart-join");
+        let store = |who: &str| BotStore::new(&dir, &relay.base(), who);
+        let client = |t: &str| RelayClient::with_token(&relay.base(), t);
+
+        let alice =
+            serve_connector(Connector::new(client(TOKENS[0]), None, None).await.unwrap()).await;
+
+        // First run of Bob's connector: publishes key packages, holds the lock.
+        let bob1 = Connector::new(client(TOKENS[1]), Some(store("bob")), None)
+            .await
+            .unwrap();
+        let bob_agent = bob1.agent_id().to_string();
+        // A second process for the same bot is refused, not allowed to
+        // overwrite the first one's keys.
+        let err = Connector::new(client(TOKENS[1]), Some(store("bob")), None)
+            .await
+            .err()
+            .expect("second connector refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("another botwhisper connect is already running for this bot")
+                && msg.contains("BOTWHISPER_HOME"),
+            "{msg}"
+        );
+        assert_eq!(relay.db.count_key_packages(&bob_agent).unwrap(), 5);
+
+        // Alice invites Bob; Bob takes his seat; Alice's connector adds him
+        // using one of the key packages the first run published.
+        let created = call(&alice, "create_room", json!({ "title": "Restart" })).await;
+        let room = created["room_id"].as_str().unwrap().to_string();
+        let inv = call(&alice, "create_invite", json!({ "room_id": room })).await;
+        let invite_url = inv["invite_url"].as_str().unwrap().to_string();
+        client(TOKENS[1])
+            .call("join_room", json!({ "invite_url": invite_url }))
+            .await
+            .unwrap();
+        let added = call(
+            &alice,
+            "wait_for_message",
+            json!({ "room_id": room, "timeout_s": 3 }),
+        )
+        .await;
+        assert_eq!(added["added_members"], json!(["m2"]), "{added}");
+
+        // Bob's connector restarts (the first run is gone) and rejoins: the
+        // Welcome opens because the key store was saved.
+        drop(bob1);
+        let bob2 = Connector::new(client(TOKENS[1]), Some(store("bob")), None)
+            .await
+            .unwrap();
+        let bob = serve_connector(bob2).await;
+        // The invite was single use and is already spent; the restarted
+        // connector finds the waiting Welcome when it next checks in.
+        call(&bob, "wait_for_message", json!({ "timeout_s": 3 })).await;
+        let st = call(&bob, "get_status", json!({ "room_id": room })).await;
+        assert_eq!(st["encryption"], "mls (end-to-end)", "{st}");
+        let sent = call(
+            &alice,
+            "send_message",
+            json!({ "room_id": room, "text": "hello after restart" }),
+        )
+        .await;
+        assert_eq!(sent["delivered_to"], json!(["m2"]), "{sent}");
+        let got = call(
+            &bob,
+            "wait_for_message",
+            json!({ "room_id": room, "timeout_s": 5 }),
+        )
+        .await;
+        assert_eq!(got["messages"][0]["content"], "hello after restart");
+        let _ = std::fs::remove_dir_all(&dir);
+        relay.shutdown().await;
+    })
+    .await
+    .expect("the test must not hang");
+}

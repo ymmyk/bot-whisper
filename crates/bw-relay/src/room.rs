@@ -118,8 +118,13 @@ pub enum MemberEvent {
     ModeChanged {
         mode: TurnMode,
     },
+    /// `members` are the seats that are in the group (confirmed);
+    /// `pending` are seated but not joined yet (waiting for a commit, or
+    /// for their Welcome to be confirmed). Only `members` count as joined.
     MembersChanged {
         members: Vec<MemberId>,
+        #[serde(default)]
+        pending: Vec<MemberId>,
     },
     /// The room was closed (owner closed it, left, or it expired). Every
     /// call after this returns `ROOM_CLOSED`.
@@ -328,6 +333,31 @@ impl Room {
 
     fn member_ids(&self) -> Vec<MemberId> {
         self.members.iter().map(|m| m.member.clone()).collect()
+    }
+
+    /// Seats that are in the MLS group.
+    fn joined_ids(&self) -> Vec<MemberId> {
+        self.members
+            .iter()
+            .filter(|m| m.is_e2e_active())
+            .map(|m| m.member.clone())
+            .collect()
+    }
+
+    /// Seats that are not in the group yet.
+    fn pending_ids(&self) -> Vec<MemberId> {
+        self.members
+            .iter()
+            .filter(|m| !m.is_e2e_active())
+            .map(|m| m.member.clone())
+            .collect()
+    }
+
+    fn members_changed_event(&self) -> MemberEvent {
+        MemberEvent::MembersChanged {
+            members: self.joined_ids(),
+            pending: self.pending_ids(),
+        }
     }
 
     fn roster(&self) -> Roster {
@@ -562,11 +592,8 @@ impl Room {
         self.db.set_next_member_n(&self.id, self.next_member_n)?;
         self.db.insert_member(&self.id, &member_row(&member))?;
         self.members.push(member.clone());
-        let ids = self.member_ids();
-        self.broadcast_event(
-            MemberEvent::MembersChanged { members: ids },
-            Some(&member.member),
-        );
+        let ev = self.members_changed_event();
+        self.broadcast_event(ev, Some(&member.member));
         self.ring_all("members_changed", Some(&member.member), now);
         self.touch();
         Ok(member)
@@ -609,8 +636,8 @@ impl Room {
         if let Some(t) = &mut self.thread {
             t.member_left(&roster, member, now);
         }
-        let ids = self.member_ids();
-        self.broadcast_event(MemberEvent::MembersChanged { members: ids }, None);
+        let ev = self.members_changed_event();
+        self.broadcast_event(ev, None);
         self.ring_all("members_changed", None, now);
         self.touch();
         Ok(())

@@ -500,3 +500,172 @@ async fn rooms_per_account_cap_and_expiry() {
     assert_eq!(f["events"][0]["reason"], "expired");
     relay.shutdown().await;
 }
+
+/// A seat added by a commit is a ghost until its Welcome is confirmed:
+/// never in `members_changed.members` or `delivered_to`, shown as
+/// pending/welcoming. And the room-title "meta" message is not a turn, so it
+/// does not trip the loop guard for the owner's next real message.
+#[tokio::test]
+async fn unconfirmed_welcomes_are_not_joined_and_meta_is_not_a_turn() {
+    let mut cfg = test_config();
+    cfg.limits.min_turn_interval_s = 2;
+    let relay = TestRelay::start_with(cfg).await;
+    let alice = relay.bot(TOKENS[0]).await;
+    let bob = relay.bot(TOKENS[1]).await;
+    let carol = relay.bot(TOKENS[2]).await;
+    let room = alice.ok("create_room", json!({})).await["room_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Bob: invited, added by a commit, but has not confirmed yet.
+    bob.ok(
+        "e2e_publish_key_packages",
+        json!({ "key_packages": [b64("KP-bob")] }),
+    )
+    .await;
+    let inv = alice.ok("create_invite", json!({ "room_id": room })).await;
+    bob.ok("join_room", json!({ "invite_url": inv["invite_url"] }))
+        .await;
+    alice
+        .ok(
+            "e2e_claim_key_package",
+            json!({ "room_id": room, "member_id": "m2" }),
+        )
+        .await;
+    alice
+        .ok(
+            "e2e_commit",
+            json!({ "room_id": room, "epoch": 0, "commit": b64("C1"), "welcome": b64("W-bob"),
+                    "welcome_to": ["m2"], "added": ["m2"] }),
+        )
+        .await;
+    let st = alice.ok("get_status", json!({ "room_id": room })).await;
+    assert_eq!(st["e2e"]["joined"], json!(["m1"]));
+    assert_eq!(st["e2e"]["welcoming"], json!(["m2"]));
+    assert_eq!(st["e2e"]["pending_join"], json!([]), "not claimed again");
+
+    // The title meta message, then straight away a real message: neither is
+    // rate limited, and nothing is delivered to the unconfirmed seat.
+    let meta = alice
+        .ok(
+            "e2e_send",
+            json!({ "room_id": room, "ciphertext": b64("META"), "meta": true }),
+        )
+        .await;
+    assert_eq!(meta["delivered_to"], json!([]));
+    let sent = alice
+        .ok(
+            "e2e_send",
+            json!({ "room_id": room, "ciphertext": b64("hello") }),
+        )
+        .await;
+    assert_eq!(
+        sent["delivered_to"],
+        json!([]),
+        "m2 has not confirmed its Welcome"
+    );
+    // A second real message inside the loop-guard window is still refused.
+    let again = alice
+        .call(
+            "e2e_send",
+            json!({ "room_id": room, "ciphertext": b64("too soon") }),
+        )
+        .await;
+    assert_eq!(again["error"], "RATE_LIMITED");
+
+    // Bob fetches (and confirms): the queued items are all there, and he is told
+    // that m2 is still pending from his own point of view until he confirms.
+    let f = bob
+        .ok(
+            "e2e_fetch",
+            json!({ "room_id": room, "timeout_s": 5, "confirm_welcome": true }),
+        )
+        .await;
+    let kinds: Vec<String> = payloads(&f).into_iter().map(|p| p.2).collect();
+    assert_eq!(kinds, vec!["W-bob", "META", "hello"]);
+    let ev = f["events"].as_array().unwrap();
+    assert_eq!(ev[0]["event"], "members_changed");
+    assert_eq!(ev[0]["members"], json!(["m1"]));
+    assert_eq!(ev[0]["pending"], json!(["m2"]));
+    // Fetching a Welcome with confirm_welcome does not itself join him.
+    let st = alice.ok("get_status", json!({ "room_id": room })).await;
+    assert_eq!(st["e2e"]["joined"], json!(["m1"]));
+    assert!(!bob
+        .err("e2e_confirm_joined", json!({ "room_id": "nope" }))
+        .await
+        .is_empty());
+    bob.ok("e2e_confirm_joined", json!({ "room_id": room }))
+        .await;
+    let st = alice.ok("get_status", json!({ "room_id": room })).await;
+    assert_eq!(st["e2e"]["joined"], json!(["m1", "m2"]));
+    assert_eq!(st["e2e"]["welcoming"], json!([]));
+    let f = alice
+        .ok("e2e_fetch", json!({ "room_id": room, "timeout_s": 2 }))
+        .await;
+    let joined_ev = f["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|e| e["event"] == "members_changed")
+        .unwrap();
+    assert_eq!(joined_ev["members"], json!(["m1", "m2"]));
+    assert_eq!(joined_ev["pending"], json!([]));
+
+    // Ghost: Carol is added but never confirms (her join failed). A message
+    // from Bob is delivered to Alice only, and the owner's status lists m3
+    // as welcoming, not joined.
+    carol
+        .ok(
+            "e2e_publish_key_packages",
+            json!({ "key_packages": [b64("KP-carol")] }),
+        )
+        .await;
+    let inv = alice.ok("create_invite", json!({ "room_id": room })).await;
+    carol
+        .ok("join_room", json!({ "invite_url": inv["invite_url"] }))
+        .await;
+    alice
+        .ok(
+            "e2e_claim_key_package",
+            json!({ "room_id": room, "member_id": "m3" }),
+        )
+        .await;
+    alice
+        .ok(
+            "e2e_commit",
+            json!({ "room_id": room, "epoch": 1, "commit": b64("C2"), "welcome": b64("W-carol"),
+                    "welcome_to": ["m3"], "added": ["m3"] }),
+        )
+        .await;
+    let sent = bob
+        .ok(
+            "e2e_send",
+            json!({ "room_id": room, "ciphertext": b64("from bob") }),
+        )
+        .await;
+    assert_eq!(
+        sent["delivered_to"],
+        json!(["m1"]),
+        "no ghost in delivered_to"
+    );
+    let f = bob
+        .ok("e2e_fetch", json!({ "room_id": room, "timeout_s": 2 }))
+        .await;
+    let last = f["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|e| e["event"] == "members_changed")
+        .unwrap();
+    assert_eq!(last["members"], json!(["m1", "m2"]));
+    assert_eq!(last["pending"], json!(["m3"]));
+    // Carol leaving (what the connector does when it cannot open the
+    // Welcome) clears the ghost.
+    carol.ok("leave_room", json!({ "room_id": room })).await;
+    let st = alice.ok("get_status", json!({ "room_id": room })).await;
+    assert_eq!(st["e2e"]["welcoming"], json!([]));
+    relay.shutdown().await;
+}

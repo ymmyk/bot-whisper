@@ -207,6 +207,9 @@ CREATE TABLE IF NOT EXISTS bot_doorbells (
 pub enum SeatState {
     /// Seated at the relay, waiting for a member's commit (and Welcome).
     Pending,
+    /// Added by a commit; its Welcome is out but the joiner has not yet
+    /// confirmed that it could use it. Not counted as joined.
+    Welcoming,
     /// In the group.
     Active,
 }
@@ -215,15 +218,16 @@ impl SeatState {
     pub fn as_str(self) -> &'static str {
         match self {
             SeatState::Pending => "pending",
+            SeatState::Welcoming => "welcoming",
             SeatState::Active => "active",
         }
     }
 
     fn parse(s: &str) -> Self {
-        if s == "active" {
-            SeatState::Active
-        } else {
-            SeatState::Pending
+        match s {
+            "active" => SeatState::Active,
+            "welcoming" => SeatState::Welcoming,
+            _ => SeatState::Pending,
         }
     }
 }
@@ -1801,6 +1805,19 @@ impl Db {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()
+        })
+    }
+
+    /// True when this bot's sign-in was approved in the browser but the AI
+    /// has not yet collected its tokens (the device code is still open).
+    pub fn bot_waiting(&self, bot_id: &str, now: u64) -> Result<bool> {
+        self.with(|c| {
+            c.query_row(
+                "SELECT EXISTS(SELECT 1 FROM device_codes
+                 WHERE bot_id = ?1 AND status = 'approved' AND expires_at > ?2)",
+                params![bot_id, now as i64],
+                |r| r.get::<_, bool>(0),
+            )
         })
     }
 

@@ -302,13 +302,28 @@ async fn gated_inner() {
     let again = call(&svc, "login", json!({})).await;
     assert_eq!(again["status"], "signed_in");
 
-    // A new connector process picks the stored login up with no `login`.
+    // A second connector process for the same bot is refused while the
+    // first is running ...
+    let refused = Gateway::new(&relay.base(), config.clone(), None, None);
+    let err = refused
+        .resume()
+        .await
+        .expect_err("second process is refused");
+    assert!(
+        err.to_string()
+            .contains("another botwhisper connect is already running for this bot"),
+        "{err}"
+    );
+    assert!(err.to_string().contains("BOTWHISPER_HOME"), "{err}");
+    // ... and a new process picks the stored login up with no `login` once
+    // the first has stopped.
+    svc.cancel().await.ok();
+    tokio::time::sleep(Duration::from_millis(500)).await;
     let gw2 = Gateway::new(&relay.base(), config.clone(), None, None);
     assert!(gw2.resume().await.unwrap());
     let (svc2, _) = serve(gw2).await;
     assert!(tool_names(&svc2).await.iter().any(|n| n == "create_room"));
     svc2.cancel().await.ok();
-    svc.cancel().await.ok();
     let _ = std::fs::remove_dir_all(&config);
     relay.shutdown().await;
 }
@@ -493,11 +508,23 @@ async fn a_login_finished_elsewhere_is_picked_up_on_the_next_call() {
         .await;
         let s = call(&b, "login_status", json!({ "wait_s": 20 })).await;
         assert_eq!(s["status"], "signed_in", "{s}");
-        // The first connector never polled, and its next call works.
+        // Two processes must not share one bot's keys: while the other
+        // process is running, the first is refused with a plain message.
+        let r = raw(&a, "create_room", json!({ "title": "lazy" })).await;
+        let msg = r.structured_content.unwrap()["message"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            msg.contains("another botwhisper connect is already running for this bot"),
+            "{msg}"
+        );
+        // Once it is gone, the first connector (which never polled) just works.
+        b.cancel().await.ok();
+        tokio::time::sleep(Duration::from_millis(500)).await;
         let room = call(&a, "create_room", json!({ "title": "lazy" })).await;
         assert_eq!(room["encryption"], "mls (end-to-end)");
         a.cancel().await.ok();
-        b.cancel().await.ok();
         let _ = std::fs::remove_dir_all(&config);
         relay.shutdown().await;
     })

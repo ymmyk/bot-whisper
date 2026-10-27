@@ -161,6 +161,17 @@ impl Room {
             .collect()
     }
 
+    /// Who gets a message queued: the group plus seats whose Welcome is out
+    /// but not yet confirmed (so a message sent just after they were added
+    /// is not lost to them). Only the joined ones count as delivered.
+    fn queue_recipients_except(&self, except: &str) -> BTreeSet<MemberId> {
+        self.members
+            .iter()
+            .filter(|m| m.member != except && m.e2e_state != SeatState::Pending)
+            .map(|m| m.member.clone())
+            .collect()
+    }
+
     fn push_e2e_item(
         &mut self,
         kind: E2eItemKind,
@@ -207,7 +218,9 @@ impl Room {
         json!({
             "epoch": self.e2e.epoch,
             "you": self.member(member).ok().map(|m| m.e2e_state),
-            "pending_join": self.members.iter().filter(|m| !m.is_e2e_active()).map(|m| m.member.clone()).collect::<Vec<_>>(),
+            "pending_join": self.members.iter().filter(|m| m.e2e_state == SeatState::Pending).map(|m| m.member.clone()).collect::<Vec<_>>(),
+            "welcoming": self.members.iter().filter(|m| m.e2e_state == SeatState::Welcoming).map(|m| m.member.clone()).collect::<Vec<_>>(),
+            "joined": self.joined_ids(),
             "pending_items_for_you": self.e2e.items.iter().filter(|i| i.pending.contains(member)).count(),
         })
     }
@@ -234,7 +247,7 @@ impl Room {
         self.require_open()?;
         self.require_e2e_active(by)?;
         let t = self.member(target)?;
-        if t.is_e2e_active() {
+        if t.is_e2e_active() || t.e2e_state == SeatState::Welcoming {
             return Err(RelayError::invalid(format!(
                 "{target} is already in the group"
             )));
@@ -297,12 +310,18 @@ impl Room {
         }
         for m in welcome_to.iter().chain(added.iter()) {
             let member = self.member(m)?;
-            if member.is_e2e_active() {
+            if member.e2e_state != SeatState::Pending {
                 return Err(RelayError::invalid(format!("{m} is already in the group")));
             }
         }
-        // Deliver the commit to everyone already in the group.
-        let recipients = self.active_members_except(by);
+        // Deliver the commit to everyone already in the group, and to seats
+        // whose Welcome is still unconfirmed (they apply it after joining).
+        let recipients: BTreeSet<MemberId> = self
+            .members
+            .iter()
+            .filter(|m| m.member != by && m.e2e_state != SeatState::Pending)
+            .map(|m| m.member.clone())
+            .collect();
         let commit_seq =
             self.push_e2e_item(E2eItemKind::Commit, by, epoch, commit, recipients, now)?;
         let welcome_seq = match welcome {
@@ -316,17 +335,19 @@ impl Room {
             )?),
             None => None,
         };
+        // Added, but only counted as joined once the joiner confirms that
+        // it could open the Welcome (`e2e_confirm_joined`).
         for m in &added {
             self.db
-                .set_member_e2e_state(&self.id, m, SeatState::Active)?;
+                .set_member_e2e_state(&self.id, m, SeatState::Welcoming)?;
             if let Some(mem) = self.members.iter_mut().find(|x| &x.member == m) {
-                mem.e2e_state = SeatState::Active;
+                mem.e2e_state = SeatState::Welcoming;
             }
         }
         self.e2e.epoch += 1;
         self.db.set_e2e_epoch(&self.id, self.e2e.epoch)?;
-        let ids = self.member_ids();
-        self.broadcast_event(MemberEvent::MembersChanged { members: ids }, Some(by));
+        let ev = self.members_changed_event();
+        self.broadcast_event(ev, Some(by));
         self.ring_all("members_changed", Some(by), now);
         self.touch();
         Ok(json!({
@@ -335,6 +356,83 @@ impl Room {
             "welcome_seq": welcome_seq,
             "added": added,
         }))
+    }
+
+    /// The joiner confirms that it opened its Welcome and holds the group
+    /// keys: only now is its seat counted as joined (and messages delivered
+    /// to it). Idempotent for a seat that is already joined.
+    pub fn e2e_confirm_joined(&mut self, member: &str, now: u64) -> Result<Value, RelayError> {
+        self.require_open()?;
+        match self.member(member)?.e2e_state {
+            SeatState::Active => {}
+            SeatState::Pending => {
+                return Err(RelayError::invalid(
+                    "no Welcome was issued for you yet; wait for a member's connector to add you",
+                ))
+            }
+            SeatState::Welcoming => {
+                self.db
+                    .set_member_e2e_state(&self.id, member, SeatState::Active)?;
+                if let Some(m) = self.members.iter_mut().find(|m| m.member == member) {
+                    m.e2e_state = SeatState::Active;
+                }
+                let ev = self.members_changed_event();
+                self.broadcast_event(ev, None);
+                self.ring_all("members_changed", Some(member), now);
+                self.touch();
+            }
+        }
+        Ok(json!({ "joined": self.joined_ids(), "pending": self.pending_ids() }))
+    }
+
+    /// A connector that predates `e2e_confirm_joined` fetched its Welcome:
+    /// treat the seat as joined, as before.
+    pub(super) fn e2e_legacy_join(&mut self, member: &str, now: u64) {
+        let welcoming = self
+            .members
+            .iter()
+            .any(|m| m.member == member && m.e2e_state == SeatState::Welcoming);
+        if welcoming {
+            let _ = self.e2e_confirm_joined(member, now);
+        }
+    }
+
+    /// An application message for the content-free "meta" lane (the room
+    /// title): queued for the joined members, but it is not a turn: no turn
+    /// logic, no loop guard, no doorbell. It still counts against the
+    /// per-minute message limits so it cannot be used to flood.
+    pub fn e2e_send_meta(
+        &mut self,
+        by: &str,
+        ciphertext: Vec<u8>,
+        now: u64,
+    ) -> Result<Value, RelayError> {
+        self.require_open()?;
+        self.require_e2e_active(by)?;
+        if ciphertext.is_empty() || ciphertext.len() > MAX_CIPHERTEXT_BYTES {
+            return Err(RelayError::new(
+                ErrorCode::BodyTooLarge,
+                format!("ciphertext must be 1 to {MAX_CIPHERTEXT_BYTES} bytes"),
+            ));
+        }
+        if let Err(retry) = self.member_msgs.check(by) {
+            return Err(RelayError::new(
+                ErrorCode::RateLimited,
+                format!("too many messages from you this minute; retry in {retry} s"),
+            )
+            .with_data(json!({ "retry_after_s": retry })));
+        }
+        let recipients = self.queue_recipients_except(by);
+        let seq = self.push_e2e_item(
+            E2eItemKind::Application,
+            by,
+            self.e2e.epoch,
+            ciphertext,
+            recipients,
+            now,
+        )?;
+        self.touch();
+        Ok(json!({ "seq": seq, "epoch": self.e2e.epoch, "delivered_to": [], "meta": true }))
     }
 
     /// Queue application ciphertext for every active member but the sender,
@@ -396,7 +494,7 @@ impl Room {
                 by,
                 self.e2e.epoch,
                 ct,
-                recipients.clone(),
+                self.queue_recipients_except(by),
                 now,
             )?;
             seq = Some(s);
@@ -460,7 +558,12 @@ impl Room {
 
     /// Everything pending for a member, in seq order. Acks on return unless
     /// `auto_ack` is false. Closed rooms behave like `collect`.
-    pub fn e2e_collect(&mut self, member: &str, auto_ack: bool) -> Result<Value, RelayError> {
+    pub fn e2e_collect(
+        &mut self,
+        member: &str,
+        auto_ack: bool,
+        confirm_welcome: bool,
+    ) -> Result<Value, RelayError> {
         if self.closed {
             if self.closed_pending.remove(member) {
                 let events = self.events.remove(member).unwrap_or_default();
@@ -480,8 +583,10 @@ impl Room {
             }
         }
         let mut items = Vec::new();
+        let mut got_welcome = false;
         for i in &mut self.e2e.items {
             if i.pending.contains(member) {
+                got_welcome |= i.kind == E2eItemKind::Welcome;
                 items.push(json!({
                     "seq": i.seq,
                     "kind": i.kind,
@@ -502,6 +607,9 @@ impl Room {
         self.e2e.items.retain(|i| !i.pending.is_empty());
         if self.e2e.items.len() != before {
             self.touch();
+        }
+        if got_welcome && !confirm_welcome {
+            self.e2e_legacy_join(member, crate::doorbell::now_unix());
         }
         let events = self.events.remove(member).unwrap_or_default();
         Ok(json!({

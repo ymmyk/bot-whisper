@@ -166,6 +166,52 @@ impl Identity {
         Ok(Group { group })
     }
 
+    /// The private halves of every key package published so far (and the
+    /// rest of the in-memory key store), to be saved 0600 next to the
+    /// identity. A process that restarts loads them back with
+    /// [`import_keystore`](Self::import_keystore), so a Welcome built on a
+    /// key package an earlier run published can still be opened.
+    pub fn export_keystore(&self) -> Vec<u8> {
+        let values = self
+            .provider
+            .storage()
+            .values
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut pairs: Vec<(String, String)> = values
+            .iter()
+            .map(|(k, v)| (hex::encode(k), hex::encode(v)))
+            .collect();
+        pairs.sort();
+        serde_json::to_vec(&json_keystore(pairs)).expect("json")
+    }
+
+    /// Load what [`export_keystore`](Self::export_keystore) saved. Returns
+    /// how many entries were added.
+    pub fn import_keystore(&self, bytes: &[u8]) -> Result<usize> {
+        let file: KeystoreFile = serde_json::from_slice(bytes)
+            .map_err(|e| E2eError::Identity(format!("keystore file: {e}")))?;
+        if file.v != 1 {
+            return Err(E2eError::Identity("unsupported keystore file".into()));
+        }
+        let mut values = self
+            .provider
+            .storage()
+            .values
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut n = 0;
+        for (k, v) in file.entries {
+            let (Ok(k), Ok(v)) = (hex::decode(k), hex::decode(v)) else {
+                return Err(E2eError::Identity("keystore file is corrupt".into()));
+            };
+            if values.insert(k, v).is_none() {
+                n += 1;
+            }
+        }
+        Ok(n)
+    }
+
     /// Join a group from a serialized Welcome addressed to one of our key
     /// packages. Returns the group and the inviter (credential identity and
     /// signature-key fingerprint, to check against an invite's `f=`).
@@ -188,6 +234,16 @@ impl Identity {
         let group = staged.into_group(&self.provider).map_err(mls)?;
         Ok((Group { group }, inviter))
     }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct KeystoreFile {
+    v: u16,
+    entries: Vec<(String, String)>,
+}
+
+fn json_keystore(entries: Vec<(String, String)>) -> KeystoreFile {
+    KeystoreFile { v: 1, entries }
 }
 
 /// The private half of a keypair. The crate only exposes it through serde,
@@ -362,6 +418,32 @@ impl Group {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A key package published by an earlier run can be used after a
+    /// restart when the key store was saved; a fresh identity cannot open it.
+    #[test]
+    fn welcome_for_an_earlier_runs_key_package_opens_after_restart() {
+        let alice = Identity::new("acct1:alice").unwrap();
+        let bob = Identity::new("acct2:bob").unwrap();
+        let kp = bob.key_package().unwrap();
+        let saved_id = bob.to_bytes();
+        let saved_keys = bob.export_keystore();
+        let mut g = alice.create_group("r").unwrap();
+        let (_c, welcome) = g.add_member(&alice, &kp).unwrap();
+
+        // Restart without the key store: the key package's private half is gone.
+        let amnesiac = Identity::from_bytes(&saved_id).unwrap();
+        let err = amnesiac.join(&welcome).unwrap_err().to_string();
+        assert!(err.contains("No matching key package"), "{err}");
+
+        // Restart with it: the join works.
+        let restarted = Identity::from_bytes(&saved_id).unwrap();
+        assert!(restarted.import_keystore(&saved_keys).unwrap() > 0);
+        let (g_bob, inviter) = restarted.join(&welcome).unwrap();
+        assert_eq!(inviter.agent_id, "acct1:alice");
+        assert_eq!(g_bob.epoch(), g.epoch());
+        assert!(restarted.import_keystore(b"nope").is_err());
+    }
 
     /// Three bots, two of them on the same account: create, add, exchange,
     /// remove one, and the removed bot can no longer read new messages.
