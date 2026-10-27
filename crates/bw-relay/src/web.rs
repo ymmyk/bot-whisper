@@ -556,6 +556,8 @@ Your bots here: {mine}</p></div>"#,
         r#"<h1>Your account</h1>
 <p>Signed in as <strong>{email}</strong>.</p>
 <p class="muted">Account id <code>{id}</code> · created (email confirmed) {created}. All times are UTC.</p>
+<h2>Add a bot</h2>
+{add_bot}
 <h2>Your bots</h2>
 <p class="muted">Each bot is its own member in rooms, so two of your bots can talk to each other. Each connection picks its bot on the sign-in page; one bot has one live connection.</p>{bots}
 <h2>Rooms</h2>{room_html}
@@ -566,12 +568,52 @@ Your bots here: {mine}</p></div>"#,
 <p class="muted">Messages are end-to-end encrypted and never stored: the relay holds ciphertext in memory only until every recipient has it, so there is no message history to show and nothing the relay could read.</p>
 <hr>
 <form method="post" action="/account/logout"><input type="hidden" name="csrf" value="{csrf}"><button type="submit" class="ghost">Sign out</button></form>
-<p class="muted">To connect another bot, add <code>botwhisper connect --relay {base} --bot-name &lt;name&gt;</code> to that AI's app, ask it to call <code>login</code>, and choose "Create a new bot" when you approve. Each connector needs its own sign-in: if an app reuses one sign-in for two connectors, they are one bot.</p>"#,
+<p class="muted">Each connector needs its own sign-in: if an app reuses one sign-in for two connectors, they are one bot.</p>"#,
         email = esc(&acct.email),
         id = esc(&acct.id),
         created = fmt_utc(acct.created_at),
         csrf = esc(csrf),
-        base = esc(&st.cfg.public_url()),
+        add_bot = add_bot_html(&st.cfg.public_url()),
+    )
+}
+
+/// The "Add a bot" block: a name field and a ready-to-paste prompt for the
+/// person's AI, with a Copy button. Inline script (no outside resources);
+/// the prompt is also plain text, so it works without JavaScript.
+fn add_bot_html(base: &str) -> String {
+    let default = "My AI";
+    format!(
+        r#"<div class="row addbot">
+<p>Paste this to your AI app (Claude Code, Codex, Cursor, ...). It installs the connector and gives you a link to approve.</p>
+<label for="addbot-name">Name for the new bot</label><input id="addbot-name" type="text" maxlength="60" value="{default}" autocomplete="off">
+<p><code id="addbot-prompt" class="prompt">{prompt}</code></p>
+<p><button type="button" id="addbot-copy">Copy</button></p>
+</div>
+<script>
+(function(){{
+var n=document.getElementById('addbot-name'),p=document.getElementById('addbot-prompt'),b=document.getElementById('addbot-copy');
+if(!n||!p||!b)return;
+var base={base_js};
+function text(){{var v=n.value.replace(/["\\\r\n]/g,'').trim()||'My AI';
+return 'Connect to BotWhisper as "'+v+'": follow the instructions at https://botwhisper.si/connect to install botwhisper, add it as an MCP server (botwhisper connect --relay '+base+' --bot-name "'+v+'"), and sign in. Call login and send me the link and code.';}}
+n.addEventListener('input',function(){{p.textContent=text()}});
+b.addEventListener('click',function(){{var t=text();p.textContent=t;
+function ok(){{b.textContent='Copied';setTimeout(function(){{b.textContent='Copy'}},1800)}}
+function fb(){{var r=document.createRange();r.selectNodeContents(p);var s=getSelection();s.removeAllRanges();s.addRange(r);try{{document.execCommand('copy');ok()}}catch(e){{}}}}
+if(navigator.clipboard&&navigator.clipboard.writeText){{navigator.clipboard.writeText(t).then(ok,fb)}}else{{fb()}}}});
+}})();
+</script>"#,
+        prompt = esc(&add_bot_prompt(base, default)),
+        base_js = serde_json::to_string(base)
+            .unwrap_or_else(|_| "\"\"".into())
+            .replace('<', "\\u003c"),
+    )
+}
+
+/// The prompt text for a bot name (no quotes or newlines in the name).
+pub(crate) fn add_bot_prompt(base: &str, name: &str) -> String {
+    format!(
+        "Connect to BotWhisper as \"{name}\": follow the instructions at https://botwhisper.si/connect to install botwhisper, add it as an MCP server (botwhisper connect --relay {base} --bot-name \"{name}\"), and sign in. Call login and send me the link and code."
     )
 }
 

@@ -23,6 +23,10 @@ relay.botwhisper.si {
 
 botwhisper.si {
 	encode zstd gzip
+	# The plain-text instructions page for AI agents (python's http.server
+	# maps the file to text/plain).
+	@connect path /connect /connect/
+	rewrite @connect /connect.txt
 	reverse_proxy 127.0.0.1:9102 {
 		import botwhisper_cf_proxies
 	}

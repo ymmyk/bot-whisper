@@ -232,6 +232,20 @@ async fn confirm_link_signs_in_once_and_expired_links_fail() {
     assert!(page.contains("call its <code>login</code> tool"));
     assert!(page.contains("skips the email step for 30 days"));
     assert!(page.contains("Dismiss"));
+    // "Add a bot": a ready-to-paste prompt for the person's AI with a Copy
+    // button, pointing at /connect and carrying the stdio command.
+    assert!(page.contains("<h2>Add a bot</h2>"));
+    assert!(page.contains(r#"id="addbot-copy""#) && page.contains(r#"id="addbot-name""#));
+    assert!(page.contains("https://botwhisper.si/connect"));
+    assert!(page.contains(&format!(
+        "add it as an MCP server (botwhisper connect --relay {base} --bot-name &quot;My AI&quot;)"
+    )));
+    assert!(page.contains("Call login and send me the link and code."));
+    assert!(page.contains("navigator.clipboard"), "inline copy script");
+    assert!(
+        !page.contains("src=\"http"),
+        "no outside script or resource"
+    );
     // ...and not on reload.
     let page = http
         .get(format!("{base}/account"))
@@ -667,6 +681,25 @@ async fn index_redirects_only_a_valid_session_to_account() {
 }
 
 /// GET /signin, POST an email with `method` ("code" or "link").
+/// The visible text of an HTML fragment: tags and `<style>` removed.
+fn strip_tags(html: &str) -> String {
+    let mut out = String::new();
+    let mut rest = html;
+    while let Some(i) = rest.find('<') {
+        out.push_str(&rest[..i]);
+        let tail = &rest[i..];
+        let end = tail.find('>').map(|j| j + 1).unwrap_or(tail.len());
+        if tail.starts_with("<style") {
+            let close = tail.find("</style>").map(|j| j + 8).unwrap_or(tail.len());
+            rest = &tail[close..];
+        } else {
+            rest = &tail[end..];
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 async fn post_signin(http: &Client, base: &str, email: &str, method: &str) -> reqwest::Response {
     let page = http
         .get(format!("{base}/signin"))
@@ -765,8 +798,15 @@ async fn web_signin_with_a_code() {
     assert_eq!(mail.to, "coder@example.com");
     assert_eq!(mail.subject, "Your BotWhisper sign-in code");
     assert!(!mail.body.contains("/oauth/confirm/"), "code only, no link");
-    assert!(mail.html.is_none());
+    let html = mail.html.clone().expect("an HTML part with the code");
     let code = mail_code(&mail.body);
+    // One unbroken token: stripped of tags, the HTML holds the bare code,
+    // so a copy gives 8 digits with no space or hyphen.
+    assert!(strip_tags(&html).contains(&code), "{html}");
+    assert!(!html.contains(&format!("{}-{}", &code[..4], &code[4..])));
+    assert!(!html.contains(&format!("{} {}", &code[..4], &code[4..])));
+    // The sign-in page shows no code, but its code input takes any form.
+    assert!(page.contains(r#"maxlength="40""#), "room for pasted forms");
     assert!(!page.contains(&code));
     assert!(
         !mail.body.contains(&pending),
