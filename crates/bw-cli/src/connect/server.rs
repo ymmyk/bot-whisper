@@ -340,19 +340,54 @@ pub(crate) fn respond(result: anyhow::Result<Value>) -> Result<CallToolResult, E
         Ok(v) => CallToolResult::structured(v),
         Err(e) => match e.downcast_ref::<super::relay::ToolError>() {
             Some(t) => CallToolResult::structured_error(t.0.clone()),
+            // Signed out (401/403, a refused refresh) is never "unreachable".
+            None if super::relay::signed_out(&e).is_some() => {
+                CallToolResult::structured_error(json!({
+                    "error": "SIGNED_OUT",
+                    "message": "signed out, call `login`",
+                    "reason": super::relay::signed_out(&e).map(|s| s.0.clone()),
+                }))
+            }
             None if crate::tls::find(&e).is_some() => {
                 CallToolResult::structured_error(crate::tls::find(&e).expect("checked").to_json())
             }
-            None if super::relay::is_unreachable(&e) => CallToolResult::structured_error(json!({
-                "error": "RELAY_UNREACHABLE",
-                "message": format!("{e}. This call did not complete; if it was a send, nothing was confirmed as sent, so send it again."),
-            })),
+            None if super::relay::is_unreachable(&e) || is_transport(&e) => {
+                CallToolResult::structured_error(json!({
+                    "error": "RELAY_UNREACHABLE",
+                    "message": UNREACHABLE_MESSAGE,
+                    "detail": one_line(&e),
+                }))
+            }
             None => CallToolResult::structured_error(json!({
                 "error": "CONNECTOR",
                 "message": e.to_string(),
             })),
         },
     })
+}
+
+/// The whole message of a `RELAY_UNREACHABLE` error: one plain line, no
+/// client-library internals (those go in `detail`).
+pub(crate) const UNREACHABLE_MESSAGE: &str =
+    "can't reach the relay; nothing was sent, send again in a minute";
+
+/// Whether `e` is a network failure talking to the relay (an HTTP client
+/// error that is not a certificate problem).
+fn is_transport(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        c.downcast_ref::<reqwest::Error>()
+            .is_some_and(|r| r.is_connect() || r.is_timeout() || r.is_request() || r.is_body())
+    })
+}
+
+/// An error chain as one short line, for `detail`.
+fn one_line(e: &anyhow::Error) -> String {
+    let full = format!("{e:#}").replace(['\n', '\r'], " ");
+    if full.chars().count() > 300 {
+        full.chars().take(300).chain(['…']).collect()
+    } else {
+        full
+    }
 }
 
 /// What a read returns while the relay is briefly unreachable (restarting):

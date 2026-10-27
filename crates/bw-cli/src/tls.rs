@@ -248,7 +248,9 @@ pub fn classify(e: reqwest::Error, url: &str, what: &str) -> anyhow::Error {
             reason,
         }
         .into(),
-        None => anyhow::anyhow!("{what}: {e}"),
+        // Keep the client error in the chain (callers tell network
+        // failures apart by it); the message itself stays plain.
+        None => anyhow::Error::from(e).context(what.to_string()),
     }
 }
 

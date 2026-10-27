@@ -171,7 +171,41 @@ impl BotStore {
         paths::write_private(
             &self.tokens_path(),
             &serde_json::to_vec_pretty(t).expect("json"),
+        )?;
+        self.record_home()
+    }
+
+    /// Where this bot's directory lives, written next to its tokens.
+    fn home_path(&self) -> PathBuf {
+        self.dir.join("home.json")
+    }
+
+    fn canonical_dir(&self) -> String {
+        std::fs::canonicalize(&self.dir)
+            .unwrap_or_else(|_| self.dir.clone())
+            .display()
+            .to_string()
+    }
+
+    /// Note which directory holds these tokens (see [`Self::copied_from`]).
+    pub fn record_home(&self) -> std::io::Result<()> {
+        paths::write_private(
+            &self.home_path(),
+            &serde_json::to_vec_pretty(&serde_json::json!({ "path": self.canonical_dir() }))
+                .expect("json"),
         )
+    }
+
+    /// `Some(original)` when this bot directory was copied from another
+    /// place: its tokens belong to the original, and using them here would
+    /// replay a rotated refresh token, which makes the relay revoke the
+    /// sign-in of both copies. Homes from before 0.2.10 have no record yet;
+    /// one is written on first use.
+    pub fn copied_from(&self) -> Option<String> {
+        let bytes = std::fs::read(self.home_path()).ok()?;
+        let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+        let recorded = v["path"].as_str()?.to_string();
+        (recorded != self.canonical_dir()).then_some(recorded)
     }
 
     /// Load the bot's MLS identity, or create one for `agent_id`.
@@ -251,6 +285,38 @@ impl BotStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_copied_home_is_recognised() {
+        let root = std::env::temp_dir().join(format!("bw-copy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let a = BotStore::new(&root.join("a"), "https://relay.example", "acct:bot");
+        a.save_tokens(&Tokens {
+            access_token: "a".into(),
+            refresh_token: Some("r".into()),
+            expires_at: 1,
+            client_id: Some("c".into()),
+        })
+        .unwrap();
+        assert_eq!(a.copied_from(), None, "the original is not a copy");
+        // Copy the bot directory somewhere else (what `cp -r` of a home does).
+        let b = BotStore::new(&root.join("b"), "https://relay.example", "acct:bot");
+        std::fs::create_dir_all(&b.dir).unwrap();
+        for f in std::fs::read_dir(&a.dir).unwrap() {
+            let f = f.unwrap().path();
+            std::fs::copy(&f, b.dir.join(f.file_name().unwrap())).unwrap();
+        }
+        assert!(b.load_tokens().is_some());
+        let orig = b.copied_from().expect("the copy knows it is one");
+        assert!(
+            orig.ends_with(&*a.dir.file_name().unwrap().to_string_lossy()),
+            "{orig}"
+        );
+        // Signing the copy in on its own makes it a home of its own.
+        b.save_tokens(&b.load_tokens().unwrap()).unwrap();
+        assert_eq!(b.copied_from(), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn hosts_and_current_marker() {

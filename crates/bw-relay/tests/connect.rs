@@ -1349,7 +1349,14 @@ async fn reads_say_relay_reconnecting_while_sends_fail_clearly() {
         assert_eq!(r.is_error, Some(true));
         let err = r.structured_content.unwrap();
         assert_eq!(err["error"], "RELAY_UNREACHABLE", "{err}");
-        assert!(err["message"].as_str().unwrap().contains("send it again"));
+        assert_eq!(
+            err["message"], "can't reach the relay; nothing was sent, send again in a minute",
+            "one plain line: {err}"
+        );
+        assert!(
+            err["detail"].is_string(),
+            "the raw reason, separately: {err}"
+        );
 
         // A short blip: the relay is back before the retry, so the read
         // just works.
@@ -1376,4 +1383,52 @@ async fn reads_say_relay_reconnecting_while_sends_fail_clearly() {
     })
     .await
     .expect("the test must not hang");
+}
+
+/// A bot whose sign-in the relay refuses (here: a refresh token it does not
+/// know, like one replayed from a copied home) is signed out: every tool
+/// says SIGNED_OUT and "signed out, call `login`", never "relay
+/// unreachable" or "relay reconnecting".
+#[tokio::test]
+async fn a_refused_sign_in_is_signed_out_not_unreachable() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let relay = TestRelay::start().await;
+        let now = bw_relay::doorbell::now_unix();
+        let client = RelayClient::new(
+            &relay.base(),
+            botwhisper::connect::store::Tokens {
+                access_token: TOKENS[0].to_string(),
+                refresh_token: Some("not-a-refresh-token".into()),
+                // Fresh for now; due for a refresh in two seconds.
+                expires_at: now + 62,
+                client_id: Some("no-such-client".into()),
+            },
+            None,
+        );
+        let a = Connector::new(client, None, None).await.unwrap();
+        let alice = serve_connector(a).await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        for (tool, args) in [
+            ("list_rooms", json!({})),
+            ("get_doorbell", json!({})),
+            ("create_room", json!({ "title": "x" })),
+        ] {
+            let r: CallToolResult = alice
+                .call_tool(
+                    CallToolRequestParams::new(tool)
+                        .with_arguments(args.as_object().cloned().unwrap()),
+                )
+                .await
+                .unwrap();
+            let v = r.structured_content.clone().unwrap_or_default();
+            assert_eq!(r.is_error, Some(true), "{tool}: {v}");
+            assert_eq!(v["error"], "SIGNED_OUT", "{tool}: {v}");
+            assert_eq!(v["message"], "signed out, call `login`", "{tool}: {v}");
+            assert!(v.get("relay_reconnecting").is_none(), "{tool}: {v}");
+            assert!(!v.to_string().contains("unreachable"), "{tool}: {v}");
+        }
+        relay.shutdown().await;
+    })
+    .await
+    .expect("no hang");
 }

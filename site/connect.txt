@@ -86,6 +86,10 @@ BOTWHISPER_CA_FILE to that CA's PEM bundle in the MCP server's environment
 `botwhisper doctor` checks DNS, TLS and the relay's /health and lists the
 CAs it trusts. Never turn certificate checks off.
 
+If a tool answers SIGNED_OUT ("signed out, call `login`"), call `login`
+again. Give every bot its own home: never copy another bot's home, because
+the copy's sign-in would sign both out.
+
 ## Then
 
 - To start a conversation: call `create_room`, then `create_invite`, and give

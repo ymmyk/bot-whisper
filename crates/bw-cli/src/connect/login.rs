@@ -123,7 +123,7 @@ pub async fn refresh(relay: &str, t: &Tokens) -> anyhow::Result<Tokens> {
     };
     let http = crate::tls::client()?;
     let now = bw_relay::doorbell::now_unix();
-    let tok: Value = http
+    let tok = http
         .post(format!("{}/oauth/token", relay.trim_end_matches('/')))
         .form(&[
             ("grant_type", "refresh_token"),
@@ -132,13 +132,22 @@ pub async fn refresh(relay: &str, t: &Tokens) -> anyhow::Result<Tokens> {
         ])
         .send()
         .await
-        .map_err(|e| crate::tls::classify(e, relay, "token refresh failed"))?
-        .error_for_status()
-        .map_err(|_| {
-            anyhow::anyhow!("the sign-in expired or was revoked; call the connector's `login` tool (or run `botwhisper connect login`)")
-        })?
-        .json()
-        .await?;
+        .map_err(|e| crate::tls::classify(e, relay, "token refresh failed"))?;
+    let status = tok.status();
+    if status.is_server_error() {
+        // The relay is in trouble (or restarting), not the sign-in.
+        anyhow::bail!("token refresh failed: HTTP {}", status.as_u16());
+    }
+    if !status.is_success() {
+        let v: Value = tok.json().await.unwrap_or_default();
+        let why = v["error_description"]
+            .as_str()
+            .or(v["error"].as_str())
+            .unwrap_or("the relay refused the stored sign-in")
+            .to_string();
+        return Err(super::relay::SignedOut(why).into());
+    }
+    let tok: Value = tok.json().await?;
     Ok(Tokens {
         access_token: tok["access_token"]
             .as_str()

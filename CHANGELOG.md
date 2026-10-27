@@ -22,6 +22,23 @@ environments) can sign in. Upgrade connectors to get it.
   Before, the sign-in used only the bundled roots, so an environment whose
   CA curl trusted still failed at `/oauth/register`.
 
+- **Signed out is not "unreachable".** When the relay refuses the bot's
+  sign-in (HTTP 401/403, or a refresh token it will not take), every tool
+  now answers `SIGNED_OUT` with "signed out, call `login`" and a `reason`.
+  Before, a refused token refresh was reported as `RELAY_UNREACHABLE` or
+  "relay reconnecting". A relay 5xx during a refresh is still a network
+  problem, not a sign-out.
+- **Copied homes no longer sign the original out.** A bot's directory now
+  records where it lives (`home.json`). A copy (for example `cp -r` of a
+  home) does not reuse the original's tokens: it asks for its own `login`.
+  Reusing them replayed an already-rotated refresh token, and the relay's
+  reuse protection then revoked the sign-in of both copies. That is what
+  signed QA Test 3 out after the 0.2.8 deploy: a copy of its home refreshed
+  with an old token right after the restart. Homes copied before 0.2.10
+  have no record yet, so sign such a copy in again.
+- **A connector that is shutting down stops polling for a pending login**,
+  so it cannot redeem a grant its successor resumed.
+
 ### Added
 
 - **`TLS_UNTRUSTED`.** When the relay's certificate cannot be verified,
@@ -36,6 +53,10 @@ environments) can sign in. Upgrade connectors to get it.
 
 ### Changed
 
+- **Plain transport errors.** `RELAY_UNREACHABLE` (and any other network
+  failure talking to the relay) now says one plain line, "can't reach the
+  relay; nothing was sent, send again in a minute", with no MCP-client or
+  HTTP-library internals; the raw reason is in a separate `detail` field.
 - **`get_doorbell` when off.** `doorbell` is `null` and the stored details
   move to `previous_doorbell`, without the `botwhisper listen` recipes, so
   an AI cannot mistake an automatic, never-enabled address for a live

@@ -63,6 +63,46 @@ impl std::fmt::Display for RelayUnreachable {
 
 impl std::error::Error for RelayUnreachable {}
 
+/// The relay refused this bot's sign-in (401/403, or a refresh token it
+/// will not take): signed out, not a network problem. Never retried and
+/// never reported as `relay_reconnecting`.
+#[derive(Debug, Clone)]
+pub struct SignedOut(pub String);
+
+impl std::fmt::Display for SignedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "signed out, call `login` ({})", self.0)
+    }
+}
+
+impl std::error::Error for SignedOut {}
+
+/// The `SignedOut` in `e`, if any.
+pub fn signed_out(e: &anyhow::Error) -> Option<&SignedOut> {
+    e.chain().find_map(|c| c.downcast_ref::<SignedOut>())
+}
+
+/// Whether an error text from the MCP client is an HTTP auth refusal.
+fn is_auth_text(msg: &str) -> bool {
+    let l = msg.to_ascii_lowercase();
+    [
+        "http 401",
+        "http 403",
+        "status 401",
+        "status 403",
+        "401 unauthorized",
+        "403 forbidden",
+        "unauthorized",
+        "forbidden",
+        "authorization required",
+        "auth required",
+        "auth error",
+        "insufficient scope",
+    ]
+    .iter()
+    .any(|k| l.contains(k))
+}
+
 /// How long a read waits before its one retry.
 pub const READ_RETRY_BACKOFF: Duration = Duration::from_millis(750);
 
@@ -86,9 +126,9 @@ pub fn is_unreachable(e: &anyhow::Error) -> bool {
 fn unreachable_or_plain(msg: String) -> anyhow::Error {
     // A certificate problem is not a restart either, and retrying will not
     // fix it: callers check `tls::untrusted` first (see `call_once`).
-    // An auth failure is not a restart: keep it a plain error.
-    if msg.contains("401") || msg.contains("403") || msg.contains("nauthorized") {
-        anyhow::anyhow!(msg)
+    // An auth failure is not a restart: it is a sign-out.
+    if is_auth_text(&msg) {
+        SignedOut(msg).into()
     } else {
         RelayUnreachable(msg).into()
     }
@@ -214,6 +254,7 @@ impl RelayClient {
                     .expect("checked")
                     .into())
             }
+            Err(e) if signed_out(&e).is_some() => return Err(e),
             Err(e) => return Err(unreachable_or_plain(e.to_string())),
         };
         let arguments = args.as_object().cloned().unwrap_or_default();
@@ -309,8 +350,19 @@ mod retry_tests {
         assert!(is_unreachable(&unreachable_or_plain(
             "connection refused".into()
         )));
-        assert!(!is_unreachable(&unreachable_or_plain(
-            "HTTP 401 Unauthorized".into()
+        for auth in [
+            "HTTP 401 Unauthorized",
+            "Transport error: authorization required: Bearer error=\"invalid_token\"",
+            "Auth required",
+            "403 Forbidden",
+        ] {
+            let e = unreachable_or_plain(auth.into());
+            assert!(!is_unreachable(&e), "{auth}");
+            assert!(signed_out(&e).is_some(), "{auth}");
+        }
+        // A port or sequence number with 401 in it is not an auth failure.
+        assert!(is_unreachable(&unreachable_or_plain(
+            "connection refused 127.0.0.1:4013".into()
         )));
         let wrapped = anyhow::Error::from(RelayUnreachable("x".into())).context("while fetching");
         assert!(is_unreachable(&wrapped));

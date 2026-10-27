@@ -179,6 +179,10 @@ struct Inner {
     busy: StdMutex<Option<String>>,
     /// Notices when the binary on disk was replaced after start.
     upgrade: StdMutex<Arc<UpgradeWatch>>,
+    /// Set when the MCP session ends: background login polling stops, so a
+    /// connector that is going away never redeems a grant its successor
+    /// (resuming the same saved login) is waiting for.
+    stopped: std::sync::atomic::AtomicBool,
 }
 
 /// The stdio MCP server of `botwhisper connect`. Cheap to clone.
@@ -264,6 +268,7 @@ impl Gateway {
                 resume_note: StdMutex::new(None),
                 busy: StdMutex::new(None),
                 upgrade: StdMutex::new(Arc::new(UpgradeWatch::for_current_exe())),
+                stopped: std::sync::atomic::AtomicBool::new(false),
             }),
         }
     }
@@ -360,6 +365,18 @@ impl Gateway {
         let Some(tokens) = store.load_tokens() else {
             return Ok(false);
         };
+        // A copied home must not reuse the original's sign-in: the first
+        // refresh would replay a rotated token and the relay would revoke
+        // the sign-in everywhere (what signed QA Test 3 out).
+        if let Some(orig) = store.copied_from() {
+            *i.resume_note.lock().expect("lock") = Some(format!(
+                "This bot's home was copied from {orig}. A copy cannot reuse the original's sign-in (that would sign both out). Call `login` to sign this copy in on its own."
+            ));
+            return Ok(false);
+        }
+        if std::fs::metadata(store.dir.join("home.json")).is_err() {
+            let _ = store.record_home();
+        }
         // A saved name that differs: refuse before the relay is called.
         if let (Some(want), Some(have)) = (expect, store.load_bot_name()) {
             if want.trim() != have.trim() {
@@ -403,9 +420,16 @@ impl Gateway {
         T: rmcp::transport::IntoTransport<RoleServer, E, A>,
         E: std::error::Error + From<std::io::Error> + Send + Sync + 'static,
     {
-        let running = rmcp::ServiceExt::serve(self, transport).await?;
-        running.waiting().await?;
-        Ok(())
+        let inner = self.inner.clone();
+        let running = rmcp::ServiceExt::serve(self, transport).await;
+        let r = match running {
+            Ok(running) => running.waiting().await.map(|_| ()).map_err(Into::into),
+            Err(e) => Err(e.into()),
+        };
+        inner
+            .stopped
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        r
     }
 
     // ----- device login -----
@@ -666,7 +690,14 @@ impl Gateway {
     fn background_poll(&self, generation: u64) {
         let gw = self.clone();
         tokio::spawn(async move {
-            while let Step::Waiting | Step::Pending = gw.poll_step(Some(generation)).await {}
+            while !gw.inner.stopped.load(std::sync::atomic::Ordering::SeqCst) {
+                if !matches!(
+                    gw.poll_step(Some(generation)).await,
+                    Step::Waiting | Step::Pending
+                ) {
+                    break;
+                }
+            }
         });
     }
 }
