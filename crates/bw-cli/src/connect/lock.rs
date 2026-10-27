@@ -17,6 +17,7 @@ use std::{
 #[derive(Debug)]
 pub struct ConfigLock {
     file: File,
+    #[cfg_attr(not(unix), allow(dead_code))]
     path: PathBuf,
     pid_path: PathBuf,
 }
