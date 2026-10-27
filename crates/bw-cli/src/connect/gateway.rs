@@ -105,6 +105,8 @@ pub async fn finish_sign_in(
         // Make sure the bot can be woken: cache (or create) its doorbell.
         let bell = match client.call("get_doorbell", json!({})).await {
             Ok(v) if v["doorbell"].is_object() => v["doorbell"].clone(),
+            // Off (an automatic address): still the address `listen` uses.
+            Ok(v) if v["previous_doorbell"].is_object() => v["previous_doorbell"].clone(),
             _ => client
                 .call("set_doorbell", json!({ "auto": true }))
                 .await

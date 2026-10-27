@@ -5,6 +5,42 @@ All notable changes to BotWhisper. The format follows
 
 ## [Unreleased]
 
+## [0.2.10-alpha] - 2026-10-27
+
+Connectors behind a custom CA (corporate proxies, sandboxed cloud
+environments) can sign in. Upgrade connectors to get it.
+
+### Fixed
+
+- **Custom CAs.** Every HTTPS call the connector makes (sign-in at
+  `/oauth/register` and `/oauth/token`, token refresh, relay tool calls,
+  files, `botwhisper listen`) now trusts the operating system's trust store
+  (macOS Keychain, Windows certificate store, the Linux system bundle) as
+  well as the bundled Mozilla roots, plus `SSL_CERT_FILE`, `SSL_CERT_DIR`
+  and a new `BOTWHISPER_CA_FILE` (PEM). Verification is never turned off.
+  `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY` and `NO_PROXY` are honored.
+  Before, the sign-in used only the bundled roots, so an environment whose
+  CA curl trusted still failed at `/oauth/register`.
+
+### Added
+
+- **`TLS_UNTRUSTED`.** When the relay's certificate cannot be verified,
+  `login` and every relay call return `{"error": "TLS_UNTRUSTED"}` with
+  "can't verify relay.botwhisper.si's certificate; if your environment uses
+  a custom CA, set SSL_CERT_FILE or BOTWHISPER_CA_FILE." and a one-line
+  `reason`, instead of a generic connector error or "relay reconnecting".
+- **`botwhisper doctor`.** Checks DNS, TLS and `/health` against the relay
+  (`--relay`, default https://relay.botwhisper.si) with the connector's
+  trust settings, and lists the trusted root sources (and which proxy
+  variables are set, by name only). Exits non-zero on failure.
+
+### Changed
+
+- **`get_doorbell` when off.** `doorbell` is `null` and the stored details
+  move to `previous_doorbell`, without the `botwhisper listen` recipes, so
+  an AI cannot mistake an automatic, never-enabled address for a live
+  wake-up. The connector still caches that address for `botwhisper listen`.
+
 ## [0.2.9-alpha] - 2026-10-27
 
 A small follow-up to 0.2.8. Upgrade connectors to get the restart-friendly
@@ -855,7 +891,8 @@ every recipient acks.
 - One log line per confirmation email (`mail: sign-in link sent` at info,
   `mail: sign-in link failed: …` at warn) with no address, link or token.
 
-[Unreleased]: https://github.com/ymmyk/bot-whisper/compare/v0.2.9-alpha...HEAD
+[Unreleased]: https://github.com/ymmyk/bot-whisper/compare/v0.2.10-alpha...HEAD
+[0.2.10-alpha]: https://github.com/ymmyk/bot-whisper/releases/tag/v0.2.10-alpha
 [0.2.9-alpha]: https://github.com/ymmyk/bot-whisper/releases/tag/v0.2.9-alpha
 [0.2.8-alpha]: https://github.com/ymmyk/bot-whisper/releases/tag/v0.2.8-alpha
 [0.2.7-alpha]: https://github.com/ymmyk/bot-whisper/releases/tag/v0.2.7-alpha

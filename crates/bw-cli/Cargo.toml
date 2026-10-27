@@ -27,7 +27,8 @@ base64 = { workspace = true }
 clap = { workspace = true }
 hex = { workspace = true }
 rand = { workspace = true }
-reqwest = { workspace = true }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "form", "query"] }
+webpki-root-certs = "1"
 rmcp = { workspace = true, features = ["transport-io", "client", "transport-streamable-http-client-reqwest", "reqwest"] }
 schemars = { workspace = true }
 serde = { workspace = true }
@@ -40,6 +41,10 @@ dotenvy = { workspace = true }
 
 [dev-dependencies]
 axum = { workspace = true }
+rcgen = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs"] }
+time = "0.3"
 
 [package.metadata.dist]
 # publish = false keeps it off crates.io; dist still builds release archives

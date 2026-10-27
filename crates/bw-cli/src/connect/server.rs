@@ -340,6 +340,9 @@ pub(crate) fn respond(result: anyhow::Result<Value>) -> Result<CallToolResult, E
         Ok(v) => CallToolResult::structured(v),
         Err(e) => match e.downcast_ref::<super::relay::ToolError>() {
             Some(t) => CallToolResult::structured_error(t.0.clone()),
+            None if crate::tls::find(&e).is_some() => {
+                CallToolResult::structured_error(crate::tls::find(&e).expect("checked").to_json())
+            }
             None if super::relay::is_unreachable(&e) => CallToolResult::structured_error(json!({
                 "error": "RELAY_UNREACHABLE",
                 "message": format!("{e}. This call did not complete; if it was a send, nothing was confirmed as sent, so send it again."),
@@ -369,7 +372,7 @@ pub(crate) fn respond_read(
     empty: impl FnOnce() -> Value,
 ) -> Result<CallToolResult, ErrorData> {
     match result {
-        Err(e) if super::relay::is_unreachable(&e) => {
+        Err(e) if super::relay::is_unreachable(&e) && crate::tls::find(&e).is_none() => {
             Ok(CallToolResult::structured(reconnecting(empty())))
         }
         r => respond(r),
@@ -1858,7 +1861,7 @@ impl Connector {
 
     #[tool(
         name = "get_doorbell",
-        description = "Your effective doorbell: `state` (`on`/`off`, as the account page shows it), `origin` (`automatic`/`manual`), a one-line `summary`, plus status, topic and wake commands. Secrets are never returned."
+        description = "Your effective doorbell: `state` (`on`/`off`, as the account page shows it), `origin` (`automatic`/`manual`), a one-line `summary`; when on, `doorbell` with status, topic and wake commands; when off, `doorbell` is null and what is stored is under `previous_doorbell` (no wake commands: it wakes nothing). Secrets are never returned."
     )]
     async fn get_doorbell(
         &self,
@@ -1871,7 +1874,12 @@ impl Connector {
                     args["room_id"] = json!(r);
                 }
                 let v = self.relay.call("get_doorbell", args).await?;
-                self.cache_doorbell(&v["doorbell"]).await;
+                // Off still has the stored address `listen` subscribes to.
+                if v["doorbell"].is_object() {
+                    self.cache_doorbell(&v["doorbell"]).await;
+                } else {
+                    self.cache_doorbell(&v["previous_doorbell"]).await;
+                }
                 Ok(v)
             }
             .await,
@@ -1882,7 +1890,9 @@ impl Connector {
 
 impl Connector {
     fn http(&self) -> reqwest::Client {
-        reqwest::Client::new()
+        // Same trust settings as every other relay call; a bad CA file was
+        // already reported by the MCP connection, so fall back quietly.
+        crate::tls::client().unwrap_or_default()
     }
 
     async fn do_send_file(&self, a: SendFileArgs) -> anyhow::Result<Value> {
@@ -1946,7 +1956,7 @@ impl Connector {
             .body(ciphertext)
             .send()
             .await
-            .map_err(|e| anyhow::anyhow!("upload failed: {e}"))?;
+            .map_err(|e| crate::tls::classify(e, &self.relay.relay, "upload failed"))?;
         let status = r.status();
         let body: Value = r.json().await.unwrap_or(Value::Null);
         if !status.is_success() {
@@ -2022,7 +2032,7 @@ impl Connector {
             .bearer_auth(&token)
             .send()
             .await
-            .map_err(|e| anyhow::anyhow!("download failed: {e}"))?;
+            .map_err(|e| crate::tls::classify(e, &self.relay.relay, "download failed"))?;
         if !r.status().is_success() {
             let status = r.status();
             let body: Value = r.json().await.unwrap_or(Value::Null);

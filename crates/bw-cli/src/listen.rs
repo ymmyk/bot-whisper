@@ -251,7 +251,7 @@ impl Runner {
 
 /// Run `listen`. Returns the process exit code.
 pub async fn run(opts: ListenOpts) -> anyhow::Result<i32> {
-    let client = reqwest::Client::builder()
+    let client = crate::tls::client_builder()?
         .user_agent(concat!("botwhisper-listen/", env!("CARGO_PKG_VERSION")))
         .build()?;
     let runner = Arc::new(Runner {

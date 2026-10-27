@@ -1180,6 +1180,10 @@ async fn wakeups_state_reflects_a_real_doorbell() {
     assert_eq!(g["state"], "off", "{g}");
     assert_eq!(g["auto"], false);
     assert!(g["origin"].is_null());
+    assert!(
+        g["doorbell"].is_null() && g.get("previous_doorbell").is_none(),
+        "{g}"
+    );
     assert_eq!(
         g["summary"],
         "Wake-ups are off. Ask your AI to turn them on."
@@ -1195,7 +1199,17 @@ async fn wakeups_state_reflects_a_real_doorbell() {
         g["summary"],
         "Wake-ups are off. Ask your AI to turn them on."
     );
-    assert!(g["doorbell"].is_object(), "listen still gets its address");
+    // Off: no live `doorbell`, and the stored details sit under
+    // `previous_doorbell` with no listen recipes, so an AI cannot mistake
+    // them for a working wake-up (the connector still caches the address).
+    assert!(g["doorbell"].is_null(), "{g}");
+    let prev = &g["previous_doorbell"];
+    assert!(prev["topic"].is_string(), "listen still gets its address");
+    assert!(
+        prev.get("recipes").is_none() && prev.get("notes").is_none(),
+        "{prev}"
+    );
+    assert!(!g.to_string().contains("botwhisper listen"), "{g}");
     let p = page(alice.clone()).await;
     assert!(p.contains(off), "auto address only");
     assert!(
@@ -1220,6 +1234,12 @@ async fn wakeups_state_reflects_a_real_doorbell() {
     assert_eq!(g["state"], "on", "{g}");
     assert_eq!(g["origin"], "manual");
     assert_eq!(g["auto"], false);
+    // On: the live doorbell with its recipes, no `previous_doorbell`.
+    assert!(
+        g["doorbell"]["recipes"].is_object() || g["doorbell"]["recipes"].is_array(),
+        "{g}"
+    );
+    assert!(g.get("previous_doorbell").is_none(), "{g}");
     let summary = g["summary"].as_str().unwrap();
     assert_eq!(summary, "Wake-ups are on (all rooms), sent to a phone or desktop notification app. Last wake-up sent: never.");
     assert!(

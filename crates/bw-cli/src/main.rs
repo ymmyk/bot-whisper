@@ -39,6 +39,22 @@ enum Command {
     /// signs in by itself once you approve; no terminal step is needed.
     /// Instructions for AIs: https://botwhisper.si/connect
     Connect(Box<ConnectArgs>),
+    /// Check that this machine can reach the relay: DNS, TLS (with the
+    /// connector's trust settings) and /health, and which CAs are trusted
+    /// (OS store, bundled roots, SSL_CERT_FILE, SSL_CERT_DIR,
+    /// BOTWHISPER_CA_FILE). Prints no secrets. Exits non-zero on failure.
+    Doctor(DoctorArgs),
+}
+
+#[derive(Args, Debug)]
+struct DoctorArgs {
+    /// Relay base URL.
+    #[arg(
+        long,
+        env = "BOTWHISPER_RELAY",
+        default_value = "https://relay.botwhisper.si"
+    )]
+    relay: String,
 }
 
 #[derive(Args, Debug)]
@@ -308,6 +324,10 @@ async fn main() -> anyhow::Result<()> {
             std::process::exit(code);
         }
         Command::Connect(args) => connect(*args).await,
+        Command::Doctor(args) => {
+            let code = botwhisper::doctor::run(&args.relay).await;
+            std::process::exit(code);
+        }
     }
 }
 

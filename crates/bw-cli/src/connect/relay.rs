@@ -84,6 +84,8 @@ pub fn is_unreachable(e: &anyhow::Error) -> bool {
 }
 
 fn unreachable_or_plain(msg: String) -> anyhow::Error {
+    // A certificate problem is not a restart either, and retrying will not
+    // fix it: callers check `tls::untrusted` first (see `call_once`).
     // An auth failure is not a restart: keep it a plain error.
     if msg.contains("401") || msg.contains("403") || msg.contains("nauthorized") {
         anyhow::anyhow!(msg)
@@ -145,14 +147,24 @@ impl RelayClient {
             return Ok(s.clone());
         }
         let token = self.tokens.lock().await.access_token.clone();
-        let transport = StreamableHttpClientTransport::from_config(
+        // The connector's own client: OS trust store, bundled roots and
+        // SSL_CERT_FILE / SSL_CERT_DIR / BOTWHISPER_CA_FILE (see `tls`).
+        let http = crate::tls::client()?;
+        let transport = StreamableHttpClientTransport::with_client(
+            http,
             StreamableHttpClientTransportConfig::with_uri(format!("{}/mcp", self.relay))
                 .auth_header(token),
         );
-        let running = ()
-            .serve(transport)
-            .await
-            .map_err(|e| anyhow::anyhow!("cannot reach the relay at {}: {e}", self.relay))?;
+        let running = match ().serve(transport).await {
+            Ok(r) => r,
+            Err(e) => {
+                let e = anyhow::anyhow!("cannot reach the relay at {}: {e}", self.relay);
+                return Err(match self.tls_problem(&e).await {
+                    Some(t) => t.into(),
+                    None => e,
+                });
+            }
+        };
         let running = Arc::new(running);
         *svc = Some(running.clone());
         Ok(running)
@@ -174,11 +186,36 @@ impl RelayClient {
         }
     }
 
+    /// Whether a failed connection was a certificate problem: from the error
+    /// itself, or (the MCP client flattens errors to text) from one plain
+    /// HTTPS request to the relay with the same trust settings.
+    async fn tls_problem(&self, e: &anyhow::Error) -> Option<crate::tls::TlsUntrusted> {
+        if let Some(t) = crate::tls::untrusted(e, &self.relay) {
+            return Some(t);
+        }
+        let http = crate::tls::client_builder()
+            .ok()?
+            .timeout(Duration::from_secs(10))
+            .build()
+            .ok()?;
+        match http.get(format!("{}/health", self.relay)).send().await {
+            Err(re) => crate::tls::classify(re, &self.relay, "probe")
+                .downcast::<crate::tls::TlsUntrusted>()
+                .ok(),
+            Ok(_) => None,
+        }
+    }
+
     async fn call_once(&self, tool: &str, args: Value) -> anyhow::Result<Value> {
-        let svc = self
-            .service()
-            .await
-            .map_err(|e| unreachable_or_plain(e.to_string()))?;
+        let svc = match self.service().await {
+            Ok(s) => s,
+            Err(e) if crate::tls::untrusted(&e, &self.relay).is_some() => {
+                return Err(crate::tls::untrusted(&e, &self.relay)
+                    .expect("checked")
+                    .into())
+            }
+            Err(e) => return Err(unreachable_or_plain(e.to_string())),
+        };
         let arguments = args.as_object().cloned().unwrap_or_default();
         let result = match svc
             .call_tool(CallToolRequestParams::new(tool.to_string()).with_arguments(arguments))

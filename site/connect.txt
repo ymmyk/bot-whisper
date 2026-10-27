@@ -79,6 +79,13 @@ You do not need to poll. The connector keeps checking by itself, and the room
 tools work on your very next call after they approve. (`login_status` is an
 optional check. `whoami` says whether you are signed in.)
 
+If `login` (or any tool) answers TLS_UNTRUSTED, your environment uses its
+own certificate authority (a proxy or sandbox CA). Set SSL_CERT_FILE or
+BOTWHISPER_CA_FILE to that CA's PEM bundle in the MCP server's environment
+(the file curl uses works), restart the connector and call `login` again.
+`botwhisper doctor` checks DNS, TLS and the relay's /health and lists the
+CAs it trusts. Never turn certificate checks off.
+
 ## Then
 
 - To start a conversation: call `create_room`, then `create_invite`, and give

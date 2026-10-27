@@ -476,7 +476,7 @@ impl BotWhisperServer {
 
     #[tool(
         name = "get_doorbell",
-        description = "[Only through the local `botwhisper connect` connector.] Show your effective doorbell (for a room, or your bot-wide default): `state` (`on`/`off`, the same as the account page; an automatic sign-in address never set up on purpose is `off`), `origin` (`automatic`/`manual`), a one-line `summary`, type, destination host, events, delivery status, the ntfy topic and the copy-paste `botwhisper listen` commands. Secrets are never returned."
+        description = "[Only through the local `botwhisper connect` connector.] Show your effective doorbell (for a room, or your bot-wide default): `state` (`on`/`off`, the same as the account page; an automatic sign-in address never set up on purpose is `off`), `origin` (`automatic`/`manual`), a one-line `summary`, and when on, `doorbell`: type, destination host, events, delivery status, the ntfy topic and the copy-paste `botwhisper listen` commands. When off, `doorbell` is null and the stored details (no listen commands; they wake nothing) are under `previous_doorbell`. Secrets are never returned."
     )]
     async fn get_doorbell(
         &self,
@@ -1101,16 +1101,34 @@ impl BotWhisperServer {
         } else {
             "all rooms"
         };
-        Ok(json!({
+        let details = cfg
+            .as_ref()
+            .map(|c| self.describe_doorbell(c, status.as_ref()));
+        let mut out = json!({
             "scope": scope,
             "room_id": room_id,
             "state": if on { "on" } else { "off" },
             "origin": cfg.as_ref().map(|c| if c.is_automatic() { "automatic" } else { "manual" }),
             "auto": cfg.as_ref().is_some_and(|c| c.is_automatic()),
             "summary": crate::doorbell::wakeups_summary(cfg.as_ref(), status.as_ref(), where_, &last),
-            "doorbell": cfg.as_ref().map(|c| self.describe_doorbell(c, status.as_ref())),
+            "doorbell": Value::Null,
             "hint": if on { None } else { Some("wake-ups are off; call set_doorbell (no arguments) to turn them on with a private ntfy topic") },
-        }))
+        });
+        match details {
+            // Live: the details with their listen recipes.
+            Some(d) if on => out["doorbell"] = d,
+            // Off: what is stored, without recipes, so nothing reads it as
+            // a live wake-up (the connector still caches it for `listen`).
+            Some(mut d) => {
+                if let Some(o) = d.as_object_mut() {
+                    o.remove("recipes");
+                    o.remove("notes");
+                }
+                out["previous_doorbell"] = d;
+            }
+            None => {}
+        }
+        Ok(out)
     }
 
     async fn do_e2e_fetch(&self, agent: AgentId, a: E2eFetchArgs) -> Result<Value, RelayError> {

@@ -3,6 +3,8 @@
 //! itself lives in `bw-relay`.
 
 pub mod connect;
+pub mod doctor;
 pub mod listen;
 pub mod next_steps;
 pub mod paths;
+pub mod tls;

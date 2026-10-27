@@ -35,7 +35,7 @@ pub async fn login(
     timeout: Duration,
 ) -> anyhow::Result<Tokens> {
     let relay = relay.trim_end_matches('/');
-    let http = reqwest::Client::builder()
+    let http = crate::tls::client_builder()?
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
 
@@ -55,7 +55,8 @@ pub async fn login(
             "response_types": ["code"],
         }))
         .send()
-        .await?
+        .await
+        .map_err(|e| crate::tls::classify(e, relay, "client registration failed"))?
         .error_for_status()
         .map_err(|e| anyhow::anyhow!("client registration failed: {e}"))?
         .json()
@@ -98,7 +99,8 @@ pub async fn login(
             ("code_verifier", verifier.as_str()),
         ])
         .send()
-        .await?
+        .await
+        .map_err(|e| crate::tls::classify(e, relay, "token exchange failed"))?
         .error_for_status()
         .map_err(|e| anyhow::anyhow!("token exchange failed: {e}"))?
         .json()
@@ -119,7 +121,7 @@ pub async fn refresh(relay: &str, t: &Tokens) -> anyhow::Result<Tokens> {
     let (Some(rt), Some(cid)) = (&t.refresh_token, &t.client_id) else {
         anyhow::bail!("this token cannot be refreshed; call the connector's `login` tool (or run `botwhisper connect login`)");
     };
-    let http = reqwest::Client::new();
+    let http = crate::tls::client()?;
     let now = bw_relay::doorbell::now_unix();
     let tok: Value = http
         .post(format!("{}/oauth/token", relay.trim_end_matches('/')))
@@ -129,7 +131,8 @@ pub async fn refresh(relay: &str, t: &Tokens) -> anyhow::Result<Tokens> {
             ("client_id", cid.as_str()),
         ])
         .send()
-        .await?
+        .await
+        .map_err(|e| crate::tls::classify(e, relay, "token refresh failed"))?
         .error_for_status()
         .map_err(|_| {
             anyhow::anyhow!("the sign-in expired or was revoked; call the connector's `login` tool (or run `botwhisper connect login`)")
@@ -304,7 +307,7 @@ async fn oauth_failure(r: reqwest::Response, what: &str) -> anyhow::Error {
 /// what this connector would like its bot called (the person decides).
 pub async fn device_start(relay: &str, bot_name: Option<&str>) -> anyhow::Result<DeviceStart> {
     let relay = relay.trim_end_matches('/');
-    let http = reqwest::Client::builder()
+    let http = crate::tls::client_builder()?
         .timeout(Duration::from_secs(20))
         .build()?;
     let reg = http
@@ -317,7 +320,9 @@ pub async fn device_start(relay: &str, bot_name: Option<&str>) -> anyhow::Result
         }))
         .send()
         .await
-        .map_err(|e| anyhow::anyhow!("cannot reach the relay at {relay}: {e}"))?;
+        .map_err(|e| {
+            crate::tls::classify(e, relay, &format!("cannot reach the relay at {relay}"))
+        })?;
     if !reg.status().is_success() {
         let e = oauth_failure(reg, "client registration failed").await;
         anyhow::bail!(
@@ -338,7 +343,9 @@ pub async fn device_start(relay: &str, bot_name: Option<&str>) -> anyhow::Result
         .form(&form)
         .send()
         .await
-        .map_err(|e| anyhow::anyhow!("cannot reach the relay at {relay}: {e}"))?;
+        .map_err(|e| {
+            crate::tls::classify(e, relay, &format!("cannot reach the relay at {relay}"))
+        })?;
     if !r.status().is_success() {
         return Err(oauth_failure(r, "device authorization failed").await);
     }
@@ -370,10 +377,11 @@ pub async fn device_start(relay: &str, bot_name: Option<&str>) -> anyhow::Result
 
 /// One poll of the token endpoint (the caller honors the interval).
 pub async fn device_poll(relay: &str, start: &DeviceStart) -> DevicePoll {
-    let http = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(20))
-        .build()
-    {
+    let http = match crate::tls::client_builder().and_then(|b| {
+        b.timeout(Duration::from_secs(20))
+            .build()
+            .map_err(anyhow::Error::from)
+    }) {
         Ok(h) => h,
         Err(e) => return DevicePoll::Failed(e.to_string()),
     };
@@ -389,7 +397,15 @@ pub async fn device_poll(relay: &str, start: &DeviceStart) -> DevicePoll {
         .await
     {
         Ok(r) => r,
-        Err(e) => return DevicePoll::Transient(e.to_string()),
+        // A certificate problem does not go away by waiting.
+        Err(e) => {
+            let e = crate::tls::classify(e, relay, "cannot reach the relay");
+            return if e.downcast_ref::<crate::tls::TlsUntrusted>().is_some() {
+                DevicePoll::Failed(e.to_string())
+            } else {
+                DevicePoll::Transient(e.to_string())
+            };
+        }
     };
     let status = r.status();
     let v: Value = match r.json().await {

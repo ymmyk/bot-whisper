@@ -334,7 +334,7 @@ dependencies = [
 
 [[package]]
 name = "botwhisper"
-version = "0.2.9-alpha"
+version = "0.2.10-alpha"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -347,15 +347,20 @@ dependencies = [
  "dotenvy",
  "hex",
  "rand 0.9.5",
- "reqwest 0.12.28",
+ "rcgen",
+ "reqwest 0.13.5",
  "rmcp",
+ "rustls",
  "schemars",
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "time",
  "tokio",
+ "tokio-rustls",
  "tracing",
  "tracing-subscriber",
+ "webpki-root-certs",
 ]
 
 [[package]]
@@ -366,7 +371,7 @@ checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 
 [[package]]
 name = "bw-e2e"
-version = "0.2.9-alpha"
+version = "0.2.10-alpha"
 dependencies = [
  "hex",
  "openmls",
@@ -381,7 +386,7 @@ dependencies = [
 
 [[package]]
 name = "bw-proto"
-version = "0.2.9-alpha"
+version = "0.2.10-alpha"
 dependencies = [
  "proptest",
  "schemars",
@@ -392,7 +397,7 @@ dependencies = [
 
 [[package]]
 name = "bw-relay"
-version = "0.2.9-alpha"
+version = "0.2.10-alpha"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -2513,6 +2518,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2ee67f1008b1ba2321834326597b8e186293b049a023cdef258527550b9935b4"
 
 [[package]]
+name = "pem"
+version = "3.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d30c53c26bc5b31a98cd02d20f25a7c8567146caf63ed593a9d87b2775291be"
+dependencies = [
+ "base64 0.22.1",
+ "serde_core",
+]
+
+[[package]]
 name = "pem-rfc7468"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2905,6 +2920,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "rcgen"
+version = "0.13.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75e669e5202259b5314d1ea5397316ad400819437857b90861765f24c4cf80a2"
+dependencies = [
+ "pem",
+ "ring",
+ "rustls-pki-types",
+ "time",
+ "yasna",
+]
+
+[[package]]
 name = "redox_syscall"
 version = "0.5.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3028,6 +3056,7 @@ dependencies = [
  "rustls-platform-verifier",
  "serde",
  "serde_json",
+ "serde_urlencoded",
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
@@ -4451,6 +4480,15 @@ checksum = "e7e8131a03190127fb2263afc72b322ecadae46b6ff8c6f399ff5d02f5559af6"
 dependencies = [
  "curve25519-dalek 5.0.0",
  "rand_core 0.10.1",
+]
+
+[[package]]
+name = "yasna"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e17bb3549cc1321ae1296b9cdc2698e2b6cb1992adfa19a8c72e5b7a738f44cd"
+dependencies = [
+ "time",
 ]
 
 [[package]]

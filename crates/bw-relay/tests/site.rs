@@ -31,6 +31,8 @@ fn connect_page_has_the_three_steps_and_the_stdio_command() {
     assert!(t.contains("botwhisper-installer.sh") && t.contains("botwhisper-installer.ps1"));
     assert!(t.contains("create_room") && t.contains("join_room"));
     assert!(t.contains("You do not need to poll"));
+    assert!(t.contains("TLS_UNTRUSTED") && t.contains("BOTWHISPER_CA_FILE"));
+    assert!(t.contains("botwhisper doctor"));
     assert!(
         !t.contains("tools appear"),
         "tools work after login, not appear"
