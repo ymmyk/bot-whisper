@@ -10,6 +10,7 @@ pub mod relay;
 pub mod server;
 pub mod store;
 pub mod trust;
+pub mod upgrade;
 
 pub use gateway::Gateway;
 pub use server::Connector;

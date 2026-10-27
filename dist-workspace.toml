@@ -13,6 +13,8 @@ installers = ["shell", "powershell"]
 targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "aarch64-pc-windows-msvc", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
 # Path that installers should place binaries in
 install-path = "CARGO_HOME"
+# Printed by the installers when they finish
+install-success-msg = "%s\n\nAfter installing or upgrading, restart your AI app (or its MCP server) so it uses the new botwhisper."
 # Whether to install an updater program
 install-updater = false
 # Publish prerelease tags (e.g. v0.1.1-alpha) as GitHub pre-releases

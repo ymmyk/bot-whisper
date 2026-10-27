@@ -242,10 +242,18 @@ async fn device_flow_happy_path() {
         let bare = uc.replace('-', "");
         let (a, b) = bare.split_at(4);
         assert!(
+            page.contains(&format!(r#"<span class="codetok">{bare}</span>"#)),
+            "the code is shown as one text node"
+        );
+        assert!(
+            !page.contains(&format!("<span>{a}</span>")) && !page.contains("class=\"g\""),
+            "no split nodes"
+        );
+        assert!(
             page.contains(&format!(
-                r#"<span class="codetok"><span>{a}</span><span class="g">{b}</span></span>"#
+                r#"<button type="button" class="copy" data-copy="{bare}" data-label="Copy code">Copy code</button>"#
             )),
-            "the code is shown as one unbroken token"
+            "a Copy button copies the unbroken code"
         );
         assert!(
             !page.contains(&format!("{a}-{b}")),
@@ -461,6 +469,16 @@ async fn expired_code_is_rejected_everywhere() {
     )
     .await;
     assert_eq!(r.status(), StatusCode::BAD_REQUEST, "expired user code");
+    // Loading the page with that stale code is a normal page (200, so the
+    // browser console stays clean) that explains it and offers the form.
+    let r = person
+        .get(format!("{base}/device?code={}", user_code(&v)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK, "a page load is not an error");
+    let page = r.text().await.unwrap();
+    assert!(page.contains("That code is not valid") && page.contains(r#"name="code""#));
     let (s, e) = poll(&http, &base, &cid, &device_code(&v)).await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
     assert_eq!(e["error"], "expired_token");
@@ -885,6 +903,15 @@ async fn device_link_context_switch_account_and_live_bot_takeover() {
     assert!(page.contains("Signed in as"), "{page}");
     assert!(page.contains("atlas@example.com"));
     assert!(page.contains("Not you?") && page.contains("Sign out and use another email"));
+    assert!(
+        page.contains(r#"<button type="submit" class="linklike small">Sign out and use another email</button>"#)
+            && page.find("Not you?").unwrap()
+                < page.find("Sign out and use another email").unwrap()
+            && page.find("Sign out and use another email").unwrap()
+                < page.find(r#"name="action" value="approve""#).unwrap(),
+        "a small link under the Signed in as line, before Approve/Deny"
+    );
+    assert!(!page.contains(r#"ghost small">Sign out and use another email"#));
     assert!(page.contains("Create bot"), "plain-text default: {page}");
     assert!(page.contains("bigcode"));
     let csrf = hidden(&page, "csrf");

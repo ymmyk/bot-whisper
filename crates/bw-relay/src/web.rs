@@ -343,33 +343,43 @@ fn short(s: &str) -> String {
     s.chars().take(8).collect()
 }
 
-/// One doorbell as the owner may see it: type, destination host, masked
-/// secrets, status. The ntfy topic is masked and revealed on demand (this
-/// is the owner's page), together with the `listen` command; tokens are
-/// shown as an environment-variable placeholder, never their value.
+/// One wake-up (doorbell) as the owner may see it, in plain words: whether
+/// it is on, how it reaches the bot, when it last fired and whether it is
+/// healthy. No protocol names, status codes or event names up front. The
+/// secret address is revealed on demand (this is the owner's page), together
+/// with the `listen` command; tokens are shown as an environment-variable
+/// placeholder, never their value.
 fn doorbell_html(
     st: &OauthState,
-    label: &str,
+    scope: &str,
     cfg: &DoorbellConfig,
     status: &DoorbellStatus,
 ) -> String {
     let base = st.registry.bells.ntfy_base_url();
     let last = match status.last_delivery_at {
-        Some(t) => format!("last delivery {}", fmt_utc(t)),
-        None => "no delivery yet".to_string(),
+        Some(t) => time_html(t),
+        None => "never".to_string(),
+    };
+    let how = match &cfg.target {
+        DoorbellTarget::Ntfy { .. } => "a phone or desktop notification app",
+        DoorbellTarget::Webhook { .. } => "a web address you set up",
+        DoorbellTarget::WebPush { .. } => "browser notifications",
+        DoorbellTarget::Gotify { .. } => "Gotify",
+        DoorbellTarget::Pushover { .. } => "Pushover",
+    };
+    let health = match status.status.as_str() {
+        "failing" => " The last attempts failed; it will keep trying.",
+        "dead" => " It stopped after repeated failures. Ask your AI to set wake-ups up again.",
+        _ => "",
     };
     let secret = if cfg.target.has_secret() {
-        " · token set"
+        " An access token is saved for it."
     } else {
         ""
     };
     let mut html = format!(
-        r#"<p class="muted">{label}: <strong>{kind}</strong> to {host}{secret} · status <strong>{status}</strong> · {last} · events {events}"#,
-        label = esc(label),
-        kind = esc(cfg.target.kind()),
-        host = esc(&cfg.target.host(base)),
-        status = esc(&status.status),
-        events = esc(&cfg.events.join(", ")),
+        r##"<p class="muted"><strong>Wake-ups: on</strong> ({scope}), sent to {how}. Last wake-up sent: {last}.{health}{secret} <a href="#wakeups">What are wake-ups?</a>"##,
+        scope = esc(scope),
     );
     if let DoorbellTarget::Ntfy {
         server,
@@ -381,8 +391,7 @@ fn doorbell_html(
         let recipes = crate::doorbell::ntfy_recipes(&server, topic, token.is_some());
         let r = |k: &str| esc(recipes[k].as_str().unwrap_or_default());
         html.push_str(&format!(
-            r#"<br>topic <code>{masked}</code> <details><summary>reveal topic and wake commands</summary><p>Topic <code>{topic}</code> on {server}. ntfy topics are public by name: treat it like a password.</p><pre>{listen}</pre><pre>{curl}</pre><pre>{claude}</pre><pre>{cron}</pre><p>OpenClaw: <code>{openclaw}</code></p></details>"#,
-            masked = esc(&cfg.masked_topic().unwrap_or_default()),
+            r#"<br><details><summary>Show the secret address and the commands that use it</summary><p>The secret address is <code>{topic}</code> on {server}. Anyone who has it can send your bot a wake-up, so treat it like a password.</p><pre>{listen}</pre><pre>{curl}</pre><pre>{claude}</pre><pre>{cron}</pre><p>OpenClaw: <code>{openclaw}</code></p></details>"#,
             topic = esc(topic),
             server = esc(&server),
             listen = r("listen"),
@@ -395,6 +404,13 @@ fn doorbell_html(
     html.push_str("</p>");
     html
 }
+
+/// What a wake-up is, in plain words; the target of every "What are
+/// wake-ups?" link on the account page.
+const WAKEUPS_HELP: &str = r#"<h2 id="wakeups">What are wake-ups?</h2>
+<p class="muted">A wake-up is a small nudge that tells your bot a new message is waiting, so it does not have to keep checking. It never contains the message itself.</p>
+<p class="muted">With wake-ups off, your bot only sees new messages when it checks in. Nothing is lost: messages wait, encrypted, until it does.</p>
+<p class="muted">To turn them on, ask your AI to set up wake-ups for your bot. It picks where the nudge goes (a notification app on your phone or computer, or a web address your AI app listens on) and the result shows up here.</p>"#;
 
 /// A labelled id: shown in full (what Copy copies), with a Copy button and a one-line explanation.
 fn id_row(label: &str, value: &str, what: &str) -> String {
@@ -485,20 +501,20 @@ fn account_html(st: &OauthState, acct: &AccountRow, csrf: &str) -> String {
         };
         let mut bells = String::new();
         if let Ok(Some((cfg, status))) = db.bot_doorbell(&b.agent_id) {
-            bells.push_str(&doorbell_html(st, "Wake-ups on (all rooms)", &cfg, &status));
+            bells.push_str(&doorbell_html(st, "all rooms", &cfg, &status));
         }
         for s in bot_seats(acct, b, &seats) {
             if let Ok(Some((cfg, status))) = db.room_doorbell(&s.room_id, &s.member_id) {
                 bells.push_str(&doorbell_html(
                     st,
-                    &format!("Wake-ups on in room {}", short(&s.room_id)),
+                    &format!("room {}", short(&s.room_id)),
                     &cfg,
                     &status,
                 ));
             }
         }
         if bells.is_empty() {
-            bells = r#"<p class="muted">Wake-ups are not set up, so your bot only sees new messages when it checks in. <a href="https://botwhisper.si/#wakeups">How to turn wake-ups on</a></p>"#.into();
+            bells = r##"<p class="muted"><strong>Wake-ups are not set up.</strong> Your bot only sees new messages when it checks in. <a href="#wakeups">What are wake-ups?</a></p>"##.into();
         }
         let disconnect = if live.is_some() {
             format!(
@@ -510,8 +526,8 @@ fn account_html(st: &OauthState, acct: &AccountRow, csrf: &str) -> String {
             String::new()
         };
         let connect_cmd = format!(
-            "botwhisper connect --relay {base} --bot-name \"{}\"",
-            dq_escape(&b.name)
+            "botwhisper connect --relay {base} --bot-name {}",
+            sh_single_quote(&b.name)
         );
         let reconnect = if matches!(status, BotStatus::NotConnected) {
             format!(
@@ -637,6 +653,7 @@ Your bots here: {mine}</p></div>"#,
 <h2>Your bots</h2>
 <p class="muted">Each bot is its own member in rooms. A bot has one live connection at a time.</p><div data-autorefresh>{bots}</div>
 {rooms_section}{invites_section}
+{wakeups_help}
 <hr>
 <p class="muted">Messages are end-to-end encrypted and never stored, so there is no history here.</p>{refresh}"##,
         email = esc(&acct.email),
@@ -647,6 +664,7 @@ Your bots here: {mine}</p></div>"#,
             "Identifies your account to BotWhisper (share it only when asking for support). Not a password."
         ),
         csrf = esc(csrf),
+        wakeups_help = WAKEUPS_HELP,
         add_bot = add_bot_html(&base),
     )
 }
@@ -669,8 +687,9 @@ fn add_bot_html(base: &str) -> String {
 var n=document.getElementById('addbot-name'),p=document.getElementById('addbot-prompt'),b=document.getElementById('addbot-copy');
 if(!n||!p||!b)return;
 var base={base_js};
-n.addEventListener('input',function(){{var v=n.value.replace(/[\r\n]+/g,' ').replace(/[\\"$`]/g,'\\$&').trim()||'My AI';
-var t='Connect to BotWhisper as "'+v+'": follow the instructions at https://botwhisper.si/connect to install botwhisper, add it as an MCP server (botwhisper connect --relay '+base+' --bot-name "'+v+'"), and sign in. Call login and send me the link and code.';
+function sq(x){{return "'"+x.replace(/'/g,"'\\''")+"'"}}
+n.addEventListener('input',function(){{var v=n.value.replace(/[\r\n]+/g,' ').trim()||'My AI';
+var t='Connect to BotWhisper as "'+v+'": follow the instructions at https://botwhisper.si/connect to install botwhisper, add it as an MCP server (botwhisper connect --relay '+base+' --bot-name '+sq(v)+'), and sign in. Call login and send me the link and code.';
 p.textContent=t;b.setAttribute('data-copy',t)}});
 if(location.hash==='#add-bot'){{n.closest('details').open=true}}
 }})();
@@ -683,29 +702,22 @@ if(location.hash==='#add-bot'){{n.closest('details').open=true}}
     )
 }
 
-/// A name inside double quotes for a shell or for the prompt: `\`, `"`, `$`
-/// and backtick get a backslash, newlines become spaces. Quotes in a bot
-/// name are kept, never dropped.
-pub(crate) fn dq_escape(name: &str) -> String {
-    let mut out = String::with_capacity(name.len());
-    for c in name.chars() {
-        match c {
-            '\\' | '"' | '$' | '`' => {
-                out.push('\\');
-                out.push(c);
-            }
-            '\r' | '\n' => out.push(' '),
-            c => out.push(c),
-        }
-    }
-    out
+/// A name as ONE single-quoted shell word: `'` becomes `'\''`, newlines
+/// become spaces. Nothing else needs escaping inside single quotes (no `$`,
+/// backtick or backslash expansion), and the name is kept as typed.
+pub(crate) fn sh_single_quote(name: &str) -> String {
+    let flat = name.replace(['\r', '\n'], " ");
+    format!("'{}'", flat.trim().replace('\'', "'\\''"))
 }
 
-/// The prompt text for a bot name (escaped with `dq_escape`).
+/// The prompt text for a bot name. The prose shows the name exactly as the
+/// person typed it (quotes and all); only the command shell-quotes it.
 pub(crate) fn add_bot_prompt(base: &str, name: &str) -> String {
-    let name = dq_escape(name);
+    let name = name.replace(['\r', '\n'], " ");
+    let name = name.trim();
     format!(
-        "Connect to BotWhisper as \"{name}\": follow the instructions at https://botwhisper.si/connect to install botwhisper, add it as an MCP server (botwhisper connect --relay {base} --bot-name \"{name}\"), and sign in. Call login and send me the link and code."
+        "Connect to BotWhisper as \"{name}\": follow the instructions at https://botwhisper.si/connect to install botwhisper, add it as an MCP server (botwhisper connect --relay {base} --bot-name {quoted}), and sign in. Call login and send me the link and code.",
+        quoted = sh_single_quote(name),
     )
 }
 
@@ -959,14 +971,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bot_names_with_quotes_are_escaped_not_dropped() {
-        assert_eq!(
-            dq_escape(r#"Will "the bot" $HOME `x` a\b"#),
-            r#"Will \"the bot\" \$HOME \`x\` a\\b"#
+    fn prompt_prose_is_plain_and_only_the_command_is_shell_quoted() {
+        let p = add_bot_prompt("https://r", r#"He said "hi""#);
+        assert!(
+            p.starts_with(r#"Connect to BotWhisper as "He said "hi"": "#),
+            "{p}"
         );
-        assert_eq!(dq_escape("a\nb"), "a b");
-        let p = add_bot_prompt("https://r", r#"My "AI""#);
-        assert!(p.contains(r#"--bot-name "My \"AI\"""#), "{p}");
+        assert!(p.contains(r#"--bot-name 'He said "hi"')"#), "{p}");
+        assert!(!p.contains('\\'), "no backslash escapes: {p}");
+        let p = add_bot_prompt("https://r", "Will's \"bot\" $HOME `x` a\\b");
+        assert!(p.contains(r#"as "Will's "bot" $HOME `x` a\b": "#), "{p}");
+        assert!(
+            p.contains(r#"--bot-name 'Will'\''s "bot" $HOME `x` a\b')"#),
+            "{p}"
+        );
+        assert_eq!(sh_single_quote("a\nb"), "'a b'");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_quoted_name_survives_a_real_shell() {
+        for name in [r#"He said "hi""#, "Will's $HOME `id` \\ bot", "plain"] {
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!("printf %s {}", sh_single_quote(name)))
+                .output()
+                .unwrap();
+            assert_eq!(String::from_utf8(out.stdout).unwrap(), name);
+        }
     }
 
     #[test]

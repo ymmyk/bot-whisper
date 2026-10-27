@@ -58,7 +58,9 @@ pub fn next_steps(exe: &str, relay: &str, bot_name: Option<&str>, home: Option<&
          Any MCP app (JSON config):\n{indented}\n\n\
          Claude Code:\n  claude mcp add botwhisper{claude_env} -- {cmd}\n\n\
          Codex CLI:\n  codex mcp add botwhisper{codex_env} -- {cmd}\n\n\
-         Then your AI can create and join rooms. Wake-ups are optional: `botwhisper listen` follows this bot's doorbell."
+         {restart}\n\n\
+         Then your AI can create and join rooms. Wake-ups are optional: `botwhisper listen` follows this bot's doorbell.",
+        restart = crate::connect::upgrade::RESTART_LINE,
     )
 }
 
@@ -98,6 +100,17 @@ mod tests {
         assert!(t.contains(
             "codex mcp add botwhisper --env 'BOTWHISPER_HOME=/tmp/my home' -- /opt/bw/botwhisper connect"
         ));
+    }
+
+    #[test]
+    fn next_text_says_to_restart_the_ai_app_after_installing_or_upgrading() {
+        let t = next_steps("botwhisper", "https://relay.example", None, None);
+        assert!(
+            t.contains(
+                "After installing or upgrading, restart your AI app (or its MCP server) so it uses the new botwhisper."
+            ),
+            "{t}"
+        );
     }
 
     #[test]

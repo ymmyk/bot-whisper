@@ -27,8 +27,8 @@ use std::{
 use rmcp::{
     handler::server::{tool::ToolCallContext, wrapper::Parameters},
     model::{
-        CallToolRequestParams, CallToolResponse, CallToolResult, Implementation, ListToolsResult,
-        PaginatedRequestParams, ServerCapabilities, ServerConfig, Tool,
+        CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
+        ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerConfig, Tool,
     },
     service::{NotificationContext, Peer, RequestContext},
     tool, tool_router, ErrorData, RoleServer, ServerHandler,
@@ -43,6 +43,7 @@ use super::{
     relay::RelayClient,
     server::{respond, room_tools, Connector},
     store::{BotStore, CachedDoorbell, Tokens},
+    upgrade::UpgradeWatch,
 };
 
 /// Default and maximum seconds one `login_status` call waits.
@@ -171,6 +172,8 @@ struct Inner {
     /// Set while another `botwhisper connect` holds this bot's home: the
     /// plain sentence to show, instead of any sign-in advice.
     busy: StdMutex<Option<String>>,
+    /// Notices when the binary on disk was replaced after start.
+    upgrade: StdMutex<Arc<UpgradeWatch>>,
 }
 
 /// The stdio MCP server of `botwhisper connect`. Cheap to clone.
@@ -255,6 +258,7 @@ impl Gateway {
                 peer: StdMutex::new(None),
                 resume_note: StdMutex::new(None),
                 busy: StdMutex::new(None),
+                upgrade: StdMutex::new(Arc::new(UpgradeWatch::for_current_exe())),
             }),
         }
     }
@@ -264,6 +268,30 @@ impl Gateway {
         let g = Gateway::new(relay, config, None, None);
         *g.inner.connector.write().expect("lock") = Some(connector);
         g
+    }
+
+    /// Replace the binary watch (tests point it at a stand-in executable).
+    pub fn watch_binary(&self, watch: UpgradeWatch) {
+        *self.inner.upgrade.lock().expect("lock") = Arc::new(watch);
+    }
+
+    /// Add the one-line "restart your AI app" notice to a tool result when
+    /// the botwhisper binary on disk was replaced after this process started.
+    async fn with_upgrade_notice(&self, response: CallToolResponse) -> CallToolResponse {
+        let watch = self.inner.upgrade.lock().expect("lock").clone();
+        let Ok(Some(notice)) = tokio::task::spawn_blocking(move || watch.warning()).await else {
+            return response;
+        };
+        match response {
+            CallToolResponse::Complete(mut r) => {
+                r.content.push(ContentBlock::text(notice.clone()));
+                if let Some(Value::Object(m)) = r.structured_content.as_mut() {
+                    m.insert("notice".into(), Value::String(notice));
+                }
+                CallToolResponse::Complete(r)
+            }
+            other => other,
+        }
     }
 
     pub fn is_signed_in(&self) -> bool {
@@ -833,6 +861,21 @@ impl ServerHandler for Gateway {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
+        let response = self.call_tool_inner(request, context).await?;
+        Ok(self.with_upgrade_notice(response).await)
+    }
+
+    fn get_tool(&self, name: &str) -> Option<Tool> {
+        self.all_tools().tools.into_iter().find(|t| t.name == name)
+    }
+}
+
+impl Gateway {
+    async fn call_tool_inner(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, ErrorData> {
         self.remember_peer(&context.peer);
         let router = Self::tool_router();
         if router.has_route(&request.name) {
@@ -873,9 +916,5 @@ impl ServerHandler for Gateway {
                 Ok(not_signed_in(detail, note).into())
             }
         }
-    }
-
-    fn get_tool(&self, name: &str) -> Option<Tool> {
-        self.all_tools().tools.into_iter().find(|t| t.name == name)
     }
 }

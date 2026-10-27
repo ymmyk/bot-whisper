@@ -212,15 +212,20 @@ async fn confirm_link_signs_in_once_and_expired_links_fail() {
         page.contains(r#"<details class="addbot" open><summary class="btn">Add a bot</summary>"#),
         "Add a bot is expanded by default"
     );
-    // A bot name with quotes is escaped in the prompt, never dropped.
+    // A bot name with quotes: shown plainly in the prose, single-quoted
+    // (never backslash-escaped) in the command, in the page JS too.
     assert!(
-        page.contains(r#"replace(/[\\"$`]/g,'\\$&')"#),
-        "quotes escaped in the prompt"
+        page.contains(r#"function sq(x)"#) && page.contains(r#"--bot-name '+sq(v)+'),"#),
+        "the live prompt single-quotes only the command"
+    );
+    assert!(
+        !page.contains(r#"replace(/[\\"$`]/g"#),
+        "no backslash-escaping of the name in the prose"
     );
     assert!(page.contains(r#"id="addbot-copy""#) && page.contains(r#"id="addbot-name""#));
     assert!(page.contains("https://botwhisper.si/connect"));
     assert!(page.contains(&format!(
-        "add it as an MCP server (botwhisper connect --relay {base} --bot-name &quot;My AI&quot;)"
+        "add it as an MCP server (botwhisper connect --relay {base} --bot-name &#39;My AI&#39;)"
     )));
     assert!(page.contains("Call login and send me the link and code."));
     assert!(page.contains("navigator.clipboard"), "inline copy script");
@@ -422,20 +427,34 @@ async fn account_page_shows_only_own_data_and_disconnect_needs_csrf() {
     // Doorbells: type, host, masked topic and status, never secrets, paths
     // or other people's doorbells.
     assert!(
-        page.contains("Wake-ups on (all rooms)")
-            && page.contains("<strong>ntfy</strong> to ntfy.sh")
-    );
-    assert!(page.contains("token set") && page.contains("status <strong>never</strong>"));
-    assert!(
-        page.contains(&format!("<code>{}…</code>", &topic[..7])),
-        "masked topic"
+        page.contains("<strong>Wake-ups: on</strong> (all rooms), sent to a phone or desktop notification app. Last wake-up sent: never.")
+            && page.contains("An access token is saved for it.")
     );
     assert!(
-        page.contains("<details>") && page.contains(&format!("--topic {topic}")),
+        page.contains(r##"<a href="#wakeups">What are wake-ups?</a>"##)
+            && page.contains(r#"<h2 id="wakeups">"#)
+            && !page.contains("botwhisper.si/#wakeups"),
+        "the wake-ups link is a relay-hosted section"
+    );
+    // Plain words up front: no protocol names, status words or event names
+    // outside the collapsed reveal.
+    let visible = page
+        .split("<details>")
+        .map(|c| c.split_once("</details>").map_or(c, |(_, rest)| rest))
+        .collect::<String>();
+    for jargon in ["ntfy", "status <strong>", "events ", "message.new", "topic"] {
+        assert!(
+            !visible.contains(jargon),
+            "jargon {jargon:?} in the wake-ups line"
+        );
+    }
+    assert!(
+        page.contains("<details><summary>Show the secret address")
+            && page.contains(&format!("--topic {topic}")),
         "full topic only inside the reveal toggle"
     );
     assert!(page.contains("BOTWHISPER_NTFY_TOKEN=&lt;your ntfy token&gt;"));
-    assert!(page.contains("<strong>webhook</strong> to hooks.alice.example"));
+    assert!(page.contains("sent to a web address you set up"));
     for s in [
         "tk_alice_secret",
         "alice-hmac-secret",
@@ -1075,4 +1094,33 @@ async fn code_guesses_are_rate_limited_per_ip() {
     }
     assert_eq!(last, StatusCode::TOO_MANY_REQUESTS);
     relay.shutdown().await;
+}
+
+/// Console errors: browsers ask for /favicon.ico on every page. Pages carry
+/// an inline icon (a data URI, so no request) and /favicon.ico answers 204
+/// instead of a 404; the strict sign-in link page allows only same-origin
+/// images and carries no icon link.
+#[tokio::test]
+async fn pages_have_no_missing_favicon_to_log() {
+    let relay = TestRelay::start().await;
+    let base = relay.base();
+    let http = browser();
+    let r = http
+        .get(format!("{base}/favicon.ico"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::NO_CONTENT);
+    let page = http
+        .get(format!("{base}/signin"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        page.contains(r#"<link rel="icon" href="data:image/svg+xml,"#),
+        "{page}"
+    );
 }

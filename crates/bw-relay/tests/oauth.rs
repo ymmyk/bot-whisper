@@ -233,9 +233,13 @@ async fn sign_in_as(
     let (a, b) = code.split_at(4);
     assert!(
         html.contains(&format!(
-            "<span>{a}</span><span style=\"margin-left:14px\">{b}</span>"
+            "letter-spacing:5px;-webkit-user-select:all;user-select:all\">{code}</span>"
         )),
-        "{html}"
+        "one text node, spaced by letter-spacing: {html}"
+    );
+    assert!(
+        !html.contains(&format!("<span>{a}</span>")) && !html.contains(&format!("{a} {b}")),
+        "no split nodes: {html}"
     );
     let pending = hidden(&body, "pending");
     assert!(!body.contains(&code), "the page never shows the code");

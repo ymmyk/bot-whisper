@@ -38,9 +38,9 @@ use crate::{
     doorbell::now_unix,
     oauth::{
         app_name, clean_bot_name, clear_session_cookies, client_ip, client_label, code_token_html,
-        connector_only_message, cookie_value, csrf_from_headers, csrf_ok, current_account,
-        error_page, esc, is_connector_client, issue_tokens, no_store, oauth_error, page,
-        random_token, too_many, OauthState, TokenForm, OPERATOR_NOTICE, SCOPE_ROOMS,
+        connector_only_message, cookie_value, copy_button, csrf_from_headers, csrf_ok,
+        current_account, error_page, esc, is_connector_client, issue_tokens, no_store, oauth_error,
+        page, random_token, too_many, OauthState, TokenForm, OPERATOR_NOTICE, SCOPE_ROOMS,
         SESSION_COOKIE,
     },
 };
@@ -323,11 +323,12 @@ fn private(mut r: Response) -> Response {
     r
 }
 
-/// "Signed in as X. Not you? Sign out and use another email" (signs out, back to /device
+/// "Signed in as X. Not you?" with a small "Sign out and use another email" link under it (signs out, back to /device
 /// with the code still attached).
 fn signed_in_line(account: &AccountRow, csrf: &str, code: Option<&str>) -> String {
     format!(
-        r#"<p class="muted">Signed in as <strong>{email}</strong>. Not you? <form class="inline" method="post" action="/device/switch"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="code" value="{code}"><button type="submit" class="ghost small">Sign out and use another email</button></form></p>"#,
+        r#"<div class="muted signedin"><p>Signed in as <strong>{email}</strong>. Not you?</p>
+<form class="inline" method="post" action="/device/switch"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="code" value="{code}"><button type="submit" class="linklike small">Sign out and use another email</button></form></div>"#,
         email = esc(&account.email),
         csrf = esc(csrf),
         code = esc(code.unwrap_or("")),
@@ -452,7 +453,7 @@ fn approval_page(
         &format!(
             r#"<h1>Connect your bot</h1>
 {signed}
-<span class="bigcode">{token}</span>
+<div class="bigcode">{token}<br>{copy}</div>
 <p style="text-align:center" class="muted">Make sure this is the code your AI just showed you.</p>
 <p><strong>{client}</strong> asked {age} to connect. {plan}</p>
 {err}
@@ -464,6 +465,7 @@ fn approval_page(
 {notice}"#,
             signed = signed_in_line(account, csrf, Some(code)),
             token = code_token_html(code),
+            copy = copy_button(code, "Copy code"),
             client = client_label(client),
             age = age_text(row.created_at, now),
             code = esc(code),
@@ -577,7 +579,15 @@ pub async fn device_get(
                 Some((c, (row, client))) => {
                     approval_page(&st, &account, &row, &client, &c, &csrf, None)
                 }
-                None => bad_code_page(&st, &account, &csrf),
+                // A page load is not an error: a stale or mistyped code shows the
+                // entry form with the message and a 200, so the browser logs no
+                // "Failed to load resource" in its console. (The form POST keeps
+                // its 400.)
+                None => {
+                    let mut r = bad_code_page(&st, &account, &csrf);
+                    *r.status_mut() = StatusCode::OK;
+                    r
+                }
             }
         }
     };

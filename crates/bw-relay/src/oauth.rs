@@ -179,7 +179,7 @@ pub(crate) fn esc(s: &str) -> String {
 pub(crate) fn page(title: &str, body: &str) -> Html<String> {
     Html(format!(
         r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{t} · BotWhisper</title><meta name="robots" content="noindex">
+<title>{t} · BotWhisper</title><meta name="robots" content="noindex"><link rel="icon" href="{icon}">
 <style>
 body{{margin:0;background:#f7f6fc;color:#1b1838;font:16px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}}
 main{{max-width:30rem;margin:8vh auto;padding:0 20px}}
@@ -196,14 +196,14 @@ button.ghost{{background:#fff;color:#1b1838;border-color:#c9c5e4}}
 .ok .x{{position:absolute;top:6px;right:8px;background:none;border:0;color:inherit;font-size:1.3rem;line-height:1;cursor:pointer;padding:4px 8px;width:auto}}
 .err{{border:1px solid #f0a0a0;background:#fff0f0;color:#7a1f1f;border-radius:12px;padding:12px 14px;margin-bottom:14px}}
 code{{background:#efedf9;padding:.08em .35em;border-radius:6px;font-size:.9em}}
-.codetok{{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-weight:650;letter-spacing:.05em;-webkit-user-select:all;user-select:all}}
-.codetok .g{{margin-left:.6em}}
+.codetok{{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-weight:650;letter-spacing:.14em;-webkit-user-select:all;user-select:all}}
+.bigcode .copy{{margin-top:10px}}
 hr{{border:0;border-top:1px solid #e2dff2;margin:22px 0}}
 .row{{border-top:1px solid #e2dff2;padding:8px 0}}
 .prompt{{display:block;padding:10px 12px;border:1px solid #e2dff2;border-radius:8px;background:#f6f5fb;white-space:pre-wrap;word-break:break-word;user-select:all}}
 label.pick{{font-weight:400;border:1px solid #e2dff2;border-radius:10px;padding:10px 12px;margin:8px 0;cursor:pointer}}
 label.pick input{{margin-right:8px}} .warn{{color:#6b4510}}
-form.inline{{display:inline}}
+form.inline{{display:inline}} .signedin p{{margin:0}} button.linklike.small{{font-size:.88rem;padding:0;margin:2px 0 0}}
 .bigcode{{display:block;text-align:center;font-size:2rem;margin:14px 0;padding:14px;border:1px solid #e2dff2;border-radius:12px;background:#f6f5fb}}
 .nav{{display:flex;gap:16px;align-items:center;flex-wrap:wrap;margin:0 0 16px;font-size:.93rem}} .nav form{{display:inline;margin:0}} .nav a{{font-weight:600}}
 button.linklike{{background:none;border:0;color:#5b4ee6;text-decoration:underline;padding:0;margin:0;font-weight:400;font-size:inherit;cursor:pointer}}
@@ -228,8 +228,23 @@ function ok(){{b.textContent='Copied';setTimeout(function(){{b.textContent=o}},1
 if(navigator.clipboard&&navigator.clipboard.writeText){{navigator.clipboard.writeText(t).then(ok,function(){{fb(t,b);ok()}})}}else{{fb(t,b);ok()}}}});
 document.querySelectorAll('time[datetime]').forEach(function(el){{var d=new Date(el.getAttribute('datetime'));if(isNaN(d))return;el.title=el.textContent;el.textContent=d.toLocaleString([],{{year:'numeric',month:'short',day:'numeric',hour:'numeric',minute:'2-digit',timeZoneName:'short'}})}});}})();</script></body></html>"#,
         t = esc(title),
+        icon = FAVICON_DATA_URI,
         b = body
     ))
+}
+
+/// A tiny inline icon, so browsers never request /favicon.ico (a 404 there is
+/// a console error on every page).
+pub(crate) const FAVICON_DATA_URI: &str = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%235b4ee6'/%3E%3Ccircle cx='16' cy='16' r='6' fill='white'/%3E%3C/svg%3E";
+
+/// `GET /favicon.ico`: nothing to show; 204 so no error is logged.
+pub(crate) async fn favicon() -> Response {
+    let mut r = StatusCode::NO_CONTENT.into_response();
+    r.headers_mut().insert(
+        header::CACHE_CONTROL,
+        "public, max-age=86400".parse().expect("header"),
+    );
+    r
 }
 
 /// `page` without its inline script, for pages served under a CSP that
@@ -239,6 +254,9 @@ pub(crate) fn page_noscript(title: &str, body: &str) -> Html<String> {
     if let (Some(a), Some(b)) = (h.find("<script>"), h.find("</script>")) {
         h.replace_range(a..b + "</script>".len(), "");
     }
+    // Nor an icon link: /favicon.ico (a 204) is the allowed same-origin one.
+    let icon = format!(r#"<link rel="icon" href="{FAVICON_DATA_URI}">"#);
+    h = h.replace(&icon, "");
     Html(h)
 }
 
@@ -1173,26 +1191,19 @@ fn new_login_code() -> String {
     format!("{n:0width$}", width = LOGIN_CODE_DIGITS)
 }
 
-/// A code shown as ONE unbroken token, so a double-click selects (and a copy
-/// gives) the whole bare code. The split in the middle is visual only: the
-/// second half sits in its own span with a left margin; the text has no
-/// space and no hyphen.
+/// A code shown as ONE text node, so a double-click selects (and a copy
+/// gives) the whole bare code. The airy look is `letter-spacing` only: no
+/// space, no hyphen, no second element inside the token.
 pub(crate) fn code_token_html(code: &str) -> String {
-    let (a, b) = code.split_at(code.len() / 2);
-    format!(
-        r#"<span class="codetok"><span>{}</span><span class="g">{}</span></span>"#,
-        esc(a),
-        esc(b)
-    )
+    format!(r#"<span class="codetok">{}</span>"#, esc(code))
 }
 
-/// The same for HTML email, where there is no stylesheet: inline styles.
+/// The same for HTML email, where there is no stylesheet: inline styles,
+/// still one text node.
 pub(crate) fn code_token_email_html(code: &str) -> String {
-    let (a, b) = code.split_at(code.len() / 2);
     format!(
-        r#"<span style="font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:26px;font-weight:700;letter-spacing:1px;-webkit-user-select:all;user-select:all"><span>{}</span><span style="margin-left:14px">{}</span></span>"#,
-        esc(a),
-        esc(b)
+        r#"<span style="font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:26px;font-weight:700;letter-spacing:5px;-webkit-user-select:all;user-select:all">{}</span>"#,
+        esc(code)
     )
 }
 
@@ -1638,7 +1649,7 @@ fn link_page_headers(mut r: Response) -> Response {
     );
     h.insert(
         header::CONTENT_SECURITY_POLICY,
-        "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
+        "default-src 'none'; style-src 'unsafe-inline'; img-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
             .parse()
             .expect("header"),
     );

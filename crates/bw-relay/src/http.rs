@@ -102,6 +102,7 @@ pub fn router(
 
     Router::new()
         .route("/health", get(health))
+        .route("/favicon.ico", get(oauth::favicon))
         .route("/push/vapid-public-key", get(vapid_public_key))
         .route("/i/{invite}", get(invite_page))
         .with_state(state)

@@ -55,14 +55,13 @@ fn hidden(page: &str, name: &str) -> String {
     page[start..start + page[start..].find('"').unwrap()].to_string()
 }
 
-/// The page shows the code as one unbroken token: the two halves in
-/// adjacent spans, no space or hyphen between them in the text.
+/// The page shows the code as ONE text node (a double-click selects all of
+/// it): no inner spans, no space or hyphen; the gap is letter-spacing.
 fn shows_code(page: &str, user_code: &str) -> bool {
     let bare = user_code.replace('-', "");
-    let (a, b) = bare.split_at(4);
-    page.contains(&format!(
-        r#"<span class="codetok"><span>{a}</span><span class="g">{b}</span></span>"#
-    ))
+    let (a, _) = bare.split_at(4);
+    page.contains(&format!(r#"<span class="codetok">{bare}</span>"#))
+        && !page.contains(&format!("<span>{a}</span>"))
 }
 
 fn cfg() -> RelayConfig {
@@ -540,4 +539,47 @@ async fn a_login_finished_elsewhere_is_picked_up_on_the_next_call() {
     })
     .await
     .expect("the test must not hang");
+}
+
+/// A connector started before an upgrade says so in tool results: one extra
+/// line "botwhisper was upgraded; restart your AI app to use vX" once the
+/// binary on disk changed, and nothing before that.
+#[cfg(unix)]
+#[tokio::test]
+async fn running_connector_notices_its_binary_was_upgraded() {
+    use botwhisper::connect::upgrade::UpgradeWatch;
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tmp_dir("upgrade");
+    let exe = dir.join("botwhisper");
+    let write = |version: &str| {
+        std::fs::write(&exe, format!("#!/bin/sh\necho botwhisper {version}\n")).unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    write("0.0.1-old");
+    let gw = Gateway::new("http://127.0.0.1:1", dir.join("home"), None, None);
+    gw.watch_binary(UpgradeWatch::for_path(Some(exe.clone()), "0.0.1-old"));
+    let (svc, _) = serve(gw).await;
+
+    let r = raw(&svc, "whoami", json!({})).await;
+    assert_eq!(r.content.len(), 1, "no notice before the upgrade: {r:?}");
+    assert!(r.structured_content.unwrap().get("notice").is_none());
+
+    // The upgrade replaces the file (newer modification time, new version).
+    write("9.9.9-new");
+    std::fs::File::options()
+        .write(true)
+        .open(&exe)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() + Duration::from_secs(120))
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(4)).await; // the stat is rate limited
+    let r = raw(&svc, "whoami", json!({})).await;
+    let line = "botwhisper was upgraded; restart your AI app to use v9.9.9-new";
+    assert_eq!(r.content.len(), 2, "{r:?}");
+    assert_eq!(r.content[1].as_text().unwrap().text, line);
+    assert_eq!(r.structured_content.unwrap()["notice"], line);
+    // Room tools get it too, signed out or not.
+    let r = raw(&svc, "list_rooms", json!({})).await;
+    assert_eq!(r.structured_content.unwrap()["notice"], line);
 }
