@@ -521,7 +521,9 @@ async fn a_login_finished_elsewhere_is_picked_up_on_the_next_call() {
             "{msg}"
         );
         assert!(
-            msg.starts_with("another botwhisper connect is running for this home (pid ")
+            msg.starts_with("another botwhisper connect is running for this home (")
+                && msg.contains(", bot \"")
+                && msg.contains(&format!(", pid {})", std::process::id()))
                 && msg.ends_with("or use a different BOTWHISPER_HOME")
                 && !msg.contains("stored sign-in")
                 && !msg.contains("login"),

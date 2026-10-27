@@ -108,6 +108,7 @@ fn join_failure(detail: &str) -> String {
 pub(crate) fn unreadable_view(
     has_group: bool,
     relay_state: &str,
+    owner: bool,
 ) -> Option<(&'static str, &'static str)> {
     if has_group {
         return None;
@@ -117,9 +118,15 @@ pub(crate) fn unreadable_view(
             "pending",
             "Waiting to be added. Keep calling wait_for_message; if nothing arrives, ask the room owner for a fresh invite.",
         )),
+        _ if owner => Some(("needs_rejoin", OWNER_REJOIN_HINT)),
         _ => Some(("needs_rejoin", REJOIN_HINT)),
     }
 }
+
+/// The owner cannot get a fresh invite from anyone: the room's keys lived
+/// only on the computer that created it.
+pub(crate) const OWNER_REJOIN_HINT: &str =
+    "This room's keys weren't saved on this computer. Create a new room and invite everyone again.";
 
 /// How to recover a room this connector has no keys for.
 pub(crate) const REJOIN_HINT: &str = "This connector has no keys for this room (its saved state is missing). Ask the room owner for a fresh invite and call join_room with it.";
@@ -393,7 +400,24 @@ impl Connector {
         // One connector per bot: take the lock before touching the key
         // material or publishing anything.
         let lock = match &store {
-            Some(s) => Some(Arc::new(ConfigLock::acquire(&s.dir)?)),
+            Some(s) => {
+                // <home>/<relay host>/<bot>: the home is two levels up.
+                let home = s
+                    .dir
+                    .parent()
+                    .and_then(|p| p.parent())
+                    .map(std::path::Path::to_path_buf)
+                    .unwrap_or_else(|| s.dir.clone());
+                let bot = who["bot_name"]
+                    .as_str()
+                    .filter(|n| !n.trim().is_empty())
+                    .unwrap_or(&agent_id)
+                    .to_string();
+                Some(Arc::new(ConfigLock::acquire(
+                    &s.dir,
+                    &super::lock::LockWho { home, bot },
+                )?))
+            }
             None => None,
         };
         let identity = match &store {
@@ -517,22 +541,26 @@ impl Connector {
     /// The error for acting on a room we hold no group for. Points at
     /// `wait_for_message` only when a Welcome is actually pending.
     async fn no_group_error(&self, room_id: &str) -> anyhow::Error {
-        let relay_state = match self
+        let (relay_state, owner) = match self
             .relay
             .call("get_status", json!({ "room_id": room_id }))
             .await
         {
-            Ok(v) => v["you"]["e2e_state"]
-                .as_str()
-                .unwrap_or("active")
-                .to_string(),
-            Err(_) => "active".to_string(),
+            Ok(v) => (
+                v["you"]["e2e_state"]
+                    .as_str()
+                    .unwrap_or("active")
+                    .to_string(),
+                v["you"]["role"] == "owner",
+            ),
+            Err(_) => ("active".to_string(), false),
         };
-        match unreadable_view(false, &relay_state) {
+        match unreadable_view(false, &relay_state, owner) {
             Some(("pending", _)) => anyhow::anyhow!(
                 "you are not in this room's group yet: waiting for the owner to add you; call wait_for_message"
             ),
-            _ => anyhow::anyhow!("{REJOIN_HINT}"),
+            Some((_, hint)) => anyhow::anyhow!("{hint}"),
+            None => anyhow::anyhow!("{REJOIN_HINT}"),
         }
     }
 
@@ -919,7 +947,9 @@ impl Connector {
                 continue;
             };
             let relay_state = r["e2e_state"].as_str().unwrap_or("active").to_string();
-            let Some((state, hint)) = unreadable_view(st.rooms.contains_key(&id), &relay_state)
+            let owner = r["role"] == "owner";
+            let Some((state, hint)) =
+                unreadable_view(st.rooms.contains_key(&id), &relay_state, owner)
             else {
                 continue;
             };
@@ -1400,7 +1430,8 @@ impl Connector {
                             .as_str()
                             .unwrap_or("active")
                             .to_string();
-                        v["local"] = match unreadable_view(false, &relay_state) {
+                        let owner = v["you"]["role"] == "owner";
+                        v["local"] = match unreadable_view(false, &relay_state, owner) {
                             Some(_) if st.pending.contains_key(r) => {
                                 json!({ "state": "pending_join" })
                             }
@@ -1903,22 +1934,29 @@ impl ServerHandler for Connector {
 
 #[cfg(test)]
 mod unreadable_tests {
-    use super::{unreadable_view, REJOIN_HINT};
+    use super::{unreadable_view, OWNER_REJOIN_HINT, REJOIN_HINT};
 
     #[test]
     fn rooms_without_a_group_are_never_active() {
         // Readable: nothing to say.
-        assert_eq!(unreadable_view(true, "active"), None);
+        assert_eq!(unreadable_view(true, "active", false), None);
+        assert_eq!(unreadable_view(true, "active", true), None);
         // Relay says active but this connector has no keys: rejoin, and the
         // hint never sends the agent to wait_for_message.
-        let (s, h) = unreadable_view(false, "active").unwrap();
+        let (s, h) = unreadable_view(false, "active", false).unwrap();
         assert_eq!(s, "needs_rejoin");
         assert_eq!(h, REJOIN_HINT);
         assert!(h.contains("fresh invite") && h.contains("join_room"));
         assert!(!h.contains("wait_for_message"));
+        // The owner cannot ask anyone for an invite: create a new room.
+        let (s, h) = unreadable_view(false, "active", true).unwrap();
+        assert_eq!(s, "needs_rejoin");
+        assert_eq!(h, OWNER_REJOIN_HINT);
+        assert!(h.contains("Create a new room") && !h.contains("join_room"));
+        assert!(!h.contains("wait_for_message"));
         // A Welcome that is really pending is a legitimate wait.
         for st in ["pending", "welcoming"] {
-            let (s, h) = unreadable_view(false, st).unwrap();
+            let (s, h) = unreadable_view(false, st, false).unwrap();
             assert_eq!(s, "pending");
             assert!(h.contains("wait_for_message"));
         }

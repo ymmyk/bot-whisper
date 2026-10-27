@@ -930,7 +930,7 @@ async fn restart_keeps_rooms_working_for_owner_and_member() {
 /// the room is `needs_rejoin`, unreadable, and every error says how to
 /// recover: a fresh invite and join_room, never wait_for_message.
 #[tokio::test]
-async fn a_room_without_saved_keys_needs_a_rejoin() {
+async fn a_room_without_saved_keys_needs_a_rejoin_with_a_role_aware_hint() {
     tokio::time::timeout(Duration::from_secs(90), async {
         let relay = TestRelay::start().await;
         let dir = tmp_dir("unreadable");
@@ -1020,6 +1020,48 @@ async fn a_room_without_saved_keys_needs_a_rejoin() {
             "{sent}"
         );
         assert!(!msg.contains("wait_for_message"), "{sent}");
+
+        // The OWNER who lost the keys cannot ask anyone for an invite: the
+        // hint says to create a new room, in list_rooms, get_status,
+        // wait_for_message and send_message alike.
+        stop(alice).await;
+        let alice2 = serve_connector(
+            Connector::new(client(TOKENS[0]), Some(store("alice-empty")), None)
+                .await
+                .unwrap(),
+        )
+        .await;
+        let rooms = call(&alice2, "list_rooms", json!({})).await;
+        let r = &rooms["rooms"][0];
+        assert_eq!(r["e2e_state"], "needs_rejoin", "{rooms}");
+        let hint = r["hint"].as_str().unwrap();
+        let owner_ok = |t: &str| {
+            t.contains("Create a new room and invite everyone again")
+                && t.contains("weren't saved on this computer")
+                && !t.contains("join_room")
+                && !t.contains("fresh invite")
+                && !t.contains("wait_for_message")
+        };
+        assert!(owner_ok(hint), "{rooms}");
+        let st = call(&alice2, "get_status", json!({ "room_id": room })).await;
+        assert!(owner_ok(st["local"]["hint"].as_str().unwrap()), "{st}");
+        let w = call(
+            &alice2,
+            "wait_for_message",
+            json!({ "room_id": room, "timeout_s": 3 }),
+        )
+        .await;
+        assert!(owner_ok(w["warnings"][0].as_str().unwrap()), "{w}");
+        let sent = call(
+            &alice2,
+            "send_message",
+            json!({ "room_id": room, "text": "x" }),
+        )
+        .await;
+        assert!(
+            owner_ok(sent["message"].as_str().unwrap_or_default()),
+            "{sent}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
         relay.shutdown().await;
     })
