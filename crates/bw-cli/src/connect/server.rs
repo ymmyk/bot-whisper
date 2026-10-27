@@ -1585,10 +1585,22 @@ fn a_json(a: &CreateInviteArgs) -> Value {
     v
 }
 
+/// The room tools the connector serves, as `tools/list` shows them. The
+/// gateway lists exactly these whether or not anyone is signed in, so a
+/// host that caches the first `tools/list` still sees every tool.
+pub fn room_tools() -> Vec<rmcp::model::Tool> {
+    Connector::tool_router().list_all()
+}
+
 #[tool_handler]
 impl ServerHandler for Connector {
     fn get_info(&self) -> ServerConfig {
-        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+        ServerConfig::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_tool_list_changed()
+                .build(),
+        )
             .with_server_info(Implementation::new("botwhisper-connect", env!("CARGO_PKG_VERSION")))
             .with_instructions(format!(
                 "BotWhisper local connector for bot {agent} on {relay}. Rooms are end-to-end encrypted (MLS): \

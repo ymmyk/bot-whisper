@@ -1,7 +1,8 @@
-//! `botwhisper connect` signed out: the stdio connector starts with only
-//! `login`, `login_status` and `whoami`, gates everything else with
-//! NOT_SIGNED_IN, and switches to the room tools (with a tools/list_changed
-//! notification) once the person approves the device login in a browser.
+//! `botwhisper connect` signed out: the stdio connector lists its whole tool
+//! set from the start (identical signed in or out), answers the room tools
+//! with NOT_SIGNED_IN until the person approves the device login in a
+//! browser, and then simply serves them, with no polling by the agent (and
+//! a tools/list_changed notification in case a host listens).
 //! Mail goes to the in-memory capture mailer; nothing is really sent.
 
 mod common;
@@ -54,6 +55,16 @@ fn hidden(page: &str, name: &str) -> String {
     page[start..start + page[start..].find('"').unwrap()].to_string()
 }
 
+/// The page shows the code as one unbroken token: the two halves in
+/// adjacent spans, no space or hyphen between them in the text.
+fn shows_code(page: &str, user_code: &str) -> bool {
+    let bare = user_code.replace('-', "");
+    let (a, b) = bare.split_at(4);
+    page.contains(&format!(
+        r#"<span class="codetok"><span>{a}</span><span class="g">{b}</span></span>"#
+    ))
+}
+
 fn cfg() -> RelayConfig {
     RelayConfig {
         connector_only: true,
@@ -89,6 +100,10 @@ async fn call(svc: &RunningService<RoleClient, Watcher>, tool: &str, args: Value
     let r = raw(svc, tool, args).await;
     assert_ne!(r.is_error, Some(true), "{tool}: {r:?}");
     r.structured_content.clone().unwrap_or(Value::Null)
+}
+
+async fn gw_signed_in(svc: &RunningService<RoleClient, Watcher>) -> bool {
+    call(svc, "whoami", json!({})).await["signed_in"] == true
 }
 
 async fn tool_names(svc: &RunningService<RoleClient, Watcher>) -> Vec<String> {
@@ -153,7 +168,10 @@ async fn person(relay: &TestRelay, link: &str, user_code: &str, action: &str, bo
         .await
         .unwrap();
     assert!(page.contains("botwhisper connect ("), "client shown");
-    assert!(page.contains(user_code));
+    assert!(
+        shows_code(&page, user_code),
+        "the code is shown as one token"
+    );
     let csrf = hidden(&page, "csrf");
     let r = http
         .post(format!("{base}/device"))
@@ -189,8 +207,27 @@ async fn gated_inner() {
     assert!(!gw.is_signed_in());
     let (svc, changed) = serve(gw).await;
 
-    // Signed out: three tools, every other call is NOT_SIGNED_IN.
-    assert_eq!(tool_names(&svc).await, ["login", "login_status", "whoami"]);
+    // initialize advertises list_changed; signed out the whole tool set is
+    // listed (a host that caches the first list still sees every tool).
+    let caps = svc.peer_info().expect("initialized").capabilities.clone();
+    assert_eq!(caps.tools.as_ref().and_then(|t| t.list_changed), Some(true));
+    let signed_out_list = serde_json::to_value(svc.list_all_tools().await.unwrap()).unwrap();
+    let signed_out_names = tool_names(&svc).await;
+    for t in [
+        "login",
+        "login_status",
+        "whoami",
+        "create_room",
+        "send_message",
+        "join_room",
+    ] {
+        assert!(
+            signed_out_names.iter().any(|n| n == t),
+            "{t} in {signed_out_names:?}"
+        );
+    }
+    assert!(signed_out_names.len() > 20, "{signed_out_names:?}");
+    // Every room call is NOT_SIGNED_IN, pointing at `login`.
     for tool in ["create_room", "send_message", "list_rooms"] {
         let r = raw(&svc, tool, json!({})).await;
         assert_eq!(r.is_error, Some(true), "{tool}");
@@ -219,40 +256,44 @@ async fn gated_inner() {
     let again = call(&svc, "login", json!({})).await;
     assert_eq!(again["user_code"], l["user_code"]);
 
-    // Still pending (a short wait), still gated.
+    // Still pending (a short wait), still gated, same tool list.
     let p = call(&svc, "login_status", json!({ "wait_s": 1 })).await;
     assert_eq!(p["status"], "pending");
-    assert_eq!(tool_names(&svc).await, ["login", "login_status", "whoami"]);
+    assert_eq!(tool_names(&svc).await, signed_out_names);
     assert_eq!(changed.load(Ordering::SeqCst), 0);
+    // A gated call while the grant is pending waits for it a little, then
+    // says NOT_SIGNED_IN and repeats the link and code.
+    let r = raw(&svc, "list_rooms", json!({})).await;
+    assert_eq!(r.is_error, Some(true));
+    let v = r.structured_content.unwrap();
+    assert_eq!(v["error"], "NOT_SIGNED_IN");
+    assert_eq!(v["login"]["user_code"], l["user_code"]);
+    assert!(v["message"]
+        .as_str()
+        .unwrap()
+        .contains("call this tool again"));
 
-    // The person approves in a browser; login_status picks it up.
+    // The person approves in a browser. The agent does NOT call
+    // login_status and does NOT re-list tools: the very next room call works.
     person(&relay, &url, &code, "approve", "Gateway Bot").await;
-    let s = call(&svc, "login_status", json!({ "wait_s": 20 })).await;
+    let room = call(&svc, "create_room", json!({ "title": "after login" })).await;
+    assert_eq!(room["encryption"], "mls (end-to-end)");
+    assert!(gw_signed_in(&svc).await);
+    // The tool list is byte-for-byte what it was signed out.
+    assert_eq!(
+        serde_json::to_value(svc.list_all_tools().await.unwrap()).unwrap(),
+        signed_out_list
+    );
+    // login_status stays as an optional check.
+    let s = call(&svc, "login_status", json!({ "wait_s": 5 })).await;
     assert_eq!(s["status"], "signed_in", "{s}");
     assert_eq!(s["bot_name"], "Gateway Bot");
     let agent_id = s["agent_id"].as_str().unwrap().to_string();
-
-    // The room tools are on, and the client was told the list changed.
-    let names = tool_names(&svc).await;
-    for t in [
-        "login",
-        "login_status",
-        "whoami",
-        "create_room",
-        "send_message",
-        "join_room",
-    ] {
-        assert!(names.iter().any(|n| n == t), "{t} in {names:?}");
-    }
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(
         changed.load(Ordering::SeqCst) >= 1,
-        "tools/list_changed sent"
+        "tools/list_changed sent on sign-in"
     );
-    let who = call(&svc, "whoami", json!({})).await;
-    assert_eq!(who["signed_in"], true);
-    let room = call(&svc, "create_room", json!({ "title": "after login" })).await;
-    assert_eq!(room["encryption"], "mls (end-to-end)");
     // Tokens stored like the browser login, keys made and published.
     let store = BotStore::current(&config, &relay.base()).expect("current bot");
     assert!(store.load_tokens().is_some());
@@ -294,7 +335,7 @@ async fn denied_inner() {
     .await;
     let s = call(&svc, "login_status", json!({ "wait_s": 20 })).await;
     assert_eq!(s["status"], "denied", "{s}");
-    assert_eq!(tool_names(&svc).await, ["login", "login_status", "whoami"]);
+    assert!(tool_names(&svc).await.iter().any(|n| n == "create_room"));
     let r = raw(&svc, "create_room", json!({})).await;
     assert_eq!(r.structured_content.unwrap()["error"], "NOT_SIGNED_IN");
     assert_eq!(changed.load(Ordering::SeqCst), 0);
@@ -323,6 +364,140 @@ async fn expired_login_is_reported() {
         let again = call(&svc, "login", json!({})).await;
         assert_eq!(again["status"], "pending", "a new code after expiry");
         svc.cancel().await.ok();
+        let _ = std::fs::remove_dir_all(&config);
+        relay.shutdown().await;
+    })
+    .await
+    .expect("the test must not hang");
+}
+
+#[tokio::test]
+async fn a_pending_login_survives_a_connector_restart() {
+    tokio::time::timeout(Duration::from_secs(90), async {
+        let relay = TestRelay::start_with(cfg()).await;
+        let config = tmp_dir("restart");
+        let (svc, _) = serve(Gateway::new(
+            &relay.base(),
+            config.clone(),
+            None,
+            Some("Phoenix".into()),
+        ))
+        .await;
+        let l = call(&svc, "login", json!({})).await;
+        let saved = std::fs::read_dir(&config)
+            .unwrap()
+            .flat_map(|d| std::fs::read_dir(d.unwrap().path()).unwrap())
+            .map(|f| f.unwrap().path())
+            .find(|p| p.file_name().unwrap() == "pending-login.json")
+            .expect("the pending login is saved");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&saved).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "the saved device code is private");
+        }
+        // The connector goes away (the host restarts it) ...
+        svc.cancel().await.ok();
+        // ... and the new process resumes the same grant, same code.
+        let gw2 = Gateway::new(&relay.base(), config.clone(), None, Some("Phoenix".into()));
+        assert!(gw2.resume_pending_login().await);
+        let (svc2, _) = serve(gw2).await;
+        let again = call(&svc2, "login", json!({})).await;
+        assert_eq!(again["status"], "pending");
+        assert_eq!(again["user_code"], l["user_code"]);
+        // The person approves; the next room call just works (background poll).
+        person(
+            &relay,
+            l["verification_url"].as_str().unwrap(),
+            l["user_code"].as_str().unwrap(),
+            "approve",
+            "Phoenix",
+        )
+        .await;
+        let room = call(&svc2, "create_room", json!({ "title": "resumed" })).await;
+        assert_eq!(room["encryption"], "mls (end-to-end)");
+        assert!(!saved.exists(), "the saved grant is removed once used");
+        svc2.cancel().await.ok();
+        let _ = std::fs::remove_dir_all(&config);
+        relay.shutdown().await;
+    })
+    .await
+    .expect("the test must not hang");
+}
+
+#[tokio::test]
+async fn an_expired_saved_login_is_dropped_with_a_clear_message() {
+    let config = tmp_dir("stale");
+    let gw = Gateway::new("http://127.0.0.1:9", config.clone(), None, None);
+    let host = botwhisper::connect::store::relay_host("http://127.0.0.1:9");
+    let dir = config.join(host.replace(':', "_"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("pending-login.json");
+    std::fs::write(
+        &path,
+        json!({"relay": "http://127.0.0.1:9", "client_id": "c", "device_code": "d",
+          "user_code": "ABCD-2346", "verification_uri": "u", "verification_uri_complete": "u",
+          "interval": 5, "expires_at": 1})
+        .to_string(),
+    )
+    .unwrap();
+    if !path.exists() {
+        return;
+    }
+    assert!(!gw.resume_pending_login().await);
+    assert!(!path.exists(), "the stale grant file is deleted");
+    let (svc, _) = serve(gw).await;
+    let r = raw(&svc, "create_room", json!({})).await;
+    let v = r.structured_content.unwrap();
+    assert_eq!(v["error"], "NOT_SIGNED_IN");
+    assert!(v["message"].as_str().unwrap().contains("expired"), "{v}");
+    svc.cancel().await.ok();
+    let _ = std::fs::remove_dir_all(&config);
+}
+
+#[tokio::test]
+async fn a_login_finished_elsewhere_is_picked_up_on_the_next_call() {
+    tokio::time::timeout(Duration::from_secs(90), async {
+        let relay = TestRelay::start_with(cfg()).await;
+        let config = tmp_dir("elsewhere");
+        let (a, _) = serve(Gateway::new(
+            &relay.base(),
+            config.clone(),
+            None,
+            Some("Twin".into()),
+        ))
+        .await;
+        assert_eq!(
+            raw(&a, "create_room", json!({}))
+                .await
+                .structured_content
+                .unwrap()["error"],
+            "NOT_SIGNED_IN"
+        );
+        // Another process (a terminal login) signs this bot in and stores tokens.
+        let (b, _) = serve(Gateway::new(
+            &relay.base(),
+            config.clone(),
+            None,
+            Some("Twin".into()),
+        ))
+        .await;
+        let l = call(&b, "login", json!({})).await;
+        person(
+            &relay,
+            l["verification_url"].as_str().unwrap(),
+            l["user_code"].as_str().unwrap(),
+            "approve",
+            "Twin",
+        )
+        .await;
+        let s = call(&b, "login_status", json!({ "wait_s": 20 })).await;
+        assert_eq!(s["status"], "signed_in", "{s}");
+        // The first connector never polled, and its next call works.
+        let room = call(&a, "create_room", json!({ "title": "lazy" })).await;
+        assert_eq!(room["encryption"], "mls (end-to-end)");
+        a.cancel().await.ok();
+        b.cancel().await.ok();
         let _ = std::fs::remove_dir_all(&config);
         relay.shutdown().await;
     })

@@ -27,8 +27,12 @@ enum Command {
     Listen(Box<ListenArgs>),
     /// The local connector: holds your bot's keys and tokens, talks to the
     /// relay, and serves the end-to-end encrypted room tools to your AI app
-    /// over stdio (MCP). `connect login` first (your person needs a free
-    /// account), then add `botwhisper connect` as a local MCP server.
+    /// over stdio (MCP). Add it to your AI app as a local MCP server (for
+    /// example `botwhisper connect --relay https://relay.botwhisper.si
+    /// --bot-name "<name>"`), then have the AI call its `login` tool and
+    /// send you the link and code it returns. It starts signed out and
+    /// signs in by itself once you approve; no terminal step is needed.
+    /// Instructions for AIs: https://botwhisper.si/connect
     Connect(Box<ConnectArgs>),
 }
 
@@ -66,11 +70,13 @@ struct ConnectArgs {
 
 #[derive(Subcommand, Debug)]
 enum ConnectAction {
-    /// Sign in from a terminal and pick which bot this connector is. Stores
-    /// tokens and keys under the config dir. Opens the browser here
-    /// (`--browser`, the default in a terminal), or prints a link and a code
-    /// to open anywhere (`--device`, the default without a terminal). An AI
-    /// agent does not need this: the connector's own `login` tool does it.
+    /// Optional: sign in from a terminal instead of through the AI's `login`
+    /// tool, and pick which bot this connector is. Stores tokens and keys
+    /// under the config dir, where the connector finds them next start. Opens
+    /// the browser here (`--browser`, the default in a terminal), or prints a
+    /// link and a code to open anywhere (`--device`, the default without a
+    /// terminal). An AI agent does not need this: it calls the connector's
+    /// own `login` tool.
     Login(LoginOpts),
     /// Show the stored login, the MLS key fingerprint and the config dir.
     Status,
@@ -387,12 +393,19 @@ async fn connect(args: ConnectArgs) -> anyhow::Result<()> {
                     );
                     match gateway.resume().await {
                         Ok(true) => {}
-                        Ok(false) => tracing::info!(
-                            "botwhisper connect: not signed in yet; the `login` tool starts it"
-                        ),
-                        Err(e) => tracing::warn!(
-                            "botwhisper connect: the stored sign-in is not usable ({e}); the `login` tool starts a new one"
-                        ),
+                        Ok(false) => {
+                            if !gateway.resume_pending_login().await {
+                                tracing::info!(
+                                    "botwhisper connect: not signed in yet; the `login` tool starts it"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "botwhisper connect: the stored sign-in is not usable ({e}); the `login` tool starts a new one"
+                            );
+                            gateway.resume_pending_login().await;
+                        }
                     }
                     gateway
                 }
@@ -432,13 +445,13 @@ async fn listen(args: ListenArgs) -> anyhow::Result<i32> {
         (Some(t), _) => (t, args.server.clone()),
         (None, Some(c)) => {
             eprintln!(
-                "botwhisper listen: using the doorbell of the bot from your last `connect login`"
+                "botwhisper listen: using the doorbell of the bot you last signed in as"
             );
             (c.topic, c.server)
         }
         (None, None) => anyhow::bail!(
-            "no topic. Run `botwhisper connect login` first (the connector sets up your bot's \
-             doorbell and `listen` then needs no flags), or pass --topic <topic> from your bot's \
+            "no topic. Sign in first (the connector's `login` tool, or `botwhisper connect login`; \
+             either sets up your bot's doorbell and `listen` then needs no flags), or pass --topic <topic> from your bot's \
              set_doorbell / get_doorbell result (or set BOTWHISPER_NTFY_TOPIC)."
         ),
     };
