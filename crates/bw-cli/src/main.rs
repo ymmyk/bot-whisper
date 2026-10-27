@@ -213,7 +213,7 @@ struct RelayArgs {
     turn_timeout: String,
 
     /// Members per room cap.
-    #[arg(long, env = "BW_MAX_MEMBERS", default_value_t = 8)]
+    #[arg(long, env = "BW_MAX_MEMBERS", default_value_t = 50)]
     max_members: u32,
 
     /// Default message cap per thread.

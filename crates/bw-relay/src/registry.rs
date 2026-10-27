@@ -12,7 +12,7 @@ use crate::{
     db::{Db, ThreadStart},
     doorbell::{self, Doorbells},
     error::RelayError,
-    room::{Member, Room, RoomHandle},
+    room::{JoinOutcome, Member, Room, RoomHandle},
 };
 
 /// Room actor registry.
@@ -154,7 +154,8 @@ impl Registry {
         &self,
         agent: &AgentId,
         invite_url: &str,
-    ) -> Result<(RoomHandle, Member), RelayError> {
+        name: Option<String>,
+    ) -> Result<(RoomHandle, JoinOutcome), RelayError> {
         let token = invite_url
             .trim()
             .trim_end_matches('/')
@@ -183,24 +184,14 @@ impl Registry {
                 "invite secret does not match. Ask the room owner for a new invite.",
             ));
         }
+        // Uses, revocation and expiry are checked by the room: a bot asking
+        // again about its waiting request gets an answer either way.
         let now = doorbell::now_unix();
-        if invite.redeemed_at.is_some() {
-            return Err(RelayError::new(
-                ErrorCode::InviteUsed,
-                "this invite was already used; ask the owner for a new one",
-            ));
-        }
-        if now >= invite.expires_at {
-            return Err(RelayError::new(
-                ErrorCode::InviteExpired,
-                "this invite has expired",
-            ));
-        }
         let handle = self.get(&invite.room_id).await?;
         let agent = agent.clone();
-        let member = handle
-            .with(move |room| room.join(&invite, &agent, now))
+        let outcome = handle
+            .with(move |room| room.join(&invite, &agent, name, now))
             .await??;
-        Ok((handle, member))
+        Ok((handle, outcome))
     }
 }

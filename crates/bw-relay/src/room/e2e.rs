@@ -240,12 +240,29 @@ impl Room {
         Ok(seq)
     }
 
+    /// Should `caller`'s connector add pending seat `m` to the group?
+    fn adds(&self, caller: &str, m: &super::Member) -> bool {
+        match &m.adder {
+            Some(a) if a == caller => true,
+            Some(a) if self.member(a).is_ok_and(|x| x.is_e2e_active()) => {
+                caller == self.owner
+                    && crate::doorbell::now_unix() >= m.joined_at + super::ADDER_GRACE_S
+            }
+            _ => caller == self.owner,
+        }
+    }
+
     /// `e2e` block for `get_status`.
     pub(super) fn e2e_status(&self, member: &str) -> Value {
         json!({
             "epoch": self.e2e.epoch,
             "you": self.member(member).ok().map(|m| m.e2e_state),
-            "pending_join": self.members.iter().filter(|m| m.e2e_state == SeatState::Pending).map(|m| m.member.clone()).collect::<Vec<_>>(),
+            // The seats this caller's connector should add: the ones it
+            // approved; the owner also adds every seat nobody approved (and
+            // approved ones whose approver has not added them for a while).
+            "pending_join": self.members.iter()
+                .filter(|m| m.e2e_state == SeatState::Pending && self.adds(member, m))
+                .map(|m| m.member.clone()).collect::<Vec<_>>(),
             "welcoming": self.members.iter().filter(|m| m.e2e_state == SeatState::Welcoming).map(|m| m.member.clone()).collect::<Vec<_>>(),
             "joined": self.joined_ids(),
             "pending_items_for_you": self.e2e.items.iter().filter(|i| i.pending.contains(member)).count(),

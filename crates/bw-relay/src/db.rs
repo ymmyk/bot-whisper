@@ -52,6 +52,21 @@ CREATE TABLE IF NOT EXISTS invites (
     expires_at    INTEGER NOT NULL,
     redeemed_at   INTEGER
 );
+-- 0.2.11: a join through a `require_approval` invite waits here until a
+-- member approves (it then becomes a pending seat) or declines it.
+CREATE TABLE IF NOT EXISTS join_requests (
+    id            TEXT PRIMARY KEY,
+    room_id       TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+    invite_id     TEXT NOT NULL,
+    agent_id      TEXT NOT NULL,
+    display_name  TEXT,
+    label         TEXT,
+    created_at    INTEGER NOT NULL,
+    status        TEXT NOT NULL DEFAULT 'waiting',
+    decided_by    TEXT,
+    member_id     TEXT
+);
+CREATE INDEX IF NOT EXISTS join_requests_by_room ON join_requests(room_id);
 -- Per-room doorbells. `config` is DoorbellConfig as JSON (secrets included;
 -- never logged, never shown).
 CREATE TABLE IF NOT EXISTS doorbells (
@@ -471,6 +486,15 @@ const ADDED_COLUMNS: &[(&str, &str, &str)] = &[
     // 0.2.6: the next e2e seq and the thread state survive a relay restart.
     ("rooms", "e2e_next_seq", "INTEGER NOT NULL DEFAULT 0"),
     ("rooms", "flow", "TEXT"),
+    // 0.2.11: reusable invite links.
+    ("invites", "reusable", "INTEGER NOT NULL DEFAULT 0"),
+    ("invites", "max_uses", "INTEGER"),
+    ("invites", "uses", "INTEGER NOT NULL DEFAULT 0"),
+    ("invites", "require_approval", "INTEGER NOT NULL DEFAULT 0"),
+    ("invites", "revoked_at", "INTEGER"),
+    ("invites", "created_at", "INTEGER"),
+    // 0.2.11: the member who approved a join adds it to the MLS group.
+    ("members", "adder", "TEXT"),
 ];
 
 /// A member row.
@@ -484,17 +508,108 @@ pub struct MemberRow {
     pub joined_at: u64,
     /// `pending` until an existing member's commit adds this member.
     pub e2e_state: SeatState,
+    /// The member that approved this seat's join and so adds it to the
+    /// group (`None`: the owner's connector does).
+    pub adder: Option<String>,
 }
 
 /// An invite row (secret stored hashed).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct InviteRow {
     pub id: String,
     pub room_id: String,
     pub secret_hash: String,
     pub label: Option<String>,
     pub expires_at: u64,
+    /// Single-use links: when it was used.
     pub redeemed_at: Option<u64>,
+    /// Many joiners per link (each with its own bot).
+    pub reusable: bool,
+    pub max_uses: Option<u32>,
+    pub uses: u32,
+    /// Joins wait for a member to approve them.
+    pub require_approval: bool,
+    pub revoked_at: Option<u64>,
+    pub created_at: Option<u64>,
+}
+
+impl InviteRow {
+    /// Can this link still let someone in (ignoring expiry)?
+    pub fn has_uses_left(&self) -> bool {
+        if self.revoked_at.is_some() {
+            return false;
+        }
+        if self.reusable {
+            self.max_uses.is_none_or(|m| self.uses < m)
+        } else {
+            self.redeemed_at.is_none()
+        }
+    }
+
+    /// `active`, `used_up`, `revoked` or `expired`.
+    pub fn state(&self, now: u64) -> &'static str {
+        if self.revoked_at.is_some() {
+            "revoked"
+        } else if !self.has_uses_left() {
+            "used_up"
+        } else if now >= self.expires_at {
+            "expired"
+        } else {
+            "active"
+        }
+    }
+
+    /// What owners see (`create_invite`, `list_invites`); never the secret.
+    pub fn public_json(&self, now: u64) -> serde_json::Value {
+        serde_json::json!({
+            "invite_id": self.id,
+            "label": self.label,
+            "reusable": self.reusable,
+            "single_use": !self.reusable,
+            "uses": self.uses,
+            "max_uses": self.max_uses,
+            "require_approval": self.require_approval,
+            "expires_at": self.expires_at,
+            "created_at": self.created_at,
+            "revoked_at": self.revoked_at,
+            "state": self.state(now),
+        })
+    }
+}
+
+/// A join waiting for (or decided by) a member's approval.
+#[derive(Debug, Clone)]
+pub struct JoinRequest {
+    pub id: String,
+    pub room_id: String,
+    pub invite_id: String,
+    pub agent_id: String,
+    pub display_name: Option<String>,
+    pub label: Option<String>,
+    pub created_at: u64,
+    /// `waiting`, `approved` or `declined`.
+    pub status: String,
+    pub decided_by: Option<String>,
+    pub member_id: Option<String>,
+}
+
+const INVITE_COLS: &str = "id, room_id, secret_hash, label, expires_at, redeemed_at, reusable, max_uses, uses, require_approval, revoked_at, created_at";
+
+fn invite_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<InviteRow> {
+    Ok(InviteRow {
+        id: r.get(0)?,
+        room_id: r.get(1)?,
+        secret_hash: r.get(2)?,
+        label: r.get(3)?,
+        expires_at: r.get::<_, i64>(4)? as u64,
+        redeemed_at: r.get::<_, Option<i64>>(5)?.map(|v| v as u64),
+        reusable: r.get(6)?,
+        max_uses: r.get(7)?,
+        uses: r.get(8)?,
+        require_approval: r.get(9)?,
+        revoked_at: r.get::<_, Option<i64>>(10)?.map(|v| v as u64),
+        created_at: r.get::<_, Option<i64>>(11)?.map(|v| v as u64),
+    })
 }
 
 /// One OAuth client (bot) connected to an account, for the account page.
@@ -525,7 +640,7 @@ pub struct AccountRoom {
 #[derive(Debug, Clone)]
 pub struct AccountSeat {
     pub room_id: String,
-    pub client_id: String,
+    pub agent_id: String,
     pub member_id: String,
     pub display_name: Option<String>,
     pub role: String,
@@ -540,6 +655,11 @@ pub struct AccountInvite {
     pub label: Option<String>,
     pub expires_at: u64,
     pub redeemed_at: Option<u64>,
+    pub reusable: bool,
+    pub uses: u32,
+    pub max_uses: Option<u32>,
+    pub require_approval: bool,
+    pub revoked_at: Option<u64>,
 }
 
 /// Thread-safe handle to the metadata database.
@@ -639,6 +759,13 @@ impl Db {
                 }
             }
             conn.execute_batch("PRAGMA user_version = 1;")?;
+        }
+        if version < 2 {
+            // 0.2.11: invites count uses; a redeemed single-use link has one.
+            conn.execute_batch(
+                "UPDATE invites SET uses = 1 WHERE redeemed_at IS NOT NULL AND uses = 0;
+                 PRAGMA user_version = 2;",
+            )?;
         }
         Ok(())
     }
@@ -810,8 +937,8 @@ impl Db {
     pub fn insert_member(&self, room_id: &str, m: &MemberRow) -> Result<()> {
         self.with(|c| {
             c.execute(
-                "INSERT INTO members (room_id, member_id, agent_id, display_name, role, invite_label, joined_at, e2e_state)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                "INSERT INTO members (room_id, member_id, agent_id, display_name, role, invite_label, joined_at, e2e_state, adder)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     room_id,
                     m.member_id,
@@ -820,7 +947,8 @@ impl Db {
                     m.role,
                     m.invite_label,
                     m.joined_at as i64,
-                    m.e2e_state.as_str()
+                    m.e2e_state.as_str(),
+                    m.adder
                 ],
             )?;
             Ok(())
@@ -844,7 +972,7 @@ impl Db {
     pub fn members(&self, room_id: &str) -> Result<Vec<MemberRow>> {
         self.with(|c| {
             let mut stmt = c.prepare(
-                "SELECT member_id, agent_id, display_name, role, invite_label, joined_at, e2e_state
+                "SELECT member_id, agent_id, display_name, role, invite_label, joined_at, e2e_state, adder
                  FROM members WHERE room_id = ?1 ORDER BY joined_at, member_id",
             )?;
             let rows = stmt.query_map(params![room_id], |r| {
@@ -856,6 +984,7 @@ impl Db {
                     invite_label: r.get(4)?,
                     joined_at: r.get::<_, i64>(5)? as u64,
                     e2e_state: SeatState::parse(&r.get::<_, String>(6)?),
+                    adder: r.get(7)?,
                 })
             })?;
             rows.collect()
@@ -1144,14 +1273,19 @@ impl Db {
     pub fn insert_invite(&self, inv: &InviteRow) -> Result<()> {
         self.with(|c| {
             c.execute(
-                "INSERT INTO invites (id, room_id, secret_hash, label, expires_at, redeemed_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
+                "INSERT INTO invites (id, room_id, secret_hash, label, expires_at, redeemed_at,
+                                      reusable, max_uses, uses, require_approval, revoked_at, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, 0, ?8, NULL, ?9)",
                 params![
                     inv.id,
                     inv.room_id,
                     inv.secret_hash,
                     inv.label,
-                    inv.expires_at as i64
+                    inv.expires_at as i64,
+                    inv.reusable,
+                    inv.max_uses,
+                    inv.require_approval,
+                    inv.created_at.map(|v| v as i64)
                 ],
             )?;
             Ok(())
@@ -1161,43 +1295,137 @@ impl Db {
     pub fn get_invite(&self, id: &str) -> Result<Option<InviteRow>> {
         self.with(|c| {
             c.query_row(
-                "SELECT id, room_id, secret_hash, label, expires_at, redeemed_at FROM invites WHERE id = ?1",
+                &format!("SELECT {INVITE_COLS} FROM invites WHERE id = ?1"),
                 params![id],
-                |r| {
-                    Ok(InviteRow {
-                        id: r.get(0)?,
-                        room_id: r.get(1)?,
-                        secret_hash: r.get(2)?,
-                        label: r.get(3)?,
-                        expires_at: r.get::<_, i64>(4)? as u64,
-                        redeemed_at: r.get::<_, Option<i64>>(5)?.map(|v| v as u64),
-                    })
-                },
+                invite_row,
             )
             .optional()
         })
     }
 
-    /// Mark an invite redeemed. Returns false if it was already redeemed
-    /// (first redeemer wins, atomically).
+    /// Every invite of a room, newest first. No secrets (only hashes are
+    /// stored; callers show `InviteRow::public_json`).
+    pub fn room_invites(&self, room_id: &str) -> Result<Vec<InviteRow>> {
+        self.with(|c| {
+            let mut st = c.prepare(&format!(
+                "SELECT {INVITE_COLS} FROM invites WHERE room_id = ?1
+                 ORDER BY COALESCE(created_at, 0) DESC, id"
+            ))?;
+            let rows = st.query_map(params![room_id], invite_row)?;
+            rows.collect()
+        })
+    }
+
+    /// Use one of an invite's uses, atomically. Single-use links are marked
+    /// redeemed (first redeemer wins); reusable ones count up to `max_uses`.
+    /// Returns false if the link was used up or revoked meanwhile.
     pub fn redeem_invite(&self, id: &str, now: u64) -> Result<bool> {
         self.with(|c| {
             let n = c.execute(
-                "UPDATE invites SET redeemed_at = ?2 WHERE id = ?1 AND redeemed_at IS NULL",
+                "UPDATE invites SET redeemed_at = CASE WHEN reusable = 1 THEN redeemed_at ELSE ?2 END,
+                                    uses = uses + 1
+                 WHERE id = ?1 AND revoked_at IS NULL
+                   AND ((reusable = 0 AND redeemed_at IS NULL)
+                        OR (reusable = 1 AND (max_uses IS NULL OR uses < max_uses)))",
                 params![id, now as i64],
             )?;
             Ok(n == 1)
         })
     }
 
+    /// Revoke an invite. Returns false if it was already revoked or unknown.
+    pub fn revoke_invite(&self, room_id: &str, id: &str, now: u64) -> Result<bool> {
+        self.with(|c| {
+            let n = c.execute(
+                "UPDATE invites SET revoked_at = ?3 WHERE room_id = ?1 AND id = ?2 AND revoked_at IS NULL",
+                params![room_id, id, now as i64],
+            )?;
+            Ok(n == 1)
+        })
+    }
+
+    /// Invites that can still let someone in.
     pub fn count_open_invites(&self, room_id: &str, now: u64) -> Result<u32> {
         self.with(|c| {
             c.query_row(
-                "SELECT COUNT(*) FROM invites WHERE room_id = ?1 AND redeemed_at IS NULL AND expires_at > ?2",
+                "SELECT COUNT(*) FROM invites WHERE room_id = ?1 AND expires_at > ?2 AND revoked_at IS NULL
+                   AND ((reusable = 0 AND redeemed_at IS NULL)
+                        OR (reusable = 1 AND (max_uses IS NULL OR uses < max_uses)))",
                 params![room_id, now as i64],
                 |r| r.get::<_, i64>(0),
             )
             .map(|v| v as u32)
+        })
+    }
+
+    // ----- join requests -----
+
+    pub fn insert_join_request(&self, j: &JoinRequest) -> Result<()> {
+        self.with(|c| {
+            c.execute(
+                "INSERT INTO join_requests (id, room_id, invite_id, agent_id, display_name, label, created_at, status)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'waiting')",
+                params![
+                    j.id,
+                    j.room_id,
+                    j.invite_id,
+                    j.agent_id,
+                    j.display_name,
+                    j.label,
+                    j.created_at as i64
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// A room's join requests, oldest first.
+    pub fn join_requests(&self, room_id: &str) -> Result<Vec<JoinRequest>> {
+        self.with(|c| {
+            let mut st = c.prepare(
+                "SELECT id, room_id, invite_id, agent_id, display_name, label, created_at, status, decided_by, member_id
+                 FROM join_requests WHERE room_id = ?1 ORDER BY created_at, id",
+            )?;
+            let rows = st.query_map(params![room_id], |r| {
+                Ok(JoinRequest {
+                    id: r.get(0)?,
+                    room_id: r.get(1)?,
+                    invite_id: r.get(2)?,
+                    agent_id: r.get(3)?,
+                    display_name: r.get(4)?,
+                    label: r.get(5)?,
+                    created_at: r.get::<_, i64>(6)? as u64,
+                    status: r.get(7)?,
+                    decided_by: r.get(8)?,
+                    member_id: r.get(9)?,
+                })
+            })?;
+            rows.collect()
+        })
+    }
+
+    /// Decide a waiting request. Returns false if it was already decided.
+    pub fn decide_join_request(
+        &self,
+        id: &str,
+        status: &str,
+        by: &str,
+        member_id: Option<&str>,
+    ) -> Result<bool> {
+        self.with(|c| {
+            let n = c.execute(
+                "UPDATE join_requests SET status = ?2, decided_by = ?3, member_id = ?4
+                 WHERE id = ?1 AND status = 'waiting'",
+                params![id, status, by, member_id],
+            )?;
+            Ok(n == 1)
+        })
+    }
+
+    pub fn delete_join_request(&self, id: &str) -> Result<()> {
+        self.with(|c| {
+            c.execute("DELETE FROM join_requests WHERE id = ?1", params![id])?;
+            Ok(())
         })
     }
 
@@ -2195,13 +2423,13 @@ impl Db {
                         (r.owner_account IS NOT NULL AND r.owner_account = ?1)
                           OR EXISTS (SELECT 1 FROM members m WHERE m.room_id = r.id
                                      AND m.member_id = r.owner
-                                     AND substr(m.agent_id, 1, length(?1) + 1) = ?1 || ':'),
+                                     AND (substr(m.agent_id, 1, length(?1) + 1) = ?1 || ':' OR m.agent_id IN (SELECT b.agent_id FROM bots b WHERE b.account_id = ?1))),
                         (SELECT COUNT(*) FROM members m WHERE m.room_id = r.id),
                         r.max_members
                  FROM rooms r
                  WHERE r.owner_account = ?1
                     OR EXISTS (SELECT 1 FROM members m WHERE m.room_id = r.id
-                               AND substr(m.agent_id, 1, length(?1) + 1) = ?1 || ':')
+                               AND (substr(m.agent_id, 1, length(?1) + 1) = ?1 || ':' OR m.agent_id IN (SELECT b.agent_id FROM bots b WHERE b.account_id = ?1)))
                  ORDER BY r.created_at, r.id",
             )?;
             let rows = st.query_map(params![account_id], |r| {
@@ -2223,14 +2451,15 @@ impl Db {
     pub fn account_seats(&self, account_id: &str) -> Result<Vec<AccountSeat>> {
         self.with(|c| {
             let mut st = c.prepare(
-                "SELECT room_id, substr(agent_id, length(?1) + 2), member_id, display_name, role, joined_at
+                "SELECT room_id, agent_id, member_id, display_name, role, joined_at
                  FROM members WHERE substr(agent_id, 1, length(?1) + 1) = ?1 || ':'
+                    OR agent_id IN (SELECT agent_id FROM bots WHERE account_id = ?1)
                  ORDER BY joined_at, room_id",
             )?;
             let rows = st.query_map(params![account_id], |r| {
                 Ok(AccountSeat {
                     room_id: r.get(0)?,
-                    client_id: r.get(1)?,
+                    agent_id: r.get(1)?,
                     member_id: r.get(2)?,
                     display_name: r.get(3)?,
                     role: r.get(4)?,
@@ -2245,12 +2474,13 @@ impl Db {
     pub fn account_invites(&self, account_id: &str) -> Result<Vec<AccountInvite>> {
         self.with(|c| {
             let mut st = c.prepare(
-                "SELECT i.id, i.room_id, i.label, i.expires_at, i.redeemed_at
+                "SELECT i.id, i.room_id, i.label, i.expires_at, i.redeemed_at,
+                        i.reusable, i.uses, i.max_uses, i.require_approval, i.revoked_at
                  FROM invites i JOIN rooms r ON r.id = i.room_id
                  WHERE r.owner_account = ?1
                     OR EXISTS (SELECT 1 FROM members m WHERE m.room_id = r.id
                                AND m.member_id = r.owner
-                               AND substr(m.agent_id, 1, length(?1) + 1) = ?1 || ':')
+                               AND (substr(m.agent_id, 1, length(?1) + 1) = ?1 || ':' OR m.agent_id IN (SELECT b.agent_id FROM bots b WHERE b.account_id = ?1)))
                  ORDER BY i.expires_at, i.id",
             )?;
             let rows = st.query_map(params![account_id], |r| {
@@ -2260,6 +2490,11 @@ impl Db {
                     label: r.get(2)?,
                     expires_at: r.get::<_, i64>(3)? as u64,
                     redeemed_at: r.get::<_, Option<i64>>(4)?.map(|v| v as u64),
+                    reusable: r.get(5)?,
+                    uses: r.get(6)?,
+                    max_uses: r.get(7)?,
+                    require_approval: r.get(8)?,
+                    revoked_at: r.get::<_, Option<i64>>(9)?.map(|v| v as u64),
                 })
             })?;
             rows.collect()
@@ -2467,6 +2702,7 @@ mod tests {
                 invite_label: None,
                 joined_at: 1,
                 e2e_state: SeatState::Pending,
+                adder: None,
             },
         )
         .unwrap();
@@ -2518,6 +2754,7 @@ mod tests {
             label: None,
             expires_at: 100,
             redeemed_at: None,
+            ..Default::default()
         })
         .unwrap();
         assert!(db.redeem_invite("i1", 5).unwrap());

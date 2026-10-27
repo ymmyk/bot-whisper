@@ -793,7 +793,10 @@ async fn two_bots_on_one_account_and_client_are_two_members() {
     assert_eq!(bots.len(), 2);
     let other = bots.iter().find(|x| x.id != first.id).unwrap();
     assert_eq!(other.name, "Other bot", "name cleaned");
-    assert_eq!(other.agent_id, format!("{account}:{}", other.id));
+    // New bots: the agent (and member) id is the bot id alone, so a copied
+    // Member ID never starts with the Account ID.
+    assert_eq!(other.agent_id, other.id);
+    assert!(!other.agent_id.contains(&account), "no account id inside");
 
     // Both stay connected, and they are two members of one room whose
     // display names default to the bot names.

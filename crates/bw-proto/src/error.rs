@@ -18,6 +18,10 @@ pub enum ErrorCode {
     InviteUsed,
     InviteExpired,
     InviteInvalid,
+    /// The owner revoked the invite link.
+    InviteRevoked,
+    /// A member declined this bot's request to join.
+    JoinDeclined,
     BodyTooLarge,
     InvalidArgument,
     InterruptUsed,
@@ -48,6 +52,8 @@ impl ErrorCode {
             ErrorCode::InviteUsed => "INVITE_USED",
             ErrorCode::InviteExpired => "INVITE_EXPIRED",
             ErrorCode::InviteInvalid => "INVITE_INVALID",
+            ErrorCode::InviteRevoked => "INVITE_REVOKED",
+            ErrorCode::JoinDeclined => "JOIN_DECLINED",
             ErrorCode::BodyTooLarge => "BODY_TOO_LARGE",
             ErrorCode::InvalidArgument => "INVALID_ARGUMENT",
             ErrorCode::InterruptUsed => "INTERRUPT_USED",

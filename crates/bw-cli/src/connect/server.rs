@@ -1,9 +1,12 @@
 //! The connector's stdio MCP server: friendly room tools for the bot that
 //! encrypt and decrypt locally and speak the relay's `e2e_*` protocol.
 //!
-//! Policy in M1: the connector auto-adds pending joiners in rooms it owns
-//! (the invite-fragment proof `k=` is M2); joiners verify the inviter's
-//! signature-key fingerprint when the invite URL carried `#f=`.
+//! Policy: the connector adds the pending joiners the relay hands it (the
+//! owner adds seats nobody approved; a member adds the ones it approved).
+//! Joiners verify the inviter's signature-key fingerprint when the invite
+//! URL carried `#f=`: the Welcome's sender, or a member of the group it
+//! opens, must hold that key. The fragment never goes to the relay (the
+//! `k=` proof is reserved for later and ignored here).
 
 use std::{
     collections::HashMap,
@@ -55,6 +58,32 @@ struct Pending {
     expected_fingerprint: Option<String>,
 }
 
+/// A join request waiting for a member's approval.
+struct Awaiting {
+    /// The invite URL without its `#` fragment (what the relay sees).
+    invite_url: String,
+    expected_fingerprint: Option<String>,
+    name: Option<String>,
+}
+
+/// Split an invite URL into the part the relay sees and the inviter
+/// fingerprint from its fragment (`#f=...`, `#k=...&f=...`). Nothing after
+/// `#` is ever sent to the relay.
+pub(crate) fn split_invite(url: &str) -> (String, Option<String>) {
+    let url = url.trim();
+    match url.split_once('#') {
+        Some((base, frag)) => {
+            let f = frag
+                .split('&')
+                .find_map(|kv| kv.strip_prefix("f="))
+                .map(|f| f.trim().to_ascii_lowercase())
+                .filter(|f| !f.is_empty());
+            (base.to_string(), f)
+        }
+        None => (url.to_string(), None),
+    }
+}
+
 /// What a `file` message carries inside the ciphertext: everything needed
 /// to fetch and decrypt the blob. The relay sees none of it.
 #[derive(Debug, Clone, serde::Serialize, Deserialize)]
@@ -86,6 +115,7 @@ struct State {
     inbox: Inbox,
     rooms: HashMap<String, RoomState>,
     pending: HashMap<String, Pending>,
+    awaiting: HashMap<String, Awaiting>,
     files: HashMap<String, ReceivedFile>,
 }
 
@@ -210,13 +240,41 @@ pub struct CreateInviteArgs {
     /// Invite lifetime such as `1h`, `7d`. Default `7d`.
     #[serde(default)]
     pub ttl: Option<String>,
+    /// One link many bots can join with, each under its own name. Default
+    /// false (single use).
+    #[serde(default)]
+    pub reusable: Option<bool>,
+    /// With `reusable`: at most this many joins. Default: unlimited until
+    /// it expires or is revoked.
+    #[serde(default)]
+    pub max_uses: Option<u32>,
+    /// Each join waits until a member already in the room approves it.
+    #[serde(default)]
+    pub require_approval: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct JoinRoomArgs {
     /// The invite URL you were given (keep its `#...` part: it carries the
-    /// inviter's key fingerprint).
+    /// inviter's key fingerprint and never leaves this machine).
     pub invite_url: String,
+    /// How the room sees this bot. Default: the bot's own name.
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct InviteIdArgs {
+    pub room_id: String,
+    /// From create_invite or list_invites.
+    pub invite_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct JoinRequestArgs {
+    pub room_id: String,
+    /// From a `join_requested` event or get_status `join_requests`.
+    pub request_id: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -342,11 +400,7 @@ pub(crate) fn respond(result: anyhow::Result<Value>) -> Result<CallToolResult, E
             Some(t) => CallToolResult::structured_error(t.0.clone()),
             // Signed out (401/403, a refused refresh) is never "unreachable".
             None if super::relay::signed_out(&e).is_some() => {
-                CallToolResult::structured_error(json!({
-                    "error": "SIGNED_OUT",
-                    "message": "signed out, call `login`",
-                    "reason": super::relay::signed_out(&e).map(|s| s.0.clone()),
-                }))
+                super::gateway::signed_out_result(super::relay::signed_out(&e).map(|s| s.0.clone()))
             }
             None if crate::tls::find(&e).is_some() => {
                 CallToolResult::structured_error(crate::tls::find(&e).expect("checked").to_json())
@@ -819,7 +873,14 @@ impl Connector {
                     };
                     if let Some(p) = st.pending.remove(room_id) {
                         if let Some(expected) = p.expected_fingerprint {
-                            if expected != inviter.fingerprint {
+                            // The Welcome came from the inviter, or from a
+                            // member who approved us inside a group the
+                            // inviter is in (MLS-authenticated tree).
+                            let in_group = group
+                                .member_keys()
+                                .iter()
+                                .any(|k| hex::encode(Sha256::digest(&k.public_key)) == expected);
+                            if expected != inviter.fingerprint && !in_group {
                                 let _ = self
                                     .relay
                                     .call("leave_room", json!({ "room_id": room_id }))
@@ -1076,8 +1137,95 @@ impl Connector {
         st["you"]["member"].as_str().map(str::to_string)
     }
 
-    /// Owner's duty: add every pending joiner (claim a key package, commit
-    /// the Add with a Welcome, then share the title inside the ciphertext).
+    /// Ask the relay to join with an invite URL (fragment already removed).
+    async fn relay_join(&self, invite_url: &str, name: Option<&str>) -> anyhow::Result<Value> {
+        debug_assert!(!invite_url.contains('#'));
+        let mut args = json!({ "invite_url": invite_url });
+        if let Some(n) = name {
+            args["name"] = json!(n);
+        }
+        self.relay.call("join_room", args).await
+    }
+
+    /// After taking a seat: wait for the Welcome until `deadline`.
+    async fn await_welcome(
+        &self,
+        room_id: &str,
+        deadline: Instant,
+        joined: &Value,
+    ) -> anyhow::Result<Value> {
+        while Instant::now() < deadline && !self.state.lock().await.rooms.contains_key(room_id) {
+            let left = deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_secs(20));
+            self.drain(room_id, left).await?;
+        }
+        let st = self.state.lock().await;
+        Ok(match st.rooms.get(room_id) {
+            Some(r) => json!({
+                "room_id": room_id,
+                "member_id": r.me,
+                "joined": true,
+                "title": r.title,
+                "epoch": r.group.epoch(),
+                "members": r.group.members(),
+                "encryption": "mls (end-to-end)",
+            }),
+            None => json!({
+                "room_id": room_id,
+                "member_id": joined["you"]["member"],
+                "joined": false,
+                "state": "pending_join",
+                "note": "no member's connector was online to add you yet; call wait_for_message on this room later",
+            }),
+        })
+    }
+
+    /// Re-ask about join requests waiting for approval. Seated ones become
+    /// pending rooms (returned); declined, revoked or expired ones are
+    /// dropped with a note.
+    async fn check_awaiting(&self) -> (Vec<String>, Vec<Value>) {
+        let list: Vec<(String, String, Option<String>)> = {
+            let st = self.state.lock().await;
+            st.awaiting
+                .iter()
+                .map(|(r, a)| (r.clone(), a.invite_url.clone(), a.name.clone()))
+                .collect()
+        };
+        let mut seated = Vec::new();
+        let mut notes = Vec::new();
+        for (room, url, name) in list {
+            match self.relay_join(&url, name.as_deref()).await {
+                Ok(v) if v["state"] == "awaiting_approval" => {
+                    notes.push(json!({ "room_id": room, "state": "awaiting_approval", "message": v["message"] }));
+                }
+                Ok(_) => {
+                    let mut st = self.state.lock().await;
+                    if let Some(a) = st.awaiting.remove(&room) {
+                        st.pending.insert(
+                            room.clone(),
+                            Pending {
+                                expected_fingerprint: a.expected_fingerprint,
+                            },
+                        );
+                    }
+                    seated.push(room);
+                }
+                Err(e) if super::relay::is_unreachable(&e) => {}
+                Err(e) => {
+                    self.state.lock().await.awaiting.remove(&room);
+                    notes.push(
+                        json!({ "room_id": room, "state": "not_joined", "error": one_line(&e) }),
+                    );
+                }
+            }
+        }
+        (seated, notes)
+    }
+
+    /// Add the pending joiners the relay assigns to this bot (claim a key
+    /// package, commit the Add with a Welcome, then share the title inside
+    /// the ciphertext): the owner's seats, or the ones this bot approved.
     async fn add_pending_joiners(&self, room_id: &str) -> anyhow::Result<Vec<String>> {
         let status = self
             .relay
@@ -1097,9 +1245,6 @@ impl Connector {
             let Some(r) = st.rooms.get_mut(room_id) else {
                 break;
             };
-            if !r.owner {
-                break;
-            }
             let kp = match self
                 .relay
                 .call(
@@ -1220,6 +1365,7 @@ impl Connector {
             "ciphersuite": "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519",
             "rooms": rooms,
             "pending_join": st.pending.keys().collect::<Vec<_>>(),
+            "awaiting_approval": st.awaiting.keys().collect::<Vec<_>>(),
             "config_dir": self.store.as_ref().map(|s| s.dir.display().to_string()),
         })))
     }
@@ -1274,7 +1420,9 @@ impl Connector {
                     "round_table": created["round_table"],
                     "thread_start": created["thread_start"],
                     "room_expires_at": created["room_expires_at"],
-                    "next": "call create_invite once per bot; joiners are added automatically when you call wait_for_message or send_message",
+                    "room_expires_at_utc": created["room_expires_at_utc"],
+                    "max_members": created["max_members"],
+                    "next": "call create_invite (reusable: true for one link many bots can use; single-use by default); joiners are added automatically when you call wait_for_message or send_message",
                 }))
             }
             .await,
@@ -1283,7 +1431,7 @@ impl Connector {
 
     #[tool(
         name = "create_invite",
-        description = "Owner only. Mint one single-use invite URL for one prospective member. The URL ends with #f=<your key fingerprint> so the joiner can verify its Welcome came from you; hand the whole URL to the other person."
+        description = "Owner only. Mint an invite URL. Single-use by default; `reusable: true` gives one link many bots can join with (each under its own name), optionally capped by `max_uses`; `ttl` defaults to 7d. `require_approval: true` makes each join wait until a member calls approve_join. The URL ends with #f=<your key fingerprint> so joiners can verify their Welcome; hand the whole URL over. Anyone holding a link can join (or ask to): share it privately, and revoke_invite it when done."
     )]
     async fn create_invite(
         &self,
@@ -1295,7 +1443,11 @@ impl Connector {
                 if let Some(url) = v["invite_url"].as_str() {
                     v["invite_url"] = json!(format!("{url}#f={}", self.identity.fingerprint()));
                 }
-                v["note"] = json!("the joiner's connector waits for your connector to add it: call wait_for_message after they join");
+                v["note"] = json!(if v["require_approval"] == true {
+                    "each joiner waits for approval: you get a join_requested event in wait_for_message; approve_join or decline_join it"
+                } else {
+                    "the joiner's connector waits for your connector to add it: call wait_for_message after they join"
+                });
                 Ok(v)
             }
             .await,
@@ -1304,7 +1456,7 @@ impl Connector {
 
     #[tool(
         name = "join_room",
-        description = "Redeem an invite URL, publish a key package and wait (up to 50 s) for the inviter's connector to add you to the encrypted group. If the inviter is offline you stay pending: call wait_for_message later."
+        description = "Redeem an invite URL (pass it whole, with its #f= part), publish a key package and wait (up to 50 s) for a member's connector to add you to the encrypted group. `name` is how the room sees you (default: your bot name). If the link needs approval you get `state: awaiting_approval` (\"waiting for a member to let you in\"); call wait_for_message or join_room again later. If nobody is online you stay pending: call wait_for_message later."
     )]
     async fn join_room(
         &self,
@@ -1312,49 +1464,32 @@ impl Connector {
     ) -> Result<CallToolResult, ErrorData> {
         respond(
             async {
-                let expected = a
-                    .invite_url
-                    .split_once('#')
-                    .and_then(|(_, frag)| {
-                        frag.split('&')
-                            .find_map(|kv| kv.strip_prefix("f=").map(str::to_string))
-                    });
+                let (invite_url, expected) = split_invite(&a.invite_url);
                 self.top_up_key_packages(false).await?;
-                let joined = self
-                    .relay
-                    .call("join_room", json!({ "invite_url": a.invite_url }))
-                    .await?;
+                let deadline = Instant::now() + Duration::from_secs(50);
+                let mut joined = self.relay_join(&invite_url, a.name.as_deref()).await?;
+                // Waiting for approval: ask again every few seconds.
+                while joined["state"] == "awaiting_approval" && Instant::now() < deadline {
+                    tokio::time::sleep(Duration::from_secs(4)).await;
+                    joined = self.relay_join(&invite_url, a.name.as_deref()).await?;
+                }
                 let room_id = joined["room_id"].as_str().unwrap_or_default().to_string();
+                if joined["state"] == "awaiting_approval" {
+                    self.state.lock().await.awaiting.insert(
+                        room_id.clone(),
+                        Awaiting { invite_url, expected_fingerprint: expected, name: a.name },
+                    );
+                    joined["joined"] = json!(false);
+                    joined["next"] = json!("call wait_for_message (or join_room again with the same link): you join as soon as a member lets you in");
+                    return Ok(joined);
+                }
                 self.state.lock().await.pending.insert(
                     room_id.clone(),
                     Pending {
                         expected_fingerprint: expected,
                     },
                 );
-                let deadline = Instant::now() + Duration::from_secs(50);
-                while Instant::now() < deadline && !self.state.lock().await.rooms.contains_key(&room_id) {
-                    let left = deadline.saturating_duration_since(Instant::now()).min(Duration::from_secs(20));
-                    self.drain(&room_id, left).await?;
-                }
-                let st = self.state.lock().await;
-                Ok(match st.rooms.get(&room_id) {
-                    Some(r) => json!({
-                        "room_id": room_id,
-                        "member_id": r.me,
-                        "joined": true,
-                        "title": r.title,
-                        "epoch": r.group.epoch(),
-                        "members": r.group.members(),
-                        "encryption": "mls (end-to-end)",
-                    }),
-                    None => json!({
-                        "room_id": room_id,
-                        "member_id": joined["you"]["member"],
-                        "joined": false,
-                        "state": "pending_join",
-                        "note": "no member's connector was online to add you yet; call wait_for_message on this room later",
-                    }),
-                })
+                self.await_welcome(&room_id, deadline, &joined).await
             }
             .await,
         )
@@ -1549,18 +1684,37 @@ impl Connector {
         respond_read(
             async {
                 let timeout = Duration::from_secs(a.timeout_s.unwrap_or(DEFAULT_WAIT_S).min(MAX_WAIT_S));
+                // Join requests waiting for approval: let in yet?
+                let (seated, mut awaiting_notes) = self.check_awaiting().await;
+                if let Some(r) = &a.room_id {
+                    if let Some(n) = awaiting_notes.iter().find(|n| n["room_id"] == *r) {
+                        let mut n = n.clone();
+                        n["messages"] = json!([]);
+                        n["events"] = json!([]);
+                        n["timed_out"] = json!(n["state"] == "awaiting_approval");
+                        return Ok(n);
+                    }
+                }
                 let rooms = match &a.room_id {
                     Some(r) => vec![r.clone()],
-                    None => self.my_e2e_rooms().await?,
+                    None => {
+                        let mut v = self.my_e2e_rooms().await?;
+                        for r in seated {
+                            if !v.contains(&r) {
+                                v.push(r);
+                            }
+                        }
+                        v
+                    }
                 };
-                if rooms.is_empty() {
+                if rooms.is_empty() && awaiting_notes.is_empty() {
                     anyhow::bail!("you are in no encrypted room");
                 }
                 // Rooms the relay calls active but this connector holds no
                 // group for can never be read here: say so instead of
                 // returning an empty, healthy-looking result.
-                let mut out = Vec::new();
-                let mut any = false;
+                let mut any = !awaiting_notes.is_empty() && rooms.is_empty();
+                let mut out: Vec<Value> = std::mem::take(&mut awaiting_notes);
                 let mut rooms = rooms;
                 let missing: Vec<String> = {
                     let st = self.state.lock().await;
@@ -1784,6 +1938,85 @@ impl Connector {
             }
             .await,
             || json!({ "rooms": [] }),
+        )
+    }
+
+    #[tool(
+        name = "list_invites",
+        description = "Owner only. The room's invite links: reusable or single-use, uses and max_uses, require_approval, expiry and state (active, used_up, revoked, expired). Never the secret."
+    )]
+    async fn list_invites(
+        &self,
+        Parameters(a): Parameters<RoomArg>,
+    ) -> Result<CallToolResult, ErrorData> {
+        respond(
+            self.relay
+                .call("list_invites", json!({ "room_id": a.room_id }))
+                .await,
+        )
+    }
+
+    #[tool(
+        name = "revoke_invite",
+        description = "Owner only. Revoke an invite link now: nobody else can join with it and requests waiting on it are declined. Members it already let in stay (remove_member removes one)."
+    )]
+    async fn revoke_invite(
+        &self,
+        Parameters(a): Parameters<InviteIdArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        respond(
+            self.relay
+                .call(
+                    "revoke_invite",
+                    json!({ "room_id": a.room_id, "invite_id": a.invite_id }),
+                )
+                .await,
+        )
+    }
+
+    #[tool(
+        name = "approve_join",
+        description = "Let in a bot waiting on a require_approval invite (from a `join_requested` event or get_status `join_requests`). Any member already in the group can approve; this connector then adds it to the encrypted group."
+    )]
+    async fn approve_join(
+        &self,
+        Parameters(a): Parameters<JoinRequestArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        respond(
+            async {
+                let mut v = self
+                    .relay
+                    .call("approve_join", json!({ "room_id": a.room_id, "request_id": a.request_id }))
+                    .await?;
+                let _ = self.drain(&a.room_id, Duration::ZERO).await?;
+                let added = self.add_pending_joiners(&a.room_id).await?;
+                v["added_to_group"] = json!(!added.is_empty());
+                v["next"] = json!(if added.is_empty() {
+                    "seated; it joins the encrypted group as soon as its key package is available (call wait_for_message)"
+                } else {
+                    "added to the encrypted group"
+                });
+                Ok(v)
+            }
+            .await,
+        )
+    }
+
+    #[tool(
+        name = "decline_join",
+        description = "Turn away a bot waiting on a require_approval invite. It is told a member declined."
+    )]
+    async fn decline_join(
+        &self,
+        Parameters(a): Parameters<JoinRequestArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        respond(
+            self.relay
+                .call(
+                    "decline_join",
+                    json!({ "room_id": a.room_id, "request_id": a.request_id }),
+                )
+                .await,
         )
     }
 
@@ -2168,6 +2401,15 @@ where
 
 fn a_json(a: &CreateInviteArgs) -> Value {
     let mut v = json!({ "room_id": a.room_id });
+    if let Some(x) = a.reusable {
+        v["reusable"] = json!(x);
+    }
+    if let Some(x) = a.max_uses {
+        v["max_uses"] = json!(x);
+    }
+    if let Some(x) = a.require_approval {
+        v["require_approval"] = json!(x);
+    }
     if let Some(l) = &a.label {
         v["label"] = json!(l);
     }
@@ -2238,5 +2480,37 @@ mod unreadable_tests {
             assert_eq!(s, "pending");
             assert!(h.contains("wait_for_message"));
         }
+    }
+}
+
+#[cfg(test)]
+mod invite_link_tests {
+    use super::split_invite;
+
+    #[test]
+    fn the_fragment_never_goes_to_the_relay() {
+        let (base, f) = split_invite(" https://relay.example/i/abc.SECRET#k=KEY&f=ABCDEF ");
+        assert_eq!(base, "https://relay.example/i/abc.SECRET");
+        assert_eq!(f.as_deref(), Some("abcdef"), "fingerprint, lowercased");
+        assert!(!base.contains("KEY") && !base.contains('#'));
+        let (base, f) = split_invite("https://relay.example/i/abc.SECRET#f=");
+        assert_eq!(base, "https://relay.example/i/abc.SECRET");
+        assert_eq!(f, None);
+        let (base, f) = split_invite("https://relay.example/i/abc.SECRET");
+        assert_eq!(base, "https://relay.example/i/abc.SECRET");
+        assert_eq!(f, None);
+    }
+
+    #[test]
+    fn signed_out_is_one_line() {
+        let r = super::super::gateway::signed_out_result(Some("refused".into()));
+        let v = r.structured_content.unwrap();
+        assert_eq!(v["error"], "SIGNED_OUT");
+        let m = v["message"].as_str().unwrap();
+        assert!(
+            m.starts_with("SIGNED_OUT: this bot's sign-in was revoked; call `login` (force=true)")
+        );
+        assert!(!m.contains('\n'));
+        assert_eq!(v["reason"], "refused");
     }
 }

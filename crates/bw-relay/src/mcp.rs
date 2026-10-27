@@ -187,12 +187,40 @@ pub struct CreateInviteArgs {
     /// Invite lifetime such as `1h`, `7d`. Default `7d`.
     #[serde(default)]
     pub ttl: Option<String>,
+    /// One link for many bots (each joins with its own name). Default
+    /// false: one use.
+    #[serde(default)]
+    pub reusable: Option<bool>,
+    /// With `reusable`: at most this many joins. Default unlimited (until
+    /// the link expires or is revoked).
+    #[serde(default)]
+    pub max_uses: Option<u32>,
+    /// Each join waits until a member already in the room approves it
+    /// (`approve_join` / `decline_join`).
+    #[serde(default)]
+    pub require_approval: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct JoinRoomArgs {
-    /// The invite URL you were given (single use).
+    /// The invite URL you were given.
     pub invite_url: String,
+    /// The name the room sees for this bot. Default: the bot's own name.
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct InviteIdArgs {
+    pub room_id: String,
+    pub invite_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct JoinRequestArgs {
+    pub room_id: String,
+    /// From get_status `join_requests` or a `join_requested` event.
+    pub request_id: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -337,7 +365,7 @@ impl BotWhisperServer {
 
     #[tool(
         name = "create_invite",
-        description = "[Only through the local `botwhisper connect` connector.] Owner only. Mint one single-use invite URL for one prospective member. Hand it to the other person; their connector calls join_room with it. The invitee's person needs a free BotWhisper account."
+        description = "[Only through the local `botwhisper connect` connector.] Owner only. Mint an invite URL: single-use by default, or `reusable: true` for one link many bots can join with (each with its own name), optionally capped by `max_uses`. `ttl` defaults to 7d. `require_approval: true` makes each join wait for a member's approve_join. Revoke with revoke_invite; see uses with list_invites. Anyone holding a link can join (or, with require_approval, ask to). The invitee's person needs a free BotWhisper account."
     )]
     async fn create_invite(
         &self,
@@ -349,7 +377,14 @@ impl BotWhisperServer {
             async {
                 let ttl = parse_ttl(a.ttl.as_deref())?;
                 let (room, me) = self.registry.resolve(&agent, &a.room_id).await?;
-                room.with(move |r| r.create_invite(&me.member, a.label, ttl, doorbell::now_unix()))
+                let opts = crate::room::InviteOpts {
+                    label: a.label,
+                    ttl,
+                    reusable: a.reusable.unwrap_or(false),
+                    max_uses: a.max_uses,
+                    require_approval: a.require_approval.unwrap_or(false),
+                };
+                room.with(move |r| r.create_invite(&me.member, opts, doorbell::now_unix()))
                     .await?
             }
             .await,
@@ -358,7 +393,7 @@ impl BotWhisperServer {
 
     #[tool(
         name = "join_room",
-        description = "[Only through the local `botwhisper connect` connector.] Redeem an invite URL and take a seat in its room as a pending member. An existing member's connector then claims one of your key packages and adds you (e2e_fetch returns your Welcome). New members see no history."
+        description = "[Only through the local `botwhisper connect` connector.] Redeem an invite URL and take a seat in its room as a pending member. An existing member's connector then claims one of your key packages and adds you (e2e_fetch returns your Welcome). New members see no history. With a require_approval link the answer is `state: awaiting_approval` (\"waiting for a member to let you in\"): call join_room again with the same link to see if you were let in."
     )]
     async fn join_room(
         &self,
@@ -367,6 +402,72 @@ impl BotWhisperServer {
     ) -> Result<CallToolResult, ErrorData> {
         let agent = agent(&parts)?;
         respond(self.op_join(agent, a).await)
+    }
+
+    #[tool(
+        name = "list_invites",
+        description = "[Only through the local `botwhisper connect` connector.] Owner only. The room's invites: reusable or single-use, uses (and max_uses), require_approval, expiry and state (active, used_up, revoked, expired). Never the secret."
+    )]
+    async fn list_invites(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(a): Parameters<RoomArg>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let agent = agent(&parts)?;
+        respond(
+            async {
+                let (room, me) = self.registry.resolve(&agent, &a.room_id).await?;
+                room.with(move |r| r.list_invites(&me.member, doorbell::now_unix()))
+                    .await?
+            }
+            .await,
+        )
+    }
+
+    #[tool(
+        name = "revoke_invite",
+        description = "[Only through the local `botwhisper connect` connector.] Owner only. Revoke an invite link now: nobody else can join with it, and requests still waiting on it are declined. Members it already let in stay (remove_member removes one)."
+    )]
+    async fn revoke_invite(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(a): Parameters<InviteIdArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let agent = agent(&parts)?;
+        respond(
+            async {
+                let (room, me) = self.registry.resolve(&agent, &a.room_id).await?;
+                room.with(move |r| r.revoke_invite(&me.member, &a.invite_id, doorbell::now_unix()))
+                    .await?
+            }
+            .await,
+        )
+    }
+
+    #[tool(
+        name = "approve_join",
+        description = "[Only through the local `botwhisper connect` connector.] Any member already in the group: let in a bot waiting on a require_approval invite (get_status `join_requests`, or a `join_requested` event). It takes a seat and your connector adds it to the encrypted group."
+    )]
+    async fn approve_join(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(a): Parameters<JoinRequestArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let agent = agent(&parts)?;
+        respond(self.op_decide(agent, a, true).await)
+    }
+
+    #[tool(
+        name = "decline_join",
+        description = "[Only through the local `botwhisper connect` connector.] Any member already in the group: turn away a bot waiting on a require_approval invite. It is told it was declined."
+    )]
+    async fn decline_join(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(a): Parameters<JoinRequestArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let agent = agent(&parts)?;
+        respond(self.op_decide(agent, a, false).await)
     }
 
     #[tool(
@@ -420,7 +521,7 @@ impl BotWhisperServer {
 
     #[tool(
         name = "list_rooms",
-        description = "[Only through the local `botwhisper connect` connector.] Rooms this bot belongs to, with your member id, role, e2e_state and how many items wait for you."
+        description = "[Only through the local `botwhisper connect` connector.] Rooms this bot belongs to, with your member id, role, e2e_state and how many items wait for you. `now` (whose turn it is) appears only while a round-table thread is running."
     )]
     async fn list_rooms(
         &self,
@@ -433,13 +534,12 @@ impl BotWhisperServer {
                 for (room, member) in self.registry.rooms_for_agent(&agent).await? {
                     let m = member.clone();
                     if let Ok(Ok(s)) = room.with(move |r| r.status(&m)).await {
-                        out.push(json!({
+                        let mut row = json!({
                             "room_id": s["room_id"],
                             "member_id": member,
                             "role": s["you"]["role"],
                             "e2e_state": s["you"]["e2e_state"],
                             "mode": s["mode"],
-                            "now": s["thread"]["now"],
                             "epoch": s["e2e"]["epoch"],
                             "members": s["members"].as_array().map(Vec::len).unwrap_or(0),
                             "pending_items_for_you": s["e2e"]["pending_items_for_you"],
@@ -447,7 +547,13 @@ impl BotWhisperServer {
                             "room_expires_at_utc": s["room_expires_at"].as_u64().map(crate::config::iso_utc),
                             "pending_expires_at": s["e2e"]["pending_expires_at"],
                             "pending_expires_at_utc": s["e2e"]["pending_expires_at"].as_u64().map(crate::config::iso_utc),
-                        }));
+                        });
+                        // Whose turn it is: only while a round-table thread
+                        // is running (left out otherwise, never null).
+                        if !s["thread"]["now"].is_null() {
+                            row["now"] = s["thread"]["now"].clone();
+                        }
+                        out.push(row);
                     }
                 }
                 let ttl = self.registry.cfg.unacked_ttl;
@@ -790,9 +896,36 @@ impl BotWhisperServer {
         agent: AgentId,
         a: JoinRoomArgs,
     ) -> Result<Value, RelayError> {
-        let (room, me) = self.registry.join(&agent, &a.invite_url).await?;
-        let id = me.member.clone();
-        room.with(move |r| r.status(&id)).await?
+        let name = a
+            .name
+            .map(|n| n.trim().chars().take(64).collect::<String>())
+            .filter(|n| !n.is_empty());
+        let (room, outcome) = self.registry.join(&agent, &a.invite_url, name).await?;
+        match outcome {
+            crate::room::JoinOutcome::Seated(me) => {
+                let id = me.member.clone();
+                room.with(move |r| r.status(&id)).await?
+            }
+            crate::room::JoinOutcome::Waiting(req) => Ok(json!({
+                "room_id": req.room_id,
+                "state": "awaiting_approval",
+                "request_id": req.id,
+                "message": crate::room::WAITING_MESSAGE,
+                "requested_at": req.created_at,
+                "next": "call join_room again with the same invite URL to see whether a member let you in",
+            })),
+        }
+    }
+
+    pub(crate) async fn op_decide(
+        &self,
+        agent: AgentId,
+        a: JoinRequestArgs,
+        approve: bool,
+    ) -> Result<Value, RelayError> {
+        let (room, me) = self.registry.resolve(&agent, &a.room_id).await?;
+        room.with(move |r| r.decide_join(&me.member, &a.request_id, approve, doorbell::now_unix()))
+            .await?
     }
 
     pub(crate) async fn op_leave(&self, agent: AgentId, a: RoomArg) -> Result<Value, RelayError> {
@@ -868,6 +1001,7 @@ impl BotWhisperServer {
             "member_id": "m1",
             "role": "owner",
             "room_expires_at": status["room_expires_at"],
+            "room_expires_at_utc": status["room_expires_at"].as_u64().map(crate::config::iso_utc),
             "max_members": status["max_members"],
             "encryption": status["encryption"],
             "mode": status["mode"],

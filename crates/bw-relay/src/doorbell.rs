@@ -155,7 +155,7 @@ impl DoorbellConfig {
 
 /// The one sentence /account and `get_doorbell` both use for wake-ups that
 /// are off (none, or only the automatic sign-in address).
-pub const WAKEUPS_OFF: &str = "Wake-ups are off. Ask your AI to turn them on.";
+pub const WAKEUPS_OFF: &str = "Wake-ups are off. Ask your AI to turn on wake-ups.";
 
 /// How a wake-up reaches the bot, in plain words (shared by /account and
 /// `get_doorbell`).

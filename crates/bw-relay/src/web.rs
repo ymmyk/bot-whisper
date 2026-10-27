@@ -371,8 +371,8 @@ fn ago_html(now: u64, t: u64) -> String {
 }
 
 /// An id shortened for display: its head and its tail, which is the part
-/// that tells two of them apart (every Member ID starts with the Account
-/// ID). It never wraps; the full value is the tooltip, what Copy copies,
+/// that tells two of them apart (Member IDs of bots made before 0.2.11
+/// start with the Account ID). It never wraps; the full value is the tooltip, what Copy copies,
 /// and is shown in full without JavaScript.
 pub(crate) fn short_id(v: &str) -> String {
     let c: Vec<char> = v.chars().collect();
@@ -470,7 +470,7 @@ fn doorbell_setup(st: &OauthState, scope: &str, cfg: &DoorbellConfig) -> String 
 const WAKEUPS_HELP: &str = r##"<details class="help" id="wakeups"><summary>What are wake-ups?</summary>
 <p>A wake-up is a small nudge that tells your bot a new message is waiting, so it does not have to keep checking. It never contains the message itself.</p>
 <p>With wake-ups off, your bot only sees new messages when it checks in. Nothing is lost: messages wait, encrypted, until it does.</p>
-<p>To turn them on, ask your AI to set up wake-ups for your bot. It picks where the nudge goes (a notification app on your phone or computer, or a web address your AI app listens on) and the result shows up here.</p></details>"##;
+<p>Your AI picks where the nudge goes (a notification app on your phone or computer, or a web address your AI app listens on), and the result shows up here.</p></details>"##;
 
 /// How a bot is doing, in plain words.
 enum BotStatus {
@@ -576,7 +576,7 @@ fn account_html(st: &OauthState, acct: &AccountRow, csrf: &str, banner: &str) ->
     let mut danger_rows = String::new();
     let mut any_waiting = false;
     for b in &all_bots {
-        let my_seats: Vec<&AccountSeat> = bot_seats(acct, b, &seats).collect();
+        let my_seats: Vec<&AccountSeat> = bot_seats(b, &seats).collect();
         let status = bot_status(db, b, now);
         let live = db.bot_live_client(&b.id, now).ok().flatten();
         let name = esc(&b.name);
@@ -629,7 +629,7 @@ fn account_html(st: &OauthState, acct: &AccountRow, csrf: &str, banner: &str) ->
             }
         }
         let wake = if sentences.is_empty() {
-            r#"<div class="wake"><span class="pill off">Off</span><div><p><strong>Wake-ups are off.</strong> Ask your AI to turn them on.</p></div></div>"#.to_string()
+            r#"<div class="wake"><span class="pill off">Off</span><div><p><strong>Wake-ups are off.</strong> Ask your AI to turn on wake-ups.</p></div></div>"#.to_string()
         } else {
             let setup = if setup.is_empty() {
                 String::new()
@@ -660,20 +660,16 @@ fn account_html(st: &OauthState, acct: &AccountRow, csrf: &str, banner: &str) ->
 
         let disconnect = if live.is_some() {
             format!(
-                r#"<form method="post" action="/account/disconnect">{csrf_input}<input type="hidden" name="bot_id" value="{id}"><button type="submit" class="small">Disconnect</button></form>"#,
+                r#"<form method="post" action="/account/disconnect">{csrf_input}<input type="hidden" name="bot_id" value="{id}"><button type="submit" class="small quiet" aria-label="Disconnect {name}…">Disconnect…</button></form>"#,
             )
         } else {
             String::new()
         };
-        let connect_cmd = format!(
-            "botwhisper connect --relay {base} --bot-name {}",
-            sh_single_quote(&b.name)
-        );
+        // The connect command lives once, in "Add a bot"; a card only says
+        // what to ask for.
         let reconnect = if matches!(status, BotStatus::NotConnected) {
             format!(
-                r#"<details class="reconnect"><summary>Reconnect this bot</summary><p>Ask your AI to call <code>login</code> and pick <strong>{name}</strong> on the approval page, or run:</p><div class="cmd"><div class="cmd-h"><span>Connect command</span>{copy}</div><pre>{cmd}</pre></div></details>"#,
-                cmd = esc(&connect_cmd),
-                copy = copy_named(&connect_cmd, &format!("connect command for {}", b.name)),
+                r##"<details class="reconnect"><summary>Reconnect this bot</summary><p>Ask your AI to call <code>login</code> and pick <strong>{name}</strong> on the approval page (setting up a new computer? see <a href="#add-bot">Add a bot</a>).</p></details>"##,
             )
         } else {
             String::new()
@@ -682,7 +678,7 @@ fn account_html(st: &OauthState, acct: &AccountRow, csrf: &str, banner: &str) ->
             r#"<article class="card bot" aria-labelledby="bot-{id}"><div class="body">
 <div class="bot-head"><span class="avatar" aria-hidden="true">{initial}</span><div class="bot-title"><h3 id="bot-{id}">{name}</h3><p class="meta">{detail} Added {created}.</p></div>{seen}</div>
 <dl class="kv"><dt>Member ID</dt><dd>{member}</dd><dt>Wake-ups</dt><dd>{wake}</dd><dt>Rooms</dt><dd>{rooms_dd}</dd></dl>{reconnect}
-</div><div class="foot"><form class="rename" method="post" action="/account/bots/rename">{csrf_input}<input type="hidden" name="bot_id" value="{id}"><label for="name-{id}" class="sr-only">Name for {name}</label><input id="name-{id}" name="name" type="text" maxlength="60" value="{name}"><button type="submit" class="small">Rename</button></form>{disconnect}</div></article>
+</div><div class="foot"><details class="manage"><summary>Manage {name}</summary><div class="manage-body"><form class="rename" method="post" action="/account/bots/rename">{csrf_input}<input type="hidden" name="bot_id" value="{id}"><label for="name-{id}" class="sr-only">Name for {name}</label><input id="name-{id}" name="name" type="text" maxlength="60" value="{name}"><button type="submit" class="small">Rename</button></form>{disconnect}</div></details></div></article>
 "#,
             initial = esc(&initial(&b.name)),
             seen = seen_html(&status, b.last_used_at, now),
@@ -742,11 +738,42 @@ fn account_html(st: &OauthState, acct: &AccountRow, csrf: &str, banner: &str) ->
     }
     let mut invite_rows = String::new();
     for i in &invites {
-        let (state, kind) = match i.redeemed_at {
-            Some(t) => (format!("used {}", time_html(t)), "off"),
-            None if i.expires_at <= now => (format!("expired {}", time_html(i.expires_at)), "off"),
-            None => (format!("unused, expires {}", time_html(i.expires_at)), "on"),
+        let used_up = i.max_uses.is_some_and(|m| i.uses >= m);
+        let (mut state, kind) = if let Some(t) = i.revoked_at {
+            (format!("revoked {}", time_html(t)), "off")
+        } else if !i.reusable {
+            match i.redeemed_at {
+                Some(t) => (format!("used {}", time_html(t)), "off"),
+                None if i.expires_at <= now => {
+                    (format!("expired {}", time_html(i.expires_at)), "off")
+                }
+                None => (
+                    format!("single-use, unused, expires {}", time_html(i.expires_at)),
+                    "on",
+                ),
+            }
+        } else {
+            let uses = match i.max_uses {
+                Some(m) => format!("{} of {m} uses", i.uses),
+                None => format!("{} use{}", i.uses, if i.uses == 1 { "" } else { "s" }),
+            };
+            if used_up {
+                (format!("reusable, used up ({uses})"), "off")
+            } else if i.expires_at <= now {
+                (
+                    format!("reusable, expired {} ({uses})", time_html(i.expires_at)),
+                    "off",
+                )
+            } else {
+                (
+                    format!("reusable, {uses}, expires {}", time_html(i.expires_at)),
+                    "on",
+                )
+            }
         };
+        if i.require_approval && kind == "on" {
+            state.push_str(" · a member approves each join");
+        }
         invite_rows.push_str(&format!(
             r#"<div class="row"><div class="row-main"><p class="row-title">Invite <code class="mono">{id}…</code>{label}</p><p class="meta">For room <code>{room}</code> · <span class="state {kind}">{state}</span></p></div></div>"#,
             id = esc(&short(&i.id)),
@@ -807,8 +834,7 @@ fn account_html(st: &OauthState, acct: &AccountRow, csrf: &str, banner: &str) ->
     format!(
         r##"{top}<div class="wrap">{rail}<main id="main">
 {banner}<div class="page-head"><h1>Your account</h1><p class="meta">Signed in as <strong>{email}</strong> · account created {created}</p></div>
-<section class="sec" aria-labelledby="bots"><div class="sec-head"><div><h2 id="bots">Your bots</h2><p class="lead">Each bot is its own member in rooms, with one live connection at a time. A bot's Member ID is its identity in every room it joins: it is what the other members' bots see. Not a password.</p></div><a class="btn primary" href="#add-bot">Add a bot</a></div>
-<p class="hint" id="which-id"><strong>Which ID to share?</strong> To show someone which bot is yours, share that bot's Member ID (below): it is what other members' bots see in rooms. Share your Account ID only with BotWhisper support.</p>
+<section class="sec" aria-labelledby="bots"><div class="sec-head"><div><h2 id="bots">Your bots</h2><p class="lead">Each bot is its own member in rooms, with one live connection at a time. A bot's Member ID is its identity in every room it joins: share it to show someone which bot is yours. Not a password.</p></div><a class="btn primary" href="#add-bot">Add a bot</a></div>
 <div class="stack" data-autorefresh>{bots}</div>
 {wakeups_help}</section>
 {add_bot}
@@ -961,6 +987,10 @@ button.danger:hover{background:var(--danger);border-color:var(--danger);color:#f
 button.danger.solid{background:var(--danger);border-color:var(--danger);color:#fff}
 button.danger.solid:hover{background:var(--danger-hover)}
 button.copy{padding:4px 10px;font-size:.8rem;border-radius:7px}
+button.quiet{border-color:transparent;background:none;color:var(--muted)}
+button.quiet:hover{color:var(--danger);border-color:var(--danger-border);background:var(--surface)}
+details.manage{width:100%}
+.manage-body{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:10px 16px;margin-top:10px}
 button.copy.primary{padding:6px 12px}
 @media (prefers-color-scheme:dark){button.danger:hover,button.danger.solid{color:#16090a}}
 input[type=text],input[type=email]{font:inherit;font-size:.92rem;padding:8px 11px;border:1px solid var(--border-strong);border-radius:9px;background:var(--surface);color:var(--text);min-width:0}
@@ -1000,9 +1030,12 @@ main.narrow p,main.narrow ul{margin:10px 0}
 main.narrow form{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:16px}
 @media (max-width:860px){
 .wrap{grid-template-columns:minmax(0,1fr);gap:0;padding-top:16px}
-.rail{margin:0 -20px 20px;overflow-x:auto;border-bottom:1px solid var(--border)}
-.rail nav{position:static;flex-direction:row;gap:4px;padding:0 14px 10px;width:max-content}
-.rail a{padding:6px 10px;white-space:nowrap}
+.rail{margin:0 -20px 20px;border-bottom:1px solid var(--border)}
+.rail nav{position:static;flex-direction:row;flex-wrap:wrap;gap:4px;padding:0 14px 10px}
+.rail a{padding:6px 12px;white-space:nowrap;min-height:44px;display:inline-flex;align-items:center}
+button,.btn,button.small,button.copy,input[type=text],input[type=email]{min-height:44px}
+.idchip code{display:flex;align-items:center}
+details>summary{min-height:44px}
 }
 @media (max-width:560px){
 body.acct{font-size:15px}
@@ -1094,13 +1127,10 @@ pub struct AccountForm {
 
 /// The account's seats held by one bot.
 fn bot_seats<'a>(
-    acct: &'a AccountRow,
     bot: &'a BotRow,
     seats: &'a [AccountSeat],
 ) -> impl Iterator<Item = &'a AccountSeat> + 'a {
-    seats
-        .iter()
-        .filter(move |s| format!("{}:{}", acct.id, s.client_id) == bot.agent_id)
+    seats.iter().filter(move |s| s.agent_id == bot.agent_id)
 }
 
 /// Signed in, CSRF valid, and the form names one of this account's bots.
@@ -1208,7 +1238,7 @@ pub async fn delete_post(
         Err(r) => return r,
     };
     let seats = st.db.account_seats(&acct.id).unwrap_or_default();
-    let mine: Vec<&AccountSeat> = bot_seats(&acct, &bot, &seats).collect();
+    let mine: Vec<&AccountSeat> = bot_seats(&bot, &seats).collect();
     if f.confirm.as_deref() != Some("yes") {
         let rooms: Vec<String> = mine
             .iter()

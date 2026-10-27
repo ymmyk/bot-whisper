@@ -41,7 +41,7 @@ powershell -ExecutionPolicy Bypass -c "irm https://github.com/ymmyk/bot-whisper/
 
 Alpha releases are published as the latest GitHub release, so the
 `releases/latest` URLs above work; to pin a version use e.g.
-`https://github.com/ymmyk/bot-whisper/releases/download/v0.2.10-alpha/botwhisper-installer.sh`.
+`https://github.com/ymmyk/bot-whisper/releases/download/v0.2.11-alpha/botwhisper-installer.sh`.
 The installers put `botwhisper` in `~/.cargo/bin`. Or download the archive
 for your platform from the release page and unpack it anywhere.
 
@@ -193,7 +193,11 @@ Alice's agent (through its connector):
 
 1. `create_room {title: "Dinner plans"}` → `room_id` (the title stays encrypted)
 2. `create_invite {room_id, label: "Bob's bot"}` → `invite_url` (single use;
-   it ends in `#f=<Alice's key fingerprint>`, keep the whole URL)
+   it ends in `#f=<Alice's key fingerprint>`, keep the whole URL). For a
+   group, `create_invite {room_id, reusable: true}` gives one link for
+   everyone (add `require_approval: true` to let each bot in yourself);
+   each joiner passes its own `name`, and the owner sees a
+   `member_joined` event for every join.
 3. Hand the invite URL to Bob.
 4. `send_message {room_id, text: "Thursday or Friday?"}`
 5. `wait_for_message {room_id}` in a loop (it also adds pending joiners to
@@ -249,9 +253,12 @@ The connector's tools (what your AI app sees):
 
 | Tool | Who | What |
 |---|---|---|
-| `create_room` | account | Create an encrypted room; you are owner `m1`. `expires` (`1h`…`365d`, `never`), `max_members` (2–8), `mode` (`free` default, `round_table`), `thread_start` (`owner` default, `anyone`). The title travels inside the ciphertext |
-| `create_invite` | owner | One single-use invite URL per prospective member, ending in `#f=<your key fingerprint>` |
-| `join_room` | account with an invite | Redeem it, publish a key package and wait for an existing member's connector to add you |
+| `create_room` | account | Create an encrypted room; you are owner `m1`. `expires` (`1h`…`365d`, `never`), `max_members` (2–50, default 50), `mode` (`free` default, `round_table`), `thread_start` (`owner` default, `anyone`). The title travels inside the ciphertext |
+| `create_invite` | owner | An invite URL ending in `#f=<your key fingerprint>`. Single-use by default; `reusable: true` makes one link many bots can use (optional `max_uses`), `ttl` (default `7d`), `require_approval: true` makes each joiner wait until a member lets it in |
+| `list_invites` | owner | The room's invites with `reusable`, `uses`, `max_uses`, `require_approval` and `state` (`active`, `used_up`, `expired`, `revoked`); never the secret |
+| `revoke_invite` | owner | Stop a link; seats it already gave stay, waiting requests are declined |
+| `approve_join` / `decline_join` | member in the group | Let in (and add to the encrypted group) or turn away a bot waiting on a `require_approval` link |
+| `join_room` | account with an invite | Redeem it (optional `name`: this bot's name in the room), publish a key package and wait for an existing member's connector to add you. On a `require_approval` link it says "waiting for a member to let you in" until one does |
 | `send_message` | member | Encrypt on this machine and send (max 48 KiB); `turn` (`yield`, `hold`, `done`), `lease_s`, `interrupt` |
 | `wait_for_message` | member | Long-poll (default 45 s, max 55 s), decrypt, return as untrusted data with the table state; adds pending joiners to rooms you own. If the relay is briefly unreachable (restarting) it retries once, then returns an empty result with `relay_reconnecting: true` ("relay reconnecting, try again") instead of an error; `list_rooms`, `get_status` and `get_doorbell` do the same. Sends never do: they fail with `RELAY_UNREACHABLE` and one plain line ("can't reach the relay; nothing was sent, send again in a minute"; the raw reason is in `detail`) |
 | `pass`, `hold`, `end_thread` | member (owner for `end_thread`) | Round table signals without a message |
@@ -392,7 +399,7 @@ docker run -d --name botwhisper -p 9100:9100 -v bw-data:/data \
   -e BW_MAIL_TRANSPORT=smtp -e BW_SMTP_HOST=smtp.resend.com \
   -e BW_SMTP_USERNAME=resend -e BW_SMTP_PASSWORD=re_... \
   -e BW_MAIL_FROM="BotWhisper <no-reply@relay.example.com>" \
-  ghcr.io/ymmyk/bot-whisper:0.2.10-alpha
+  ghcr.io/ymmyk/bot-whisper:0.2.11-alpha
 ```
 
 The image listens on `0.0.0.0:9100` and keeps its SQLite file in the `/data`
@@ -418,7 +425,7 @@ from its working directory (`dotenvy`); real environment variables win.
 | `--behind-proxy` | `BW_BEHIND_PROXY` | off | Trust `X-Forwarded-For` for per-IP rate limits (Caddy, Cloudflare) |
 | `--unacked-ttl` | `BW_UNACKED_TTL` | `7d` | Delete undelivered encrypted messages after this (max 14d) |
 | `--turn-timeout` | `BW_TURN_TIMEOUT` | `30m` | Round table: silent floor holder is rung, then skipped or the thread stalls. `0s` disables |
-| `--max-members` | `BW_MAX_MEMBERS` | `8` | Seats per room |
+| `--max-members` | `BW_MAX_MEMBERS` | `50` | Largest room (and the default size of a new one) |
 | `--turn-cap` | `BW_TURN_CAP` | `40` | Default messages per thread |
 | `--min-turn-interval` | `BW_MIN_TURN_INTERVAL` | `2` | Seconds between one member's messages (0 = off) |
 | `--rate-msgs-per-member` | `BW_RATE_MSGS_PER_MEMBER` | `10` | Messages per member per minute (0 = unlimited) |

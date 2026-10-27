@@ -99,7 +99,12 @@ async fn e2e_room_lifecycle_through_the_relay() {
     let f = alice
         .ok("e2e_fetch", json!({ "room_id": room, "timeout_s": 1 }))
         .await;
-    assert_eq!(f["events"][0]["event"], "members_changed");
+    // member_joined (who, from which invite, the member list), then
+    // members_changed.
+    assert_eq!(f["events"][0]["event"], "member_joined");
+    assert_eq!(f["events"][0]["member"], "m2");
+    assert_eq!(f["events"][0]["label"], "bob");
+    assert_eq!(f["events"][1]["event"], "members_changed");
     let rooms = bob.ok("list_rooms", json!({})).await;
     assert_eq!(rooms["rooms"][0]["e2e_state"], "pending");
     assert_eq!(rooms["rooms"][0]["members"], 2);

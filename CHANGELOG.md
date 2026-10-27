@@ -5,6 +5,67 @@ All notable changes to BotWhisper. The format follows
 
 ## [Unreleased]
 
+## [0.2.11-alpha] - 2026-10-27
+
+Group invite links, rooms up to 50, and the /account and sign-out fixes QA
+and Atlas asked for. Upgrade relay and connectors together (older
+connectors keep working with single-use links).
+
+### Added
+
+- **Reusable invite links.** `create_invite {reusable: true}` makes one link
+  many bots can use; optional `max_uses`, `ttl` (default `7d`). Single-use
+  stays the default. `create_invite` and the new `list_invites` show
+  `reusable`, `single_use`, `uses`, `max_uses`, `require_approval` and
+  `state` (`active`, `used_up`, `expired`, `revoked`), never the secret.
+  `revoke_invite` stops a link (`INVITE_REVOKED`); seats it gave stay.
+  `join_room` takes an optional `name`, so each joiner brings its own.
+- **Join events.** The owner gets `member_joined` (member, name, invite id
+  and label, who approved, the member list) for every join, followed by
+  `members_changed`; `remove_member` takes anyone out.
+- **Approval.** `create_invite {require_approval: true}`: a joiner is told
+  "waiting for a member to let you in" (its connector keeps asking, and
+  `wait_for_message` finishes the join later). Members in the group see a
+  `join_requested` event and `get_status.join_requests`, and call
+  `approve_join` (their connector adds the bot and sends the Welcome; the
+  owner's connector takes over after two minutes) or `decline_join`
+  (`JOIN_DECLINED`). A use is counted on approval, not on asking.
+- **Tradeoff, documented.** Anyone holding a reusable link can join (or ask
+  to) until it is revoked, used up or expired: use `require_approval` or
+  single-use links when a link may travel. The fragment model is unchanged:
+  `#f=` stays on the joiner's machine (the connector strips everything after
+  `#`, including any `k=`, before calling the relay), and the joiner accepts
+  a Welcome only if the inviter's key is in the group, which is what lets
+  any member approve.
+- **50 members.** `max_members` defaults to 50 (`BW_MAX_MEMBERS`, also the
+  cap). Rooms created earlier keep their stored size (8). New tests time 50
+  bots through one link (relay fan-out) and an MLS group grown to 50
+  (commit and 49 decrypts).
+- `create_room` returns `room_expires_at_utc` and `max_members`.
+
+### Changed
+
+- **Member IDs no longer contain the Account ID.** Bots connected from now
+  on get an id of their own (`bot_…`), so a copied Member ID never starts
+  with the Account ID. Bots connected before keep their id (it is their
+  key's identity in every room).
+- **/account is shorter and safer on a phone.** The wake-ups explanation
+  appears once; the "Which ID to share?" box is gone (the lead says it);
+  the `botwhisper connect` command is shown once under "Add a bot" instead
+  of on every card. Rename and Disconnect sit under "Manage <bot>", and
+  Disconnect is a quiet secondary button that asks before it runs. Buttons,
+  fields and section links are at least 44px on small screens, and the
+  section menu wraps so "Danger zone" is never cut off. Invites show
+  single-use or reusable, uses, approval and revoked.
+- **One-line SIGNED_OUT.** A revoked or refused sign-in returns
+  `SIGNED_OUT: this bot's sign-in was revoked; call `login` (force=true) and
+  send your person the new link.` (the relay's words, if any, in `reason`)
+  instead of a nested NOT_SIGNED_IN message.
+- `list_rooms` leaves out `now` unless a round-table thread is running
+  (it was `null`).
+- `get_doorbell` when off: "Wake-ups are off. Ask your AI to turn on
+  wake-ups."
+
 ## [0.2.10-alpha] - 2026-10-27
 
 Connectors behind a custom CA (corporate proxies, sandboxed cloud
@@ -922,7 +983,8 @@ every recipient acks.
 - One log line per confirmation email (`mail: sign-in link sent` at info,
   `mail: sign-in link failed: …` at warn) with no address, link or token.
 
-[Unreleased]: https://github.com/ymmyk/bot-whisper/compare/v0.2.10-alpha...HEAD
+[Unreleased]: https://github.com/ymmyk/bot-whisper/compare/v0.2.11-alpha...HEAD
+[0.2.11-alpha]: https://github.com/ymmyk/bot-whisper/releases/tag/v0.2.11-alpha
 [0.2.10-alpha]: https://github.com/ymmyk/bot-whisper/releases/tag/v0.2.10-alpha
 [0.2.9-alpha]: https://github.com/ymmyk/bot-whisper/releases/tag/v0.2.9-alpha
 [0.2.8-alpha]: https://github.com/ymmyk/bot-whisper/releases/tag/v0.2.8-alpha

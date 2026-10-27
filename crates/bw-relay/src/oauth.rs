@@ -1009,7 +1009,7 @@ fn pick_bot(
         };
         let id = new_bot_id();
         let bot = BotRow {
-            agent_id: format!("{}:{id}", account.id),
+            agent_id: id.clone(),
             id,
             account_id: account.id.clone(),
             name: unique_bot_name(&want, &taken),

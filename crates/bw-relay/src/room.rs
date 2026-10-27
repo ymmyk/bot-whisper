@@ -40,7 +40,7 @@ struct SavedFlow {
 use crate::{
     auth::AgentId,
     config::RelayConfig,
-    db::{Db, InviteRow, MemberRow, RoomRow, SeatState, ThreadStart},
+    db::{Db, InviteRow, JoinRequest, MemberRow, RoomRow, SeatState, ThreadStart},
     doorbell::{self, DoorbellConfig, DoorbellKey, DoorbellPayload, Doorbells, Ring},
     error::RelayError,
     ratelimit::Limiter,
@@ -50,6 +50,35 @@ use crate::{
 /// How long a closed room keeps answering so waiters can collect their
 /// `room_closed` event before the actor exits.
 const CLOSE_GRACE: Duration = Duration::from_secs(60);
+
+/// A seat approved by a member is added to the MLS group by that member's
+/// connector; if it has not after this long, the owner's connector may.
+pub const ADDER_GRACE_S: u64 = 120;
+
+/// Join requests that may wait for approval in one room at once.
+pub const MAX_WAITING_JOINS: usize = 50;
+
+/// What joiners are told while their request waits.
+pub const WAITING_MESSAGE: &str = "waiting for a member to let you in";
+
+/// What `join` did.
+#[derive(Debug, Clone)]
+pub enum JoinOutcome {
+    /// Seated (pending until a member's connector adds it to the group).
+    Seated(Member),
+    /// The invite needs a member's approval first.
+    Waiting(JoinRequest),
+}
+
+/// Options for `create_invite`.
+#[derive(Debug, Clone, Default)]
+pub struct InviteOpts {
+    pub label: Option<String>,
+    pub ttl: Option<Duration>,
+    pub reusable: bool,
+    pub max_uses: Option<u32>,
+    pub require_approval: bool,
+}
 
 /// Member role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -82,6 +111,9 @@ pub struct Member {
     /// `pending` until added to the MLS group by a member's commit, then
     /// `active`.
     pub e2e_state: SeatState,
+    /// The member who approved this join (and adds it to the group).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub adder: Option<String>,
 }
 
 impl Member {
@@ -125,6 +157,33 @@ pub enum MemberEvent {
     /// The owner switched the room mode.
     ModeChanged {
         mode: TurnMode,
+    },
+    /// A bot took a seat (through an invite, or approved). Everyone sees
+    /// who, through which invite, and the member list.
+    MemberJoined {
+        member: MemberId,
+        display_name: Option<String>,
+        invite_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        approved_by: Option<MemberId>,
+        members: Vec<MemberId>,
+    },
+    /// A bot asks to join through a `require_approval` invite: any joined
+    /// member may `approve_join` or `decline_join` it.
+    JoinRequested {
+        request_id: String,
+        display_name: Option<String>,
+        invite_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+    },
+    /// A join request was decided (by `by`).
+    JoinDecided {
+        request_id: String,
+        approved: bool,
+        by: MemberId,
     },
     /// `members` are the seats that are in the group (confirmed);
     /// `pending` are seated but not joined yet (waiting for a commit, or
@@ -218,6 +277,7 @@ impl Room {
             // The creator's connector creates the MLS group locally, so the
             // owner is active from the start.
             e2e_state: SeatState::Active,
+            adder: None,
         };
         db.insert_member(&id, &member_row(&owner))?;
         Ok(Self::from_parts(
@@ -257,6 +317,7 @@ impl Room {
                 invite_label: m.invite_label,
                 joined_at: m.joined_at,
                 e2e_state: m.e2e_state,
+                adder: m.adder,
             })
             .collect();
         let doorbells = db.doorbells(id)?;
@@ -548,16 +609,23 @@ impl Room {
 
     // ----- invites and membership -----
 
-    /// Owner only. Returns the single-use invite URL.
+    /// Owner only. Returns the invite URL (single-use unless `reusable`).
     pub fn create_invite(
         &mut self,
         by: &str,
-        label: Option<String>,
-        ttl: Option<Duration>,
+        o: InviteOpts,
         now: u64,
     ) -> Result<Value, RelayError> {
         self.require_open()?;
         self.require_owner(by, "create invites")?;
+        if !o.reusable && o.max_uses.is_some() {
+            return Err(RelayError::invalid(
+                "max_uses needs reusable: true (a single-use link has one use)",
+            ));
+        }
+        if o.max_uses == Some(0) {
+            return Err(RelayError::invalid("max_uses must be at least 1"));
+        }
         let max = self.cfg.limits.invites_per_room;
         if max > 0 && self.db.count_open_invites(&self.id, now)? >= max {
             return Err(RelayError::new(
@@ -569,67 +637,327 @@ impl Room {
         rand::rng().fill_bytes(&mut secret);
         let secret = hex::encode(secret);
         let id = uuid::Uuid::new_v4().simple().to_string();
-        let ttl = ttl.unwrap_or(self.cfg.default_invite_ttl);
-        let expires_at = now + ttl.as_secs();
-        self.db.insert_invite(&InviteRow {
+        let ttl = o.ttl.unwrap_or(self.cfg.default_invite_ttl);
+        let row = InviteRow {
             id: id.clone(),
             room_id: self.id.clone(),
             secret_hash: hex::encode(Sha256::digest(secret.as_bytes())),
-            label: label.clone(),
-            expires_at,
+            label: o.label,
+            expires_at: now + ttl.as_secs(),
             redeemed_at: None,
-        })?;
-        Ok(json!({
-            "invite_id": id,
-            "invite_url": format!("{}/i/{id}.{secret}", self.cfg.public_url()),
-            "label": label,
-            "expires_at": expires_at,
-            "single_use": true,
-        }))
+            reusable: o.reusable,
+            max_uses: o.max_uses,
+            uses: 0,
+            require_approval: o.require_approval,
+            revoked_at: None,
+            created_at: Some(now),
+        };
+        self.db.insert_invite(&row)?;
+        let mut v = row.public_json(now);
+        v["invite_url"] = json!(format!("{}/i/{id}.{secret}", self.cfg.public_url()));
+        Ok(v)
+    }
+
+    /// Owner only: the room's invites (never their secrets).
+    pub fn list_invites(&self, by: &str, now: u64) -> Result<Value, RelayError> {
+        self.require_open()?;
+        self.require_owner(by, "list invites")?;
+        let invites: Vec<Value> = self
+            .db
+            .room_invites(&self.id)?
+            .iter()
+            .map(|i| i.public_json(now))
+            .collect();
+        Ok(json!({ "room_id": self.id, "invites": invites }))
+    }
+
+    /// Owner only: revoke an invite link. Seats it already gave stay;
+    /// requests still waiting on it are declined.
+    pub fn revoke_invite(
+        &mut self,
+        by: &str,
+        invite_id: &str,
+        now: u64,
+    ) -> Result<Value, RelayError> {
+        self.require_open()?;
+        self.require_owner(by, "revoke invites")?;
+        let Some(inv) = self
+            .db
+            .get_invite(invite_id)?
+            .filter(|i| i.room_id == self.id)
+        else {
+            return Err(RelayError::invalid(format!(
+                "no such invite in this room: {invite_id}"
+            )));
+        };
+        let changed = self.db.revoke_invite(&self.id, invite_id, now)?;
+        for r in self.db.join_requests(&self.id)? {
+            if r.invite_id == invite_id && r.status == "waiting" {
+                self.decide(&r, false, by, now)?;
+            }
+        }
+        let inv = self.db.get_invite(invite_id)?.unwrap_or(inv);
+        let mut v = inv.public_json(now);
+        v["revoked"] = json!(true);
+        v["already_revoked"] = json!(!changed);
+        Ok(v)
     }
 
     /// Redeem an invite that the registry already looked up and verified.
-    /// The new member is `pending` until a member's commit adds it.
+    /// The new member is `pending` until a member's commit adds it; with
+    /// `require_approval` it waits for a member's `approve_join` first.
+    /// Asking again with the same link reports where the request stands.
     pub fn join(
         &mut self,
         invite: &InviteRow,
         agent: &AgentId,
+        name: Option<String>,
         now: u64,
-    ) -> Result<Member, RelayError> {
+    ) -> Result<JoinOutcome, RelayError> {
         self.require_open()?;
-        if self.member_for_agent(&agent.id).is_some() {
+        let requests = self.db.join_requests(&self.id)?;
+        let mine = requests
+            .iter()
+            .rfind(|r| r.agent_id == agent.id && r.invite_id == invite.id)
+            .cloned();
+        if let Some(m) = self.member_for_agent(&agent.id) {
+            // Approved earlier and asking again: here is the seat.
+            if mine.as_ref().is_some_and(|r| r.status == "approved") {
+                return Ok(JoinOutcome::Seated(m.clone()));
+            }
             return Err(RelayError::new(
                 ErrorCode::AlreadyMember,
                 "this bot is already a member of the room",
             ));
         }
+        if let Some(r) = &mine {
+            match r.status.as_str() {
+                "waiting" => return Ok(JoinOutcome::Waiting(r.clone())),
+                "declined" => {
+                    return Err(RelayError::new(
+                        ErrorCode::JoinDeclined,
+                        "a member declined this bot's request to join; ask the owner",
+                    ))
+                }
+                // Approved, then removed or left: a fresh join below.
+                _ => {}
+            }
+        }
+        if invite.revoked_at.is_some() {
+            return Err(revoked());
+        }
+        if !invite.has_uses_left() {
+            return Err(used_up(invite));
+        }
+        if now >= invite.expires_at {
+            return Err(RelayError::new(
+                ErrorCode::InviteExpired,
+                "this invite has expired; ask the owner for a new one",
+            ));
+        }
         if self.members.len() as u32 >= self.max_members {
             return Err(RelayError::new(ErrorCode::RoomFull, "the room is full"));
         }
-        if !self.db.redeem_invite(&invite.id, now)? {
-            return Err(RelayError::new(
-                ErrorCode::InviteUsed,
-                "this invite was already used; ask the owner for a new one",
-            ));
+        let display_name = name.or_else(|| agent.name.clone());
+        if invite.require_approval {
+            if requests.iter().filter(|r| r.status == "waiting").count() >= MAX_WAITING_JOINS {
+                return Err(RelayError::new(
+                    ErrorCode::RateLimited,
+                    "too many join requests are waiting in this room; try again later",
+                ));
+            }
+            let req = JoinRequest {
+                id: format!("j{}", &uuid::Uuid::new_v4().simple().to_string()[..12]),
+                room_id: self.id.clone(),
+                invite_id: invite.id.clone(),
+                agent_id: agent.id.clone(),
+                display_name: display_name.clone(),
+                label: invite.label.clone(),
+                created_at: now,
+                status: "waiting".into(),
+                decided_by: None,
+                member_id: None,
+            };
+            self.db.insert_join_request(&req)?;
+            self.broadcast_joined_only(MemberEvent::JoinRequested {
+                request_id: req.id.clone(),
+                display_name,
+                invite_id: invite.id.clone(),
+                label: invite.label.clone(),
+            });
+            self.ring_all("members_changed", None, now);
+            self.touch();
+            return Ok(JoinOutcome::Waiting(req));
         }
+        if !self.db.redeem_invite(&invite.id, now)? {
+            return Err(used_up(invite));
+        }
+        let member = self.seat(agent.id.clone(), display_name, invite, None, now)?;
+        Ok(JoinOutcome::Seated(member))
+    }
+
+    /// Give a bot a pending seat and tell everyone.
+    fn seat(
+        &mut self,
+        agent_id: String,
+        display_name: Option<String>,
+        invite: &InviteRow,
+        approved_by: Option<String>,
+        now: u64,
+    ) -> Result<Member, RelayError> {
         let member = Member {
             member: format!("m{}", self.next_member_n),
-            agent_id: agent.id.clone(),
-            display_name: agent.name.clone(),
+            agent_id,
+            display_name,
             role: Role::Member,
             invite_label: invite.label.clone(),
             joined_at: now,
             e2e_state: SeatState::Pending,
+            adder: approved_by.clone(),
         };
         self.next_member_n += 1;
         self.db.set_next_member_n(&self.id, self.next_member_n)?;
         self.db.insert_member(&self.id, &member_row(&member))?;
         self.members.push(member.clone());
+        let joined = MemberEvent::MemberJoined {
+            member: member.member.clone(),
+            display_name: member.display_name.clone(),
+            invite_id: invite.id.clone(),
+            label: invite.label.clone(),
+            approved_by,
+            members: self.member_ids(),
+        };
+        self.broadcast_event(joined, Some(&member.member));
         let ev = self.members_changed_event();
         self.broadcast_event(ev, Some(&member.member));
         self.ring_all("members_changed", Some(&member.member), now);
         self.touch();
         Ok(member)
+    }
+
+    /// Events for members already in the group (not pending seats).
+    fn broadcast_joined_only(&mut self, ev: MemberEvent) {
+        for id in self.joined_ids() {
+            self.push_event(&id, ev.clone());
+        }
+    }
+
+    /// Requests waiting for approval, for joined members.
+    pub fn waiting_joins(&self) -> Vec<Value> {
+        self.db
+            .join_requests(&self.id)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.status == "waiting")
+            .map(|r| {
+                json!({
+                    "request_id": r.id,
+                    "display_name": r.display_name,
+                    "invite_id": r.invite_id,
+                    "label": r.label,
+                    "requested_at": r.created_at,
+                })
+            })
+            .collect()
+    }
+
+    /// A joined member approves or declines a waiting join request.
+    pub fn decide_join(
+        &mut self,
+        by: &str,
+        request_id: &str,
+        approve: bool,
+        now: u64,
+    ) -> Result<Value, RelayError> {
+        self.require_open()?;
+        let me = self.member(by)?;
+        if !me.is_e2e_active() {
+            return Err(RelayError::invalid(
+                "only members already in the group can let others in",
+            ));
+        }
+        let Some(req) = self
+            .db
+            .join_requests(&self.id)?
+            .into_iter()
+            .find(|r| r.id == request_id)
+        else {
+            return Err(RelayError::invalid(format!(
+                "no such join request: {request_id}"
+            )));
+        };
+        if req.status != "waiting" {
+            return Err(RelayError::invalid(format!(
+                "that request was already {} by {}",
+                req.status,
+                req.decided_by.as_deref().unwrap_or("someone")
+            )));
+        }
+        if approve {
+            let invite = self.db.get_invite(&req.invite_id)?;
+            let Some(invite) = invite.filter(|i| i.revoked_at.is_none()) else {
+                self.decide(&req, false, by, now)?;
+                return Err(revoked());
+            };
+            if self.member_for_agent(&req.agent_id).is_some() {
+                self.decide(&req, false, by, now)?;
+                return Err(RelayError::new(
+                    ErrorCode::AlreadyMember,
+                    "that bot is already a member",
+                ));
+            }
+            if self.members.len() as u32 >= self.max_members {
+                return Err(RelayError::new(ErrorCode::RoomFull, "the room is full"));
+            }
+            if !self.db.redeem_invite(&invite.id, now)? {
+                self.decide(&req, false, by, now)?;
+                return Err(used_up(&invite));
+            }
+            let member = self.seat(
+                req.agent_id.clone(),
+                req.display_name.clone(),
+                &invite,
+                Some(by.to_string()),
+                now,
+            )?;
+            self.db
+                .decide_join_request(&req.id, "approved", by, Some(&member.member))?;
+            self.broadcast_joined_only(MemberEvent::JoinDecided {
+                request_id: req.id.clone(),
+                approved: true,
+                by: by.to_string(),
+            });
+            Ok(json!({
+                "request_id": req.id,
+                "approved": true,
+                "member_id": member.member,
+                "display_name": member.display_name,
+                "members": self.members(),
+                "next": "your connector adds the new member to the encrypted group now",
+            }))
+        } else {
+            self.decide(&req, false, by, now)?;
+            Ok(json!({ "request_id": req.id, "approved": false, "declined": true }))
+        }
+    }
+
+    /// Record a decline and tell the members.
+    fn decide(
+        &mut self,
+        req: &JoinRequest,
+        approve: bool,
+        by: &str,
+        _now: u64,
+    ) -> Result<(), RelayError> {
+        let status = if approve { "approved" } else { "declined" };
+        if self.db.decide_join_request(&req.id, status, by, None)? {
+            self.broadcast_joined_only(MemberEvent::JoinDecided {
+                request_id: req.id.clone(),
+                approved: approve,
+                by: by.to_string(),
+            });
+        }
+        Ok(())
     }
 
     /// A member leaves. If the owner leaves, the room closes.
@@ -829,6 +1157,8 @@ impl Room {
             "thread": self.view_for(member),
             "e2e": self.e2e_status(member),
             "pending_events_for_you": self.events.get(member).map(Vec::len).unwrap_or(0),
+            // Joins through require_approval links, for members to decide.
+            "join_requests": if me.is_e2e_active() { json!(self.waiting_joins()) } else { json!([]) },
             "doorbell": self.doorbell_for(member).map(|(d, key)| {
                 let mut v = d.bot_view(self.bells.ntfy_base_url());
                 v["scope"] = json!(match key { DoorbellKey::Room { .. } => "room", DoorbellKey::Bot { .. } => "bot_default" });
@@ -967,6 +1297,28 @@ fn member_row(m: &Member) -> MemberRow {
         invite_label: m.invite_label.clone(),
         joined_at: m.joined_at,
         e2e_state: m.e2e_state,
+        adder: m.adder.clone(),
+    }
+}
+
+fn revoked() -> RelayError {
+    RelayError::new(
+        ErrorCode::InviteRevoked,
+        "the owner revoked this invite link; ask them for a new one",
+    )
+}
+
+fn used_up(invite: &InviteRow) -> RelayError {
+    if invite.reusable {
+        RelayError::new(
+            ErrorCode::InviteUsed,
+            "this invite link has no uses left; ask the owner for a new one",
+        )
+    } else {
+        RelayError::new(
+            ErrorCode::InviteUsed,
+            "this invite was already used; ask the owner for a new one",
+        )
     }
 }
 

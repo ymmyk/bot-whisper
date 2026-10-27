@@ -217,11 +217,18 @@ async fn confirm_link_signs_in_once_and_expired_links_fail() {
         "bots come first, support later"
     );
     assert_eq!(page.matches("Not a password.").count(), 1, "said once");
-    // Which ID to share, and what each is for, in one line.
-    assert_eq!(page.matches("Which ID to share?").count(), 1);
-    assert!(
-        page.contains("share that bot's Member ID")
-            && page.contains("Share your Account ID only with BotWhisper support.")
+    // Which ID to share, said once (in the bots intro), and the Account
+    // ID's use once (under Support).
+    assert!(!page.contains("Which ID to share?"));
+    assert_eq!(
+        page.matches("share it to show someone which bot is yours")
+            .count(),
+        1
+    );
+    assert_eq!(
+        page.matches("Share it only when asking for support.")
+            .count(),
+        1
     );
     assert!(page.contains(r#"<time datetime=""#));
     // Retention: up to the configured TTL, with a local-time deadline.
@@ -394,6 +401,13 @@ async fn account_page_shows_only_own_data_and_disconnect_needs_csrf() {
         )
         .await;
     let invite_url = inv["invite_url"].as_str().unwrap().to_string();
+    let club = a
+        .ok(
+            "create_invite",
+            json!({ "room_id": room_id, "label": "club", "reusable": true, "max_uses": 5, "require_approval": true }),
+        )
+        .await;
+    let club_url = club["invite_url"].as_str().unwrap().to_string();
     let b = relay.bot(&b_tok).await;
     b.ok("create_room", json!({ "title": "Bob room" })).await;
 
@@ -453,11 +467,22 @@ async fn account_page_shows_only_own_data_and_disconnect_needs_csrf() {
         )),
         "full id without JS"
     );
-    // Rename and Disconnect share the card's footer; Delete sits apart in
+    // Rename and Disconnect sit folded under "Manage" in the card's footer,
+    // Disconnect as the quiet action that asks first; Delete sits apart in
     // the page's danger zone.
+    assert!(page.contains(r#"<details class="manage"><summary>Manage Alice Claude</summary>"#));
     assert!(
         page.contains(r#"Rename</button></form><form method="post" action="/account/disconnect">"#)
     );
+    assert!(page.contains(
+        r#"class="small quiet" aria-label="Disconnect Alice Claude…">Disconnect…</button>"#
+    ));
+    // Phone widths: 44px tap targets, and the section menu wraps instead
+    // of cutting off "Danger zone".
+    assert!(page.contains(
+        "button,.btn,button.small,button.copy,input[type=text],input[type=email]{min-height:44px}"
+    ));
+    assert!(page.contains(".rail nav{position:static;flex-direction:row;flex-wrap:wrap"));
     assert!(page.contains(r#"<div class="card list danger-zone"><div class="row"><div class="row-main"><p class="row-title">Delete Alice Claude</p>"#));
     // Shared explanations once, not per bot.
     assert_eq!(page.matches("Not a password.").count(), 1);
@@ -468,8 +493,20 @@ async fn account_page_shows_only_own_data_and_disconnect_needs_csrf() {
     assert!(
         page.contains(r#"<span class="badge">Owner</span>"#)
             && page.contains("for Sam")
-            && page.contains("unused")
+            && page.contains("single-use, unused")
     );
+    assert!(
+        page.contains("reusable, 0 of 5 uses") && page.contains("a member approves each join"),
+        "reusable invites show uses"
+    );
+    let club_secret = club_url
+        .rsplit('/')
+        .next()
+        .unwrap()
+        .split('#')
+        .next()
+        .unwrap();
+    assert!(!page.contains(club_secret.split_once('.').unwrap().1));
     assert!(page.contains("Rename") && page.contains("Delete"));
     for other in [
         "bob@example.com",
@@ -623,7 +660,8 @@ async fn account_page_shows_only_own_data_and_disconnect_needs_csrf() {
         r#"<span class="seen off"><span class="dot" aria-hidden="true"></span>Not connected</span>"#
     ));
     assert!(page.contains("Reconnect this bot"));
-    assert!(page.contains(r#"data-copy="botwhisper connect --relay"#));
+    // The connect command is not repeated on every card.
+    assert!(!page.contains(r#"data-copy="botwhisper connect --relay"#));
     assert!(
         !page.contains("/account/disconnect"),
         "nothing to disconnect"
@@ -1202,7 +1240,7 @@ async fn pages_have_no_missing_favicon_to_log() {
 
 /// Wake-ups show "on" only when one was really set up: a new bot with none,
 /// or with only the ready address its connector made at sign-in, says
-/// "Wake-ups are off. Ask your AI to turn them on."; setting one up on
+/// "Wake-ups are off. Ask your AI to turn on wake-ups."; setting one up on
 /// purpose turns it on and marks it manual for good.
 #[tokio::test]
 async fn wakeups_state_reflects_a_real_doorbell() {
@@ -1223,7 +1261,7 @@ async fn wakeups_state_reflects_a_real_doorbell() {
                 .unwrap()
         }
     };
-    let off = "<strong>Wake-ups are off.</strong> Ask your AI to turn them on.";
+    let off = "<strong>Wake-ups are off.</strong> Ask your AI to turn on wake-ups.";
     let p = page(alice.clone()).await;
     assert!(p.contains(off), "none yet");
     let bot = relay.bot(&tok).await;
@@ -1238,7 +1276,7 @@ async fn wakeups_state_reflects_a_real_doorbell() {
     );
     assert_eq!(
         g["summary"],
-        "Wake-ups are off. Ask your AI to turn them on."
+        "Wake-ups are off. Ask your AI to turn on wake-ups."
     );
     assert!(!p.contains("Wake-ups are on"));
     bot.ok("set_doorbell", json!({ "auto": true })).await;
@@ -1249,7 +1287,7 @@ async fn wakeups_state_reflects_a_real_doorbell() {
     assert_eq!(g["auto"], true);
     assert_eq!(
         g["summary"],
-        "Wake-ups are off. Ask your AI to turn them on."
+        "Wake-ups are off. Ask your AI to turn on wake-ups."
     );
     // Off: no live `doorbell`, and the stored details sit under
     // `previous_doorbell` with no listen recipes, so an AI cannot mistake

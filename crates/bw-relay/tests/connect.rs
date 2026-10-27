@@ -1423,7 +1423,14 @@ async fn a_refused_sign_in_is_signed_out_not_unreachable() {
             let v = r.structured_content.clone().unwrap_or_default();
             assert_eq!(r.is_error, Some(true), "{tool}: {v}");
             assert_eq!(v["error"], "SIGNED_OUT", "{tool}: {v}");
-            assert_eq!(v["message"], "signed out, call `login`", "{tool}: {v}");
+            let msg = v["message"].as_str().unwrap_or_default();
+            assert_eq!(
+                msg,
+                botwhisper::connect::gateway::SIGNED_OUT_MESSAGE,
+                "{tool}: one plain line"
+            );
+            assert!(msg.starts_with("SIGNED_OUT: ") && !msg.contains('\n'));
+            assert!(!v.to_string().contains("NOT_SIGNED_IN"), "{tool}: {v}");
             assert!(v.get("relay_reconnecting").is_none(), "{tool}: {v}");
             assert!(!v.to_string().contains("unreachable"), "{tool}: {v}");
         }
@@ -1431,4 +1438,121 @@ async fn a_refused_sign_in_is_signed_out_not_unreachable() {
     })
     .await
     .expect("no hang");
+}
+
+#[tokio::test]
+async fn approval_links_let_bots_in_through_any_member() {
+    tokio::time::timeout(Duration::from_secs(120), approval_inner())
+        .await
+        .expect("the test must not hang");
+}
+
+/// Wait until `who` sees a join request, then approve it.
+async fn approve_next(
+    who: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    room: &str,
+) -> Value {
+    for _ in 0..100 {
+        let st = call(who, "get_status", json!({ "room_id": room })).await;
+        if let Some(req) = st["join_requests"][0]["request_id"].as_str() {
+            return call(
+                who,
+                "approve_join",
+                json!({ "room_id": room, "request_id": req }),
+            )
+            .await;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("no join request showed up");
+}
+
+async fn approval_inner() {
+    let relay = TestRelay::start().await;
+    let mut svcs = Vec::new();
+    for t in TOKENS {
+        let c = Connector::new(RelayClient::with_token(&relay.base(), t), None, None)
+            .await
+            .unwrap();
+        svcs.push(serve_connector(c).await);
+    }
+    let (alice, bob, carol) = (&svcs[0], &svcs[1], &svcs[2]);
+    let room = call(alice, "create_room", json!({ "title": "Club" })).await["room_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let inv = call(
+        alice,
+        "create_invite",
+        json!({ "room_id": room, "reusable": true, "require_approval": true }),
+    )
+    .await;
+    assert_eq!(inv["reusable"], true, "{inv}");
+    let url = inv["invite_url"].as_str().unwrap().to_string();
+    assert!(
+        url.contains("#f="),
+        "the inviter fingerprint rides in the fragment"
+    );
+
+    // Bob waits; the owner lets him in and adds him to the group.
+    let (joined, approved) = tokio::join!(
+        call(
+            bob,
+            "join_room",
+            json!({ "invite_url": url, "name": "Bob" })
+        ),
+        approve_next(alice, &room)
+    );
+    assert_eq!(approved["added_to_group"], true, "{approved}");
+    assert_eq!(joined["joined"], true, "{joined}");
+
+    // Carol waits on the same link; Bob (a member, not the owner) lets her
+    // in, so her Welcome comes from Bob; it still checks out because the
+    // inviter's key (f=) is in the group she joins.
+    let (joined, approved) = tokio::join!(
+        call(
+            carol,
+            "join_room",
+            json!({ "invite_url": url, "name": "Carol" })
+        ),
+        approve_next(bob, &room)
+    );
+    assert_eq!(approved["added_to_group"], true, "{approved}");
+    assert_eq!(joined["joined"], true, "{joined}");
+
+    // Everyone reads Alice.
+    call(
+        alice,
+        "wait_for_message",
+        json!({ "room_id": room, "timeout_s": 0 }),
+    )
+    .await;
+    let sent = call(
+        alice,
+        "send_message",
+        json!({ "room_id": room, "text": "welcome both" }),
+    )
+    .await;
+    assert_eq!(
+        sent["delivered_to"].as_array().map(Vec::len),
+        Some(2),
+        "{sent}"
+    );
+    for who in [bob, carol] {
+        let got = call(
+            who,
+            "wait_for_message",
+            json!({ "room_id": room, "timeout_s": 5 }),
+        )
+        .await;
+        let texts: Vec<&str> = got["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|m| m["content"].as_str())
+            .collect();
+        assert!(texts.contains(&"welcome both"), "{got}");
+    }
+    let list = call(alice, "list_invites", json!({ "room_id": room })).await;
+    assert_eq!(list["invites"][0]["uses"], 2, "{list}");
 }

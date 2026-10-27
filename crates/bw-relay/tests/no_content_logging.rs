@@ -73,6 +73,38 @@ async fn relay_never_logs_message_content() {
     )
     .await;
 
+    // A reusable approval link: its secret never reaches the logs.
+    let reusable = a
+        .ok(
+            "create_invite",
+            json!({ "room_id": room, "reusable": true, "require_approval": true, "max_uses": 3 }),
+        )
+        .await;
+    let link = reusable["invite_url"].as_str().unwrap().to_string();
+    let link_secret = link
+        .rsplit('/')
+        .next()
+        .unwrap()
+        .split('#')
+        .next()
+        .unwrap()
+        .split_once('.')
+        .unwrap()
+        .1
+        .to_string();
+    let _ = a.call("list_invites", json!({ "room_id": room })).await;
+    let _ = c
+        .call(
+            "join_room",
+            json!({ "invite_url": link, "name": "NAME-CANARY-9d" }),
+        )
+        .await;
+    let _ = a
+        .call(
+            "revoke_invite",
+            json!({ "room_id": room, "invite_id": reusable["invite_id"] }),
+        )
+        .await;
     a.send(&room, sentinel).await;
     b.wait(&room, 5).await;
     // Exercise the error paths too (they format messages).
@@ -120,6 +152,7 @@ async fn relay_never_logs_message_content() {
         "CANARY".to_string(),
         room.clone(),
         "9199".to_string(),
+        link_secret.clone(),
     ] {
         assert!(
             !logs.contains(&needle),

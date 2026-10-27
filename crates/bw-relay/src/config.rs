@@ -111,7 +111,7 @@ impl Default for RelayConfig {
             session_ttl: Duration::from_secs(30 * 24 * 3600),
             login_link_ttl: Duration::from_secs(15 * 60),
             unacked_ttl: Duration::from_secs(7 * 24 * 3600),
-            max_members: 8,
+            max_members: 50,
             default_turn_cap: 40,
             default_room_expiry: Duration::from_secs(7 * 24 * 3600),
             default_invite_ttl: Duration::from_secs(7 * 24 * 3600),

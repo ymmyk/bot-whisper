@@ -174,6 +174,9 @@ struct Inner {
     peer: StdMutex<Option<Peer<RoleServer>>>,
     /// Why the stored sign-in could not be resumed at startup.
     resume_note: StdMutex<Option<String>>,
+    /// The relay revoked (or refused to refresh) this bot's sign-in: room
+    /// tools answer `SIGNED_OUT` in one line until `login` succeeds.
+    signed_out: StdMutex<Option<String>>,
     /// Set while another `botwhisper connect` holds this bot's home: the
     /// plain sentence to show, instead of any sign-in advice.
     busy: StdMutex<Option<String>>,
@@ -207,6 +210,18 @@ pub struct LoginStatusArgs {
     pub wait_s: Option<u64>,
 }
 
+/// The one line a bot sees once the relay revoked its sign-in.
+pub const SIGNED_OUT_MESSAGE: &str = "SIGNED_OUT: this bot's sign-in was revoked; call `login` (force=true) and send your person the new link.";
+
+/// `SIGNED_OUT`: one plain line; the relay's own words go in `reason`.
+pub(crate) fn signed_out_result(reason: Option<String>) -> CallToolResult {
+    let mut v = json!({ "error": "SIGNED_OUT", "message": SIGNED_OUT_MESSAGE });
+    if let Some(r) = reason.filter(|r| !r.trim().is_empty()) {
+        v["reason"] = json!(r);
+    }
+    CallToolResult::structured_error(v)
+}
+
 fn not_signed_in(detail: Option<Value>, note: Option<String>) -> CallToolResult {
     let mut v = json!({
         "error": "NOT_SIGNED_IN",
@@ -228,6 +243,13 @@ fn revoked(r: &CallToolResult) -> Option<String> {
     if r.is_error != Some(true) {
         return None;
     }
+    if let Some(v) = r
+        .structured_content
+        .as_ref()
+        .filter(|v| v["error"] == "SIGNED_OUT")
+    {
+        return Some(v["reason"].as_str().unwrap_or("revoked").to_string());
+    }
     let text = r
         .structured_content
         .as_ref()
@@ -239,9 +261,8 @@ fn revoked(r: &CallToolResult) -> Option<String> {
                 .filter_map(|c| c.as_text().map(|t| t.text.clone()))
                 .next()
         })?;
-    (text.contains("expired or was revoked") || text.contains("cannot be refreshed")).then_some(
-        "The stored sign-in was revoked or expired. Call `login` to sign in again.".to_string(),
-    )
+    (text.contains("expired or was revoked") || text.contains("cannot be refreshed"))
+        .then(|| "the relay no longer accepts the stored sign-in".to_string())
 }
 
 fn minutes_left(expires: Instant) -> u64 {
@@ -266,6 +287,7 @@ impl Gateway {
                 login: Mutex::new(LoginState::default()),
                 peer: StdMutex::new(None),
                 resume_note: StdMutex::new(None),
+                signed_out: StdMutex::new(None),
                 busy: StdMutex::new(None),
                 upgrade: StdMutex::new(Arc::new(UpgradeWatch::for_current_exe())),
                 stopped: std::sync::atomic::AtomicBool::new(false),
@@ -326,9 +348,10 @@ impl Gateway {
     /// hosts that care, so say so) and answer `NOT_SIGNED_IN`.
     async fn signed_out_by_relay(&self, why: String) -> CallToolResult {
         *self.inner.connector.write().expect("lock") = None;
-        *self.inner.resume_note.lock().expect("lock") = Some(why.clone());
+        *self.inner.resume_note.lock().expect("lock") = None;
+        *self.inner.signed_out.lock().expect("lock") = Some(why.clone());
         self.notify_tools_changed().await;
-        not_signed_in(None, Some(why))
+        signed_out_result(Some(why))
     }
 
     fn connector(&self) -> Option<Connector> {
@@ -404,6 +427,9 @@ impl Gateway {
                     *i.resume_note.lock().expect("lock") = None;
                 } else if let Some(w) = e.downcast_ref::<super::server::WrongBot>() {
                     *i.resume_note.lock().expect("lock") = Some(w.to_string());
+                } else if let Some(so) = super::relay::signed_out(&e) {
+                    *i.resume_note.lock().expect("lock") = None;
+                    *i.signed_out.lock().expect("lock") = Some(so.0.clone());
                 } else {
                     *i.resume_note.lock().expect("lock") = Some(format!(
                         "The stored sign-in could not be used ({e}). Call `login` to sign in again."
@@ -567,6 +593,7 @@ impl Gateway {
         let connector = Connector::new(client, Some(signed.store), Some(&i.config)).await?;
         *i.connector.write().expect("lock") = Some(connector);
         *i.resume_note.lock().expect("lock") = None;
+        *i.signed_out.lock().expect("lock") = None;
         *i.busy.lock().expect("lock") = None;
         tracing::info!(bot = %signed.agent_id, "botwhisper connect: signed in through device login");
         self.notify_tools_changed().await;
@@ -980,6 +1007,12 @@ impl Gateway {
                 }
                 let (detail, note) = {
                     let st = self.inner.login.lock().await;
+                    // Revoked, and no new login started yet: one line.
+                    if st.pending.is_none() {
+                        if let Some(why) = self.inner.signed_out.lock().expect("lock").clone() {
+                            return Ok(signed_out_result(Some(why)).into());
+                        }
+                    }
                     (
                         st.pending.as_ref().map(|p| self.pending_view(p, "pending")),
                         st.last_failure
