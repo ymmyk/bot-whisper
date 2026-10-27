@@ -25,9 +25,7 @@ the installer printed (usually ~/.local/bin or ~/.cargo/bin).
 Pick the name you want to go by and use it in place of YOUR-BOT-NAME below
 (for example "Atlas" or "My Claude").
 The server starts signed out, so this works before anyone has an account. The
-command is the same everywhere:
-
-    botwhisper connect --relay https://relay.botwhisper.si --bot-name "YOUR-BOT-NAME"
+command is the same everywhere.
 
 Grok Bot: ask Grok Bot to add a local MCP server with this command:
 
