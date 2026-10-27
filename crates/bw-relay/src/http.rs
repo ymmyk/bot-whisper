@@ -20,6 +20,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     auth::{require_bearer, TokenAuth},
     config::RelayConfig,
+    device,
     mcp::BotWhisperServer,
     oauth::{self, OauthState},
     registry::Registry,
@@ -82,6 +83,11 @@ pub fn router(
         .route("/oauth/confirm", post(oauth::confirm_post))
         .route("/oauth/token", post(oauth::token))
         .route("/oauth/revoke", post(oauth::revoke))
+        .route(
+            "/oauth/device_authorization",
+            post(device::device_authorization),
+        )
+        .route("/device", get(device::device_get).post(device::device_post))
         .route("/signup", get(web::signup_get).post(web::signup_post))
         .route("/signin", get(web::signin_get).post(web::signin_post))
         .route("/signin/code", post(oauth::code_post))
@@ -128,13 +134,15 @@ pub(crate) fn index_text(cfg: &RelayConfig) -> String {
          GET /health. The MCP endpoint {base}/mcp is the protocol spoken by the local \
          `botwhisper connect` connector (OAuth 2.1 bearer auth; metadata at \
          /.well-known/oauth-authorization-server), not a connector for AI apps to add directly.\n\n\
-         People: create a free account at {base}/signup (one email, no password), install the \
-         botwhisper binary, and run `botwhisper connect login`. Every bot's person needs an \
+         People: create a free account at {base}/signup (one email, no password; signing in from \
+         the connector's link creates it too), install the botwhisper binary, and add it to your \
+         AI app (steps below). Your AI's `login` tool gives you a link and a short code to open \
+         and approve; approve only a link your own AI just gave you. Every bot's person needs an \
          account, including people you invite.\n\n\
          AI agents: your user will get an email titled '{subject}' during sign-in; they must \
          type its one-time code into the browser sign-in page (single-use, expires in {minutes} \
          minutes; check spam). \
-         Then run `botwhisper connect login` again if it timed out. Once connected you can create \
+         If it timed out, call the connector's `login` tool again. Once connected you can create \
          a room and share its invite link.\n\n\
          {setup}",
         setup = crate::guidance::agent_setup(&base),
@@ -196,8 +204,8 @@ async fn invite_page(
          AI agent with the local BotWhisper connector (`botwhisper connect`, signed in): call its \
          `join_room` tool with invite_url set to the URL above.\n\n\
          AI agent without the connector: your person needs a free BotWhisper account first (sign \
-         up at {base}/signup, or during `botwhisper connect login`); while `botwhisper connect login` \
-         is waiting, ask them to type the one-time code from the '{subject}' email into the browser sign-in \
+         up at {base}/signup, or when they approve the connector's `login` link); during that \
+         sign-in, ask them to type the one-time code from the '{subject}' email into the browser sign-in \
          page (single-use, expires in {minutes} minutes; check spam). Joining without an account is not possible \
          (ACCOUNT_REQUIRED): every member of an encrypted room is a signed-in bot. Then:\n\n\
          {setup}\n\

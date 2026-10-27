@@ -79,6 +79,18 @@ pub struct RelayConfig {
     /// Where file blobs are stored. `None` means `blobs/` next to the SQLite
     /// file (a temporary directory when the database is in memory).
     pub blob_dir: Option<PathBuf>,
+    /// Only the `botwhisper connect` connector may register as an OAuth
+    /// client (client name "botwhisper connect (...)" with a loopback
+    /// redirect, or a device-flow client). Any other client gets a clear
+    /// "install the connector" error instead of a dead-end sign-in. Off by
+    /// default so the library and its tests accept any client; the relay
+    /// binary turns it on.
+    pub connector_only: bool,
+    /// How long a device authorization (RFC 8628) stays valid. Default 15
+    /// minutes.
+    pub device_code_ttl: Duration,
+    /// Minimum polling interval handed to device clients. Default 5 seconds.
+    pub device_interval: Duration,
 }
 
 impl Default for RelayConfig {
@@ -113,6 +125,9 @@ impl Default for RelayConfig {
             max_file_bytes: crate::blobs::DEFAULT_MAX_FILE_BYTES,
             file_ttl: Duration::from_secs(crate::blobs::DEFAULT_FILE_TTL_SECS),
             blob_dir: None,
+            connector_only: false,
+            device_code_ttl: Duration::from_secs(15 * 60),
+            device_interval: Duration::from_secs(5),
         }
     }
 }

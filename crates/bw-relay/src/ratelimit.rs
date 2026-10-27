@@ -84,6 +84,8 @@ pub struct RateLimits {
     pub registrations_per_ip_per_hour: u32,
     /// Token-endpoint requests per IP per minute.
     pub token_requests_per_ip_per_min: u32,
+    /// Device authorizations (RFC 8628) started per IP per hour.
+    pub device_starts_per_ip_per_hour: u32,
     /// Minimum seconds between content turns in a thread (loop guard).
     pub min_turn_interval_s: u64,
 }
@@ -100,6 +102,7 @@ impl Default for RateLimits {
             signups_per_ip_per_hour: 20,
             registrations_per_ip_per_hour: 30,
             token_requests_per_ip_per_min: 60,
+            device_starts_per_ip_per_hour: 30,
             min_turn_interval_s: 2,
         }
     }
@@ -118,6 +121,7 @@ impl RateLimits {
             signups_per_ip_per_hour: 0,
             registrations_per_ip_per_hour: 0,
             token_requests_per_ip_per_min: 0,
+            device_starts_per_ip_per_hour: 0,
             min_turn_interval_s: 0,
         }
     }

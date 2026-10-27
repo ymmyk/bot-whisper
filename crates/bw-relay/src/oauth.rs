@@ -89,6 +89,12 @@ pub struct AuthLimiters {
     pub token_by_ip: Limiter,
     /// One-time code guesses per client IP (on top of the per-login limit).
     pub codes_by_ip: Limiter,
+    /// Device authorizations started per client IP.
+    pub device_starts_by_ip: Limiter,
+    /// Device user-code lookups per client IP (guessing).
+    pub device_codes_by_ip: Limiter,
+    /// Device user-code lookups per signed-in account.
+    pub device_codes_by_account: Limiter,
 }
 
 impl AuthLimiters {
@@ -103,6 +109,18 @@ impl AuthLimiters {
             ),
             token_by_ip: Limiter::new(l.token_requests_per_ip_per_min, Duration::from_secs(60)),
             codes_by_ip: Limiter::new(CODE_GUESSES_PER_IP, Duration::from_secs(10 * 60)),
+            device_starts_by_ip: Limiter::new(
+                l.device_starts_per_ip_per_hour,
+                Duration::from_secs(3600),
+            ),
+            device_codes_by_ip: Limiter::new(
+                crate::device::CODE_LOOKUPS_PER_IP,
+                Duration::from_secs(10 * 60),
+            ),
+            device_codes_by_account: Limiter::new(
+                crate::device::CODE_LOOKUPS_PER_ACCOUNT,
+                Duration::from_secs(10 * 60),
+            ),
         }
     }
 }
@@ -212,7 +230,7 @@ pub(crate) fn no_store<T: IntoResponse>(r: T) -> Response {
     resp
 }
 
-fn oauth_error(status: StatusCode, error: &str, description: &str) -> Response {
+pub(crate) fn oauth_error(status: StatusCode, error: &str, description: &str) -> Response {
     no_store((
         status,
         Json(json!({ "error": error, "error_description": description })),
@@ -339,7 +357,11 @@ pub struct AuthorizeParams {
 
 /// Validate the request against the registered client. Errors that happen
 /// before the redirect URI is trusted are shown as a page, never redirected.
-fn validate_authz(db: &Db, p: &AuthorizeParams) -> Result<(AuthzRequest, ClientRow), Response> {
+fn validate_authz(
+    st: &OauthState,
+    p: &AuthorizeParams,
+) -> Result<(AuthzRequest, ClientRow), Response> {
+    let db = &st.db;
     let client_id = p
         .client_id
         .as_deref()
@@ -375,6 +397,14 @@ fn validate_authz(db: &Db, p: &AuthorizeParams) -> Result<(AuthzRequest, ClientR
             "Unregistered redirect_uri",
             "The redirect URI does not match the one this client registered.",
         ));
+    }
+    if st.cfg.connector_only && !is_connector_client(client.name.as_deref(), &client.redirect_uris)
+    {
+        return Err(no_store(error_page(
+            StatusCode::FORBIDDEN,
+            "Not for AI apps directly",
+            &connector_only_message(&st.cfg.public_url()),
+        )));
     }
     let req = AuthzRequest {
         client_id: client.id.clone(),
@@ -434,7 +464,8 @@ pub async fn authorization_server_metadata(State(st): State<OauthState>) -> Resp
         "revocation_endpoint": format!("{base}/oauth/revoke"),
         "response_types_supported": ["code"],
         "response_modes_supported": ["query"],
-        "grant_types_supported": ["authorization_code", "refresh_token"],
+        "grant_types_supported": ["authorization_code", "refresh_token", DEVICE_GRANT],
+        "device_authorization_endpoint": format!("{base}/oauth/device_authorization"),
         "token_endpoint_auth_methods_supported": ["none", "client_secret_post", "client_secret_basic"],
         "revocation_endpoint_auth_methods_supported": ["none", "client_secret_post", "client_secret_basic"],
         "code_challenge_methods_supported": ["S256"],
@@ -480,6 +511,37 @@ pub fn valid_redirect_uri(s: &str) -> bool {
     }
 }
 
+/// `grant_type` of RFC 8628.
+pub const DEVICE_GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
+
+/// True for the local `botwhisper connect` connector: its dynamic client
+/// registration is named "botwhisper connect (<host>)" and has only loopback
+/// redirect URIs (browser login) or none at all (device login). A name is
+/// not a secret, so this stops confusion, not a determined impostor: it
+/// keeps AI apps' generic "add connector" flows from signing in to an
+/// endpoint they cannot use.
+pub fn is_connector_client(name: Option<&str>, redirect_uris: &[String]) -> bool {
+    name.is_some_and(|n| n.trim_start().starts_with("botwhisper connect"))
+        && redirect_uris.iter().all(|u| {
+            url::Url::parse(u).is_ok_and(|u| {
+                u.scheme() == "http"
+                    && matches!(u.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"))
+            })
+        })
+}
+
+/// What a generic OAuth client is told when it is not the connector.
+pub(crate) fn connector_only_message(base: &str) -> String {
+    format!(
+        "This is the BotWhisper relay's protocol endpoint for the local `botwhisper connect` connector, \
+         not a connector to add to an AI app directly: its tools only work through that connector, which \
+         encrypts messages on your machine. Install it ({sh}; Windows: {ps1}) and add the local stdio MCP \
+         server `botwhisper connect --relay {base}` instead. Then call its `login` tool. See {base}/.",
+        sh = crate::guidance::INSTALL_SH,
+        ps1 = crate::guidance::INSTALL_PS1,
+    )
+}
+
 pub async fn register_client(
     State(st): State<OauthState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -500,7 +562,12 @@ pub async fn register_client(
             )
         }
     };
-    if req.redirect_uris.is_empty() || req.redirect_uris.len() > 10 {
+    // A device-flow client (RFC 8628) has no redirect URI at all.
+    let wants_device = req
+        .grant_types
+        .as_ref()
+        .is_some_and(|g| g.iter().any(|g| g == DEVICE_GRANT));
+    if (req.redirect_uris.is_empty() && !wants_device) || req.redirect_uris.len() > 10 {
         return oauth_error(
             StatusCode::BAD_REQUEST,
             "invalid_redirect_uri",
@@ -530,12 +597,27 @@ pub async fn register_client(
         .unwrap_or_else(|| vec!["authorization_code".into(), "refresh_token".into()]);
     if grant_types
         .iter()
-        .any(|g| g != "authorization_code" && g != "refresh_token")
+        .any(|g| g != "authorization_code" && g != "refresh_token" && g != DEVICE_GRANT)
     {
         return oauth_error(
             StatusCode::BAD_REQUEST,
             "invalid_client_metadata",
-            "only authorization_code and refresh_token grants are supported",
+            "only authorization_code, refresh_token and the device_code grants are supported",
+        );
+    }
+    if wants_device && auth_method != "none" {
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_client_metadata",
+            "device-flow clients are public: token_endpoint_auth_method must be none",
+        );
+    }
+    if st.cfg.connector_only && !is_connector_client(req.client_name.as_deref(), &req.redirect_uris)
+    {
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_client_metadata",
+            &connector_only_message(&st.cfg.public_url()),
         );
     }
     if let Some(rt) = &req.response_types {
@@ -593,7 +675,7 @@ fn sign_in_again(st: &OauthState) -> String {
     )
 }
 
-fn too_many(retry: u64) -> Response {
+pub(crate) fn too_many(retry: u64) -> Response {
     let mut r = oauth_error(
         StatusCode::TOO_MANY_REQUESTS,
         "rate_limited",
@@ -618,7 +700,7 @@ pub(crate) fn current_account(st: &OauthState, headers: &HeaderMap) -> Option<Ac
     st.db.get_account(&id).ok().flatten()
 }
 
-fn client_label(client: &ClientRow) -> String {
+pub(crate) fn client_label(client: &ClientRow) -> String {
     match &client.name {
         Some(n) => esc(n),
         None => "an MCP client".to_string(),
@@ -670,12 +752,45 @@ pub(crate) fn csrf_ok(expected: Option<String>, given: Option<&str>) -> bool {
 }
 
 /// "never" or a UTC time.
-fn when(t: Option<u64>) -> String {
+pub(crate) fn when(t: Option<u64>) -> String {
     t.map(crate::web::fmt_utc).unwrap_or_else(|| "never".into())
 }
 
-fn app_name(name: &Option<String>) -> String {
+pub(crate) fn app_name(name: &Option<String>) -> String {
     esc(name.as_deref().unwrap_or("an MCP client"))
+}
+
+/// The radio list of an account's bots for the bot pickers (the OAuth
+/// "Which bot is connecting?" page and the device approval page).
+pub(crate) fn bot_radio_list(
+    st: &OauthState,
+    bots: &[BotRow],
+    preselect: Option<&str>,
+    now: u64,
+) -> String {
+    let mut list = String::new();
+    for b in bots {
+        let live = st.db.bot_live_client(&b.id, now).ok().flatten();
+        let detail = match &live {
+            Some((_, n)) => format!(
+                r#"Connected to {app} now · last used {used}<br><span class="warn">Picking it disconnects it from {app}.</span>"#,
+                app = app_name(n),
+                used = when(b.last_used_at),
+            ),
+            None => format!(
+                "Not connected · last connected with {app} · last used {used}",
+                app = app_name(&b.last_client_name),
+                used = when(b.last_used_at),
+            ),
+        };
+        list.push_str(&format!(
+            r#"<label class="pick"><input type="radio" name="bot" value="{id}"{checked}><strong>{name}</strong><br><span class="muted">{detail}</span></label>"#,
+            id = esc(&b.id),
+            checked = if preselect == Some(b.id.as_str()) { " checked" } else { "" },
+            name = esc(&b.name),
+        ));
+    }
+    list
 }
 
 /// "Which bot is connecting?": the signed-in person picks one of their bots
@@ -698,28 +813,7 @@ fn picker_page(
         .filter(|b| b.last_client_id.as_deref() == Some(client.id.as_str()))
         .max_by_key(|b| b.last_used_at.unwrap_or(b.created_at))
         .map(|b| b.id.clone());
-    let mut list = String::new();
-    for b in &bots {
-        let live = st.db.bot_live_client(&b.id, now).ok().flatten();
-        let detail = match &live {
-            Some((_, n)) => format!(
-                r#"Connected to {app} now · last used {used}<br><span class="warn">Picking it disconnects it from {app}.</span>"#,
-                app = app_name(n),
-                used = when(b.last_used_at),
-            ),
-            None => format!(
-                "Not connected · last connected with {app} · last used {used}",
-                app = app_name(&b.last_client_name),
-                used = when(b.last_used_at),
-            ),
-        };
-        list.push_str(&format!(
-            r#"<label class="pick"><input type="radio" name="bot" value="{id}"{checked}><strong>{name}</strong><br><span class="muted">{detail}</span></label>"#,
-            id = esc(&b.id),
-            checked = if preselect.as_deref() == Some(b.id.as_str()) { " checked" } else { "" },
-            name = esc(&b.name),
-        ));
-    }
+    let list = bot_radio_list(st, &bots, preselect.as_deref(), now);
     let err = error
         .map(|e| format!(r#"<div class="err">{}</div>"#, esc(e)))
         .unwrap_or_default();
@@ -870,7 +964,7 @@ fn pick_bot(
     issue_code_and_redirect(st, req, &account.id, SCOPE_ROOMS, &bot.id)
 }
 
-fn redirect_host(uri: &str) -> String {
+pub(crate) fn redirect_host(uri: &str) -> String {
     url::Url::parse(uri)
         .ok()
         .and_then(|u| {
@@ -886,7 +980,7 @@ pub async fn authorize_get(
     headers: HeaderMap,
     Query(p): Query<AuthorizeParams>,
 ) -> Response {
-    let (req, client) = match validate_authz(&st.db, &p) {
+    let (req, client) = match validate_authz(&st, &p) {
         Ok(v) => v,
         Err(r) => return r,
     };
@@ -902,7 +996,7 @@ pub async fn authorize_post(
     headers: HeaderMap,
     Form(p): Form<AuthorizeParams>,
 ) -> Response {
-    let (req, client) = match validate_authz(&st.db, &p) {
+    let (req, client) = match validate_authz(&st, &p) {
         Ok(v) => v,
         Err(r) => return r,
     };
@@ -1239,7 +1333,7 @@ pub async fn code_post(
         now_unix(),
         LOGIN_CODE_MAX_ATTEMPTS,
     ) {
-        Ok(CodeCheck::Ok(pending)) => finish_login(&st, pending),
+        Ok(CodeCheck::Ok(pending)) => finish_login(&st, pending, &headers),
         Ok(CodeCheck::Wrong { left }) => {
             let mut r = code_page(
                 &st,
@@ -1383,6 +1477,7 @@ fn use_the_code_page() -> Response {
 pub async fn confirm(
     State(st): State<OauthState>,
     method: Method,
+    headers: HeaderMap,
     Path(token): Path<String>,
 ) -> Response {
     let now = now_unix();
@@ -1400,7 +1495,7 @@ pub async fn confirm(
     let Some(pending) = st.db.consume_pending_login(&hash, now).ok().flatten() else {
         return link_gone_page(&st);
     };
-    finish_login(&st, pending)
+    finish_login(&st, pending, &headers)
 }
 
 /// "Sign in to BotWhisper as <email>" with a button that POSTs the token.
@@ -1470,7 +1565,7 @@ pub async fn confirm_post(
     if !is_web_login(&pending.authz) {
         return use_the_code_page();
     }
-    let mut r = finish_login(&st, pending);
+    let mut r = finish_login(&st, pending, &headers);
     r.headers_mut().insert(
         header::REFERRER_POLICY,
         "no-referrer".parse().expect("header"),
@@ -1485,7 +1580,11 @@ fn is_web_login(authz: &str) -> bool {
 /// Finish a confirmed pending login (link or code): create the account on
 /// first use, set the browser session, then show the bot picker to a waiting
 /// MCP client or send a web sign-in/signup to /account.
-fn finish_login(st: &OauthState, pending: PendingLogin) -> Response {
+pub(crate) fn finish_login(
+    st: &OauthState,
+    pending: PendingLogin,
+    headers: &HeaderMap,
+) -> Response {
     let now = now_unix();
     // A web signup or sign-in has no MCP client waiting; anything else
     // resumes one.
@@ -1554,6 +1653,10 @@ fn finish_login(st: &OauthState, pending: PendingLogin) -> Response {
         },
         // No MCP client is waiting on this browser: go to the account page
         // with a one-shot "signed in" banner.
+        // A person who came from a device link (`/device`) goes back to it.
+        None if cookie_value(headers, crate::device::NEXT_COOKIE).is_some() => {
+            no_store(Redirect::to("/device"))
+        }
         None => crate::web::signed_in_redirect(&st.cfg),
     };
     resp.headers_mut().append(
@@ -1585,10 +1688,19 @@ pub struct TokenForm {
     pub client_secret: Option<String>,
     #[serde(default)]
     pub token: Option<String>,
+    /// RFC 8628 device grant.
+    #[serde(default)]
+    pub device_code: Option<String>,
+    /// RFC 8628 device authorization request: scope, and the bot name the
+    /// device would like (the person decides).
+    #[serde(default)]
+    pub scope: Option<String>,
+    #[serde(default)]
+    pub bot_name: Option<String>,
 }
 
 /// Authenticate the client from the Basic header or the form body.
-fn authenticate_client(
+pub(crate) fn authenticate_client(
     db: &Db,
     headers: &HeaderMap,
     form: &TokenForm,
@@ -1631,7 +1743,7 @@ pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-fn issue_tokens(
+pub(crate) fn issue_tokens(
     st: &OauthState,
     client_id: &str,
     account_id: &str,
@@ -1816,16 +1928,17 @@ pub async fn token(
                 Err(r) => r,
             }
         }
+        Some(DEVICE_GRANT) => crate::device::token_grant(&st, &client, &form, now),
         _ => oauth_error(
             StatusCode::BAD_REQUEST,
             "unsupported_grant_type",
-            "use authorization_code or refresh_token",
+            "use authorization_code, refresh_token or the device_code grant",
         ),
     }
 }
 
 /// The bot a code is for (every code is bound to one of the account's bots).
-fn code_bot(st: &OauthState, row: &CodeRow) -> Option<String> {
+pub(crate) fn code_bot(st: &OauthState, row: &CodeRow) -> Option<String> {
     st.db
         .get_bot(row.bot_id.as_deref()?)
         .ok()

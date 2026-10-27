@@ -967,7 +967,10 @@ async fn unconfirmed_clients_are_told_to_confirm_the_email() {
         says_confirm(&body);
         assert!(body.contains("from this BotWhisper relay"));
         assert!(body.contains(&format!("create an account first at {base}/signup")));
-        assert!(body.contains(&format!("`botwhisper connect login --relay {base}`")));
+        assert!(body.contains(&format!(
+            "`claude mcp add botwhisper -- botwhisper connect --relay {base} --bot-name <name>`"
+        )));
+        assert!(body.contains("Call the connector's `login` tool"));
         assert!(body.contains("botwhisper-installer.sh | sh"));
         no_secrets(&body.replace("bwa_not-a-real-token", ""));
     }
@@ -1023,15 +1026,15 @@ async fn unconfirmed_clients_are_told_to_confirm_the_email() {
     assert!(page.contains("needs a free BotWhisper account first"));
     assert!(page.contains(&format!("sign up at {base}/signup")));
     assert!(page.contains("ACCOUNT_REQUIRED"));
-    assert!(page.contains(&format!("`botwhisper connect login --relay {base}`")));
+    assert!(page.contains("Call the connector's `login` tool"));
     assert!(page.contains(&format!(
-        "`claude mcp add botwhisper -- botwhisper connect --relay {base}`"
+        "`claude mcp add botwhisper -- botwhisper connect --relay {base} --bot-name <name>`"
     )));
     assert!(page.contains("~/.cursor/mcp.json"));
     assert!(page.contains("call `join_room` with this invite URL"));
     assert!(!page.contains("Have an invite instead?"));
     // The index carries the same setup commands.
-    assert!(idx.contains(&format!("`botwhisper connect login --relay {base}`")));
+    assert!(idx.contains("Call the connector's `login` tool"));
     assert!(idx.contains("end-to-end encrypted"));
 
     // No mail was sent beyond the one pending sign-in, and the pending
@@ -1047,9 +1050,11 @@ async fn mcp_instructions_explain_email_confirmation() {
     let info = bot.svc.peer_info().expect("server info");
     let ins = info.instructions.clone().unwrap_or_default();
     assert!(
-        ins.contains("sign-up happens in the browser during `botwhisper connect login`"),
+        ins.contains("only works through the local `botwhisper connect` connector"),
         "{ins}"
     );
+    assert!(ins.contains("three steps") && ins.contains("call its `login` tool"));
+    assert!(ins.contains("--bot-name <your name>"));
     assert!(ins.contains("no tool here that reads or writes message text"));
     assert!(ins.contains(&format!("{}/signup", relay.base())));
     assert!(ins.contains("check their inbox (and spam)"));

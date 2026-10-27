@@ -228,7 +228,8 @@ async fn confirm_link_signs_in_once_and_expired_links_fail() {
         .await
         .unwrap();
     assert!(page.contains("You're signed in."));
-    assert!(page.contains(&format!("botwhisper connect login --relay {base}")));
+    assert!(page.contains(&format!("botwhisper connect --relay {base} --bot-name")));
+    assert!(page.contains("call its <code>login</code> tool"));
     assert!(page.contains("skips the email step for 30 days"));
     assert!(page.contains("Dismiss"));
     // ...and not on reload.

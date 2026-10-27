@@ -10,6 +10,7 @@ pub mod auth;
 pub mod blobs;
 pub mod config;
 pub mod db;
+pub mod device;
 pub mod doorbell;
 pub mod error;
 pub mod guidance;

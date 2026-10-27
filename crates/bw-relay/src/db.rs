@@ -89,6 +89,24 @@ CREATE TABLE IF NOT EXISTS oauth_codes (
     used           INTEGER NOT NULL DEFAULT 0,
     bot_id         TEXT
 );
+-- Device authorizations (RFC 8628). Both codes are stored hashed: the device
+-- code by sha256, the short user code by sha256 over a fixed prefix. `status`
+-- is pending, approved, denied or used (the tokens were handed out once).
+CREATE TABLE IF NOT EXISTS device_codes (
+    device_hash    TEXT PRIMARY KEY,
+    user_code_hash TEXT NOT NULL UNIQUE,
+    client_id      TEXT NOT NULL,
+    scope          TEXT NOT NULL,
+    bot_name       TEXT,
+    created_at     INTEGER NOT NULL,
+    expires_at     INTEGER NOT NULL,
+    interval_s     INTEGER NOT NULL,
+    last_poll      INTEGER,
+    lookups        INTEGER NOT NULL DEFAULT 0,
+    status         TEXT NOT NULL DEFAULT 'pending',
+    account_id     TEXT,
+    bot_id         TEXT
+);
 CREATE TABLE IF NOT EXISTS oauth_tokens (
     token_hash    TEXT PRIMARY KEY,
     kind          TEXT NOT NULL,
@@ -352,6 +370,27 @@ pub struct ClientRow {
     /// `none` (public client) or `client_secret_post` / `client_secret_basic`.
     pub auth_method: String,
     pub created_at: u64,
+}
+
+/// A device authorization (RFC 8628), keyed by the hash of its device code.
+#[derive(Debug, Clone)]
+pub struct DeviceRow {
+    pub device_hash: String,
+    pub user_code_hash: String,
+    pub client_id: String,
+    pub scope: String,
+    /// The bot name the device asked for (a suggestion; the person decides).
+    pub bot_name: Option<String>,
+    pub created_at: u64,
+    pub expires_at: u64,
+    pub interval_s: u64,
+    /// Unix milliseconds of the last token poll.
+    pub last_poll: Option<u64>,
+    pub lookups: u32,
+    /// `pending`, `approved`, `denied` or `used`.
+    pub status: String,
+    pub account_id: Option<String>,
+    pub bot_id: Option<String>,
 }
 
 /// An authorization code (stored hashed).
@@ -1393,6 +1432,184 @@ impl Db {
         })
     }
 
+    // ----- device authorizations (RFC 8628) -----
+
+    pub fn insert_device(&self, d: &DeviceRow) -> Result<()> {
+        self.with(|c| {
+            c.execute(
+                "INSERT INTO device_codes (device_hash, user_code_hash, client_id, scope, bot_name, created_at, expires_at, interval_s)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    d.device_hash,
+                    d.user_code_hash,
+                    d.client_id,
+                    d.scope,
+                    d.bot_name,
+                    d.created_at as i64,
+                    d.expires_at as i64,
+                    d.interval_s as i64
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn device_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<DeviceRow> {
+        Ok(DeviceRow {
+            device_hash: r.get(0)?,
+            user_code_hash: r.get(1)?,
+            client_id: r.get(2)?,
+            scope: r.get(3)?,
+            bot_name: r.get(4)?,
+            created_at: r.get::<_, i64>(5)? as u64,
+            expires_at: r.get::<_, i64>(6)? as u64,
+            interval_s: r.get::<_, i64>(7)? as u64,
+            last_poll: r.get::<_, Option<i64>>(8)?.map(|v| v as u64),
+            lookups: r.get::<_, i64>(9)?.max(0) as u32,
+            status: r.get(10)?,
+            account_id: r.get(11)?,
+            bot_id: r.get(12)?,
+        })
+    }
+
+    const DEVICE_COLS: &'static str = "device_hash, user_code_hash, client_id, scope, bot_name, created_at, expires_at, interval_s, last_poll, lookups, status, account_id, bot_id";
+
+    /// Look up a live, pending authorization by the hash of its user code,
+    /// counting the lookup. The `max_lookups`th lookup deletes it (a code
+    /// that people keep probing dies), as does an expired one.
+    pub fn lookup_device_by_user_code(
+        &self,
+        user_code_hash: &str,
+        now: u64,
+        max_lookups: u32,
+        count: bool,
+    ) -> Result<Option<DeviceRow>> {
+        self.with(|c| {
+            let row = c
+                .query_row(
+                    &format!(
+                        "SELECT {} FROM device_codes WHERE user_code_hash = ?1 AND status = 'pending' AND expires_at > ?2",
+                        Self::DEVICE_COLS
+                    ),
+                    params![user_code_hash, now as i64],
+                    Self::device_row,
+                )
+                .optional()?;
+            let Some(mut row) = row else {
+                return Ok(None);
+            };
+            if !count {
+                return Ok(Some(row));
+            }
+            row.lookups += 1;
+            if row.lookups > max_lookups {
+                c.execute(
+                    "DELETE FROM device_codes WHERE device_hash = ?1",
+                    params![row.device_hash],
+                )?;
+                return Ok(None);
+            }
+            c.execute(
+                "UPDATE device_codes SET lookups = ?2 WHERE device_hash = ?1",
+                params![row.device_hash, row.lookups as i64],
+            )?;
+            Ok(Some(row))
+        })
+    }
+
+    pub fn get_device(&self, device_hash: &str) -> Result<Option<DeviceRow>> {
+        self.with(|c| {
+            c.query_row(
+                &format!(
+                    "SELECT {} FROM device_codes WHERE device_hash = ?1",
+                    Self::DEVICE_COLS
+                ),
+                params![device_hash],
+                Self::device_row,
+            )
+            .optional()
+        })
+    }
+
+    /// Record a poll: sets `last_poll`, and when `slow_down` raises the
+    /// interval by `bump` seconds. Returns the interval now in force.
+    pub fn device_polled(&self, device_hash: &str, now: u64, bump: u64) -> Result<u64> {
+        self.with(|c| {
+            c.execute(
+                "UPDATE device_codes SET last_poll = ?2, interval_s = interval_s + ?3 WHERE device_hash = ?1",
+                params![device_hash, now as i64, bump as i64],
+            )?;
+            c.query_row(
+                "SELECT interval_s FROM device_codes WHERE device_hash = ?1",
+                params![device_hash],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|v| v as u64)
+        })
+    }
+
+    /// Approve a pending authorization for an account's bot. False when it
+    /// is no longer pending (expired, denied, or approved by another tab).
+    pub fn approve_device(
+        &self,
+        device_hash: &str,
+        account_id: &str,
+        bot_id: &str,
+        now: u64,
+    ) -> Result<bool> {
+        self.with(|c| {
+            let n = c.execute(
+                "UPDATE device_codes SET status = 'approved', account_id = ?2, bot_id = ?3
+                 WHERE device_hash = ?1 AND status = 'pending' AND expires_at > ?4",
+                params![device_hash, account_id, bot_id, now as i64],
+            )?;
+            Ok(n == 1)
+        })
+    }
+
+    pub fn deny_device(&self, device_hash: &str) -> Result<bool> {
+        self.with(|c| {
+            let n = c.execute(
+                "UPDATE device_codes SET status = 'denied' WHERE device_hash = ?1 AND status = 'pending'",
+                params![device_hash],
+            )?;
+            Ok(n == 1)
+        })
+    }
+
+    /// Hand the approval over exactly once: the first caller gets the row,
+    /// every later one gets `None`.
+    pub fn consume_device(&self, device_hash: &str, now: u64) -> Result<Option<DeviceRow>> {
+        self.with(|c| {
+            let n = c.execute(
+                "UPDATE device_codes SET status = 'used' WHERE device_hash = ?1 AND status = 'approved' AND expires_at > ?2",
+                params![device_hash, now as i64],
+            )?;
+            if n != 1 {
+                return Ok(None);
+            }
+            c.query_row(
+                &format!(
+                    "SELECT {} FROM device_codes WHERE device_hash = ?1",
+                    Self::DEVICE_COLS
+                ),
+                params![device_hash],
+                Self::device_row,
+            )
+            .optional()
+        })
+    }
+
+    pub fn delete_device(&self, device_hash: &str) -> Result<()> {
+        self.with(|c| {
+            c.execute(
+                "DELETE FROM device_codes WHERE device_hash = ?1",
+                params![device_hash],
+            )?;
+            Ok(())
+        })
+    }
+
     // ----- tokens -----
 
     pub fn insert_token(&self, token_hash: &str, row: &TokenRow) -> Result<()> {
@@ -1642,6 +1859,10 @@ impl Db {
         self.with(|c| {
             let n = now as i64;
             c.execute("DELETE FROM oauth_codes WHERE expires_at <= ?1", params![n])?;
+            c.execute(
+                "DELETE FROM device_codes WHERE expires_at <= ?1",
+                params![n],
+            )?;
             c.execute(
                 "DELETE FROM oauth_tokens
                  WHERE expires_at <= ?1 OR (revoked <> 0 AND kind <> 'refresh')",

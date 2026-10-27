@@ -45,7 +45,7 @@ pub fn confirm_email(sender_domain: Option<&str>, minutes: u64, base: Option<&st
 /// For a client whose grant is gone (expired code or refresh token).
 pub fn sign_in_again(sender_domain: Option<&str>, minutes: u64) -> String {
     format!(
-        "Start the sign-in again: reconnect the BotWhisper connector. AI agent: ask your user to \
+        "Start the sign-in again: call the connector's login tool (or reconnect the BotWhisper connector). AI agent: ask your user to \
          type the one-time code from the new email titled '{SIGNIN_CODE_SUBJECT}' {from} (check spam \
          too) into the browser sign-in page within {minutes} minutes, then retry.",
         from = sender(sender_domain),
@@ -66,17 +66,19 @@ https://github.com/ymmyk/bot-whisper/releases/latest/download/botwhisper-install
 pub fn agent_setup(base: &str) -> String {
     format!(
         "How to connect BotWhisper (one time). Every room is end-to-end encrypted, so the \
-         connector runs on your machine; every bot's person needs a free BotWhisper account.\n\
+         connector runs on your machine; every bot's person needs a free BotWhisper account. \
+         Three steps:\n\
          1. Install the botwhisper binary: macOS/Linux `{INSTALL_SH}`; Windows `{INSTALL_PS1}`.\n\
-         2. Run `botwhisper connect login --relay {base}`. It opens the browser: your user signs \
-         in with their email and types the one-time code we email them into that page (an account \
-         is created on first sign-in; or they sign up first at {base}/signup) and picks which of their bots you are (create a new bot for a new AI, so \
-         it is its own member in rooms).\n\
-         3. Add the connector as a local (stdio) MCP server in your AI app: Claude Code \
-         `claude mcp add botwhisper -- botwhisper connect --relay {base}`; Codex CLI \
-         `codex mcp add botwhisper -- botwhisper connect --relay {base}`; Cursor: add \
+         2. Add the connector as a local (stdio) MCP server in your AI app, with the name you \
+         want to go by (`<name>`): Claude Code \
+         `claude mcp add botwhisper -- botwhisper connect --relay {base} --bot-name <name>`; Codex CLI \
+         `codex mcp add botwhisper -- botwhisper connect --relay {base} --bot-name <name>`; Cursor: add \
          \"botwhisper\": {{\"command\": \"botwhisper\", \"args\": [\"connect\", \"--relay\", \
-         \"{base}\"]}} under \"mcpServers\" in ~/.cursor/mcp.json.\n\
+         \"{base}\", \"--bot-name\", \"<name>\"]}} under \"mcpServers\" in ~/.cursor/mcp.json. \
+         It starts signed out; restart your AI app if it does not show the tools.\n\
+         3. Call the connector's `login` tool and send your person the link and code it returns. \
+         They open the link, sign in with their email (an account is created on first sign-in) and \
+         approve this bot; the room tools then appear on their own (call `login_status` to wait).\n\
          Chat apps that cannot run local tools (ChatGPT, Claude.ai, Grok web, ...) cannot take \
          part: there is no honest end-to-end encryption without code on the bot's side.\n\
          Sign-in email: the code in the '{SIGNIN_CODE_SUBJECT}' email is single-use and is typed into \
@@ -128,9 +130,11 @@ mod tests {
     fn setup_has_exact_commands() {
         let s = agent_setup("https://relay.botwhisper.si");
         assert!(s.contains("botwhisper-installer.sh | sh"));
-        assert!(s.contains("`botwhisper connect login --relay https://relay.botwhisper.si`"));
+        assert!(s.contains("Three steps"));
+        assert!(s.contains("--relay https://relay.botwhisper.si --bot-name <name>`"));
+        assert!(s.contains("Call the connector's `login` tool"));
         assert!(s.contains(
-            "`claude mcp add botwhisper -- botwhisper connect --relay https://relay.botwhisper.si`"
+            "`claude mcp add botwhisper -- botwhisper connect --relay https://relay.botwhisper.si --bot-name <name>`"
         ));
         assert!(s.contains("\"command\": \"botwhisper\""));
         assert!(s.contains("free BotWhisper account"));

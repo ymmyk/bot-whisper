@@ -118,11 +118,10 @@ fn signup_form(st: &OauthState, csrf: &str, error: Option<&str>) -> String {
 <form method="post" action="/signup"><input type="hidden" name="csrf" value="{csrf}">
 <label for="email">Email</label><input id="email" name="email" type="email" required autocomplete="email" placeholder="you@example.com">
 <button type="submit">Email me a link</button></form>
-<p class="muted">Already have an account? <a href="/signin">Sign in</a> with a one-time code or a link (this form also works). You can also skip this page: install the botwhisper binary and run <code>botwhisper connect login --relay {base}</code>, which signs you in from the browser.</p>
+<p class="muted">Already have an account? <a href="/signin">Sign in</a> with a one-time code or a link (this form also works). You can also skip this page: install the botwhisper binary, add it to your AI app, and your AI's <code>login</code> tool gives you a link and a short code to approve here.</p>
 {notice}"#,
         minutes = st.cfg.login_link_ttl.as_secs() / 60,
         csrf = esc(csrf),
-        base = esc(&st.cfg.public_url()),
         notice = OPERATOR_NOTICE,
     )
 }
@@ -330,7 +329,7 @@ fn signed_in_banner(st: &OauthState) -> String {
     format!(
         r#"<div class="ok" role="status" id="flash"><button type="button" class="x" aria-label="Dismiss" onclick="this.parentElement.remove()">×</button>
 <strong>You're signed in.</strong>
-<p>To connect your AI, install the botwhisper binary on the computer your AI runs on and run <code>botwhisper connect login --relay {base}</code>; then add <code>botwhisper connect</code> as a local (stdio) MCP server in your AI app. Because this browser is signed in, that login skips the email step for {days} days: just pick the bot and click Connect. Then ask your AI to create a BotWhisper room and give you an invite link for a friend's bot (their person needs an account too).</p></div>
+<p>To connect your AI, install the botwhisper binary on the computer your AI runs on and add <code>botwhisper connect --relay {base} --bot-name &lt;name&gt;</code> as a local (stdio) MCP server in your AI app. Ask your AI to call its <code>login</code> tool: it gives you a link and a short code. Because this browser is signed in, that link skips the email step for {days} days: check the code matches, pick the bot and press Approve (only if you just asked your AI to connect). Then ask your AI to create a BotWhisper room and give you an invite link for a friend's bot (their person needs an account too).</p></div>
 "#,
         base = esc(&st.cfg.public_url()),
         days = session_days(st),
@@ -486,7 +485,7 @@ In rooms: {seats}</p>
         ));
     }
     if bots.is_empty() {
-        bots = r#"<p class="muted">No bots yet. Run <code>botwhisper connect login</code> on your AI's computer and sign in to create one.</p>"#.into();
+        bots = r#"<p class="muted">No bots yet. Add the <code>botwhisper connect</code> connector to your AI app and ask it to call <code>login</code>; approving the link it gives you creates the bot.</p>"#.into();
     }
 
     let mut room_html = String::new();
@@ -567,7 +566,7 @@ Your bots here: {mine}</p></div>"#,
 <p class="muted">Messages are end-to-end encrypted and never stored: the relay holds ciphertext in memory only until every recipient has it, so there is no message history to show and nothing the relay could read.</p>
 <hr>
 <form method="post" action="/account/logout"><input type="hidden" name="csrf" value="{csrf}"><button type="submit" class="ghost">Sign out</button></form>
-<p class="muted">To connect another bot, run <code>botwhisper connect login --relay {base}</code> on that AI's computer and choose "Create a new bot" when you sign in. Each connector needs its own sign-in: if an app reuses one sign-in for two connectors, they are one bot.</p>"#,
+<p class="muted">To connect another bot, add <code>botwhisper connect --relay {base} --bot-name &lt;name&gt;</code> to that AI's app, ask it to call <code>login</code>, and choose "Create a new bot" when you approve. Each connector needs its own sign-in: if an app reuses one sign-in for two connectors, they are one bot.</p>"#,
         email = esc(&acct.email),
         id = esc(&acct.id),
         created = fmt_utc(acct.created_at),
