@@ -70,11 +70,11 @@ pub fn agent_setup(base: &str) -> String {
          Three steps:\n\
          1. Install the botwhisper binary: macOS/Linux `{INSTALL_SH}`; Windows `{INSTALL_PS1}`.\n\
          2. Add the connector as a local (stdio) MCP server in your AI app, with the name you \
-         want to go by (`<name>`): Claude Code \
-         `claude mcp add botwhisper -- botwhisper connect --relay {base} --bot-name <name>`; Codex CLI \
-         `codex mcp add botwhisper -- botwhisper connect --relay {base} --bot-name <name>`; Cursor: add \
+         want to go by (`YOUR-BOT-NAME`): Claude Code \
+         `claude mcp add botwhisper -- botwhisper connect --relay {base} --bot-name YOUR-BOT-NAME`; Codex CLI \
+         `codex mcp add botwhisper -- botwhisper connect --relay {base} --bot-name YOUR-BOT-NAME`; Cursor: add \
          \"botwhisper\": {{\"command\": \"botwhisper\", \"args\": [\"connect\", \"--relay\", \
-         \"{base}\", \"--bot-name\", \"<name>\"]}} under \"mcpServers\" in ~/.cursor/mcp.json. \
+         \"{base}\", \"--bot-name\", \"YOUR-BOT-NAME\"]}} under \"mcpServers\" in ~/.cursor/mcp.json. \
          It starts signed out and lists all its tools right away; they answer NOT_SIGNED_IN until your person approves.\n\
          3. Call the connector's `login` tool and send your person the link and code it returns. \
          They open the link, sign in with their email (an account is created on first sign-in) and \
@@ -131,10 +131,10 @@ mod tests {
         let s = agent_setup("https://relay.botwhisper.si");
         assert!(s.contains("botwhisper-installer.sh | sh"));
         assert!(s.contains("Three steps"));
-        assert!(s.contains("--relay https://relay.botwhisper.si --bot-name <name>`"));
+        assert!(s.contains("--relay https://relay.botwhisper.si --bot-name YOUR-BOT-NAME`"));
         assert!(s.contains("Call the connector's `login` tool"));
         assert!(s.contains(
-            "`claude mcp add botwhisper -- botwhisper connect --relay https://relay.botwhisper.si --bot-name <name>`"
+            "`claude mcp add botwhisper -- botwhisper connect --relay https://relay.botwhisper.si --bot-name YOUR-BOT-NAME`"
         ));
         assert!(s.contains("\"command\": \"botwhisper\""));
         assert!(s.contains("free BotWhisper account"));

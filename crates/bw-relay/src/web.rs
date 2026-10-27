@@ -25,7 +25,7 @@
 use std::net::SocketAddr;
 
 use axum::{
-    extract::{ConnectInfo, Form, State},
+    extract::{ConnectInfo, Form, Query, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Redirect, Response},
 };
@@ -36,14 +36,14 @@ use crate::{
     db::{unique_bot_name, AccountRow, AccountSeat, BotRow},
     doorbell::{now_unix, DoorbellConfig, DoorbellStatus, DoorbellTarget},
     oauth::{
-        check_email_page, clean_bot_name, clear_session_cookies, client_ip, code_page,
-        cookie_value, csrf_from_headers, csrf_ok, current_account, error_page, esc, no_store, page,
-        random_token, send_signin_email, signin_failure_page, Delivery, OauthState, SigninError,
-        OPERATOR_NOTICE, RATE_LIMITED_MSG, SESSION_COOKIE, WEB_SIGNIN, WEB_SIGNUP,
+        check_email_page, clean_bot_name, clear_session_cookies, client_ip, code_page_ctx,
+        cookie_value, copy_button, csrf_from_headers, csrf_ok, current_account, error_page, esc,
+        no_store, page, random_token, send_signin_email, signin_authz, signin_failure_page,
+        time_html, CodeCtx, Delivery, OauthState, SigninError, OPERATOR_NOTICE, RATE_LIMITED_MSG,
+        SESSION_COOKIE,
     },
 };
 
-const SIGNUP_CSRF_COOKIE: &str = "bw_signup_csrf";
 const SIGNIN_CSRF_COOKIE: &str = "bw_signin_csrf";
 
 /// `YYYY-MM-DD HH:MM UTC` for a unix time.
@@ -105,123 +105,58 @@ fn session_days(st: &OauthState) -> u64 {
     st.cfg.session_ttl.as_secs() / 86_400
 }
 
-// ----- signup -----
+// ----- sign in -----
 
-fn signup_form(st: &OauthState, csrf: &str, error: Option<&str>) -> String {
+fn signin_form(
+    st: &OauthState,
+    csrf: &str,
+    error: Option<&str>,
+    device: Option<&str>,
+    email: Option<&str>,
+) -> String {
     let err = error
         .map(|e| format!(r#"<div class="err">{}</div>"#, esc(e)))
         .unwrap_or_default();
+    let ctx = device
+        .and_then(|c| crate::device::context_html(st, c))
+        .unwrap_or_default();
+    let title = if ctx.is_empty() {
+        "Sign in to BotWhisper"
+    } else {
+        "Sign in to connect your bot"
+    };
+    let hidden = device
+        .filter(|_| !ctx.is_empty())
+        .map(|c| format!(r#"<input type="hidden" name="device" value="{}">"#, esc(c)))
+        .unwrap_or_default();
     format!(
-        r#"<h1>Create your BotWhisper account</h1>
-<p class="muted">One email, no password. We'll send a confirmation link that works once and expires in {minutes} minutes.</p>
+        r#"<h1>{title}</h1>
+{ctx}<p class="muted">New or returning, it's the same: no password. We'll email you an {digits}-digit code.</p>
 {err}
-<form method="post" action="/signup"><input type="hidden" name="csrf" value="{csrf}">
-<label for="email">Email</label><input id="email" name="email" type="email" required autocomplete="email" placeholder="you@example.com">
-<button type="submit">Email me a link</button></form>
-<p class="muted">Already have an account? <a href="/signin">Sign in</a> with a one-time code or a link (this form also works). You can also skip this page: install the botwhisper binary, add it to your AI app, and your AI's <code>login</code> tool gives you a link and a short code to approve here.</p>
+<form method="post" action="/signin"><input type="hidden" name="csrf" value="{csrf}">{hidden}
+<label for="email">Email</label><input id="email" name="email" type="email" required autocomplete="email" placeholder="you@example.com" value="{email}" autofocus>
+<button type="submit" name="method" value="code">Continue with email</button>
+<p class="muted"><button type="submit" name="method" value="link" class="linklike">Email me a link instead</button></p></form>
 {notice}"#,
-        minutes = st.cfg.login_link_ttl.as_secs() / 60,
+        digits = crate::oauth::LOGIN_CODE_DIGITS,
         csrf = esc(csrf),
+        email = esc(email.unwrap_or("")),
         notice = OPERATOR_NOTICE,
     )
 }
 
-fn signup_page(st: &OauthState, status: StatusCode, error: Option<&str>) -> Response {
+fn signin_page(
+    st: &OauthState,
+    status: StatusCode,
+    error: Option<&str>,
+    device: Option<&str>,
+    email: Option<&str>,
+) -> Response {
     let csrf = random_token("");
     let mut r = no_store((
         status,
-        page("Create an account", &signup_form(st, &csrf, error)),
+        page("Sign in", &signin_form(st, &csrf, error, device, email)),
     ));
-    r.headers_mut().append(
-        header::SET_COOKIE,
-        format!(
-            "{SIGNUP_CSRF_COOKIE}={csrf}; Path=/signup; HttpOnly; SameSite=Strict; Max-Age=3600{}",
-            if st.cfg.is_https() { "; Secure" } else { "" }
-        )
-        .parse()
-        .expect("header"),
-    );
-    r
-}
-
-pub async fn signup_get(State(st): State<OauthState>, headers: HeaderMap) -> Response {
-    if current_account(&st, &headers).is_some() {
-        return no_store(Redirect::to("/account"));
-    }
-    signup_page(&st, StatusCode::OK, None)
-}
-
-#[derive(Debug, Deserialize, Default)]
-pub struct SignupForm {
-    #[serde(default)]
-    pub email: Option<String>,
-    #[serde(default)]
-    pub csrf: Option<String>,
-}
-
-pub async fn signup_post(
-    State(st): State<OauthState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    Form(f): Form<SignupForm>,
-) -> Response {
-    if !csrf_ok(
-        cookie_value(&headers, SIGNUP_CSRF_COOKIE),
-        f.csrf.as_deref(),
-    ) {
-        return forbidden();
-    }
-    let ip = client_ip(&headers, Some(peer), st.cfg.behind_proxy);
-    let email = f.email.as_deref().unwrap_or_default();
-    match send_signin_email(
-        &st,
-        &ip,
-        email,
-        WEB_SIGNUP.to_string(),
-        "create or sign in to your BotWhisper account",
-        Delivery::Link,
-    )
-    .await
-    {
-        Ok(_) => check_email_page(&st, "finish creating your account"),
-        Err(SigninError::InvalidEmail) => signup_page(
-            &st,
-            StatusCode::OK,
-            Some("That is not a valid email address."),
-        ),
-        Err(SigninError::RateLimited) => {
-            signup_page(&st, StatusCode::TOO_MANY_REQUESTS, Some(RATE_LIMITED_MSG))
-        }
-        Err(e) => signin_failure_page(&e),
-    }
-}
-
-// ----- sign in -----
-
-fn signin_form(st: &OauthState, csrf: &str, error: Option<&str>) -> String {
-    let err = error
-        .map(|e| format!(r#"<div class="err">{}</div>"#, esc(e)))
-        .unwrap_or_default();
-    format!(
-        r#"<h1>Sign in to BotWhisper</h1>
-<p class="muted">One email, no password. Pick how you want to confirm it: whatever we send works once and expires in {minutes} minutes.</p>
-{err}
-<form method="post" action="/signin"><input type="hidden" name="csrf" value="{csrf}">
-<label for="email">Email</label><input id="email" name="email" type="email" required autocomplete="email" placeholder="you@example.com">
-<label class="pick"><input type="radio" name="method" value="code" checked><strong>Email me a one-time code</strong><br><span class="muted">Type it on the next page. Handy when your email is on another device, like your phone.</span></label>
-<label class="pick"><input type="radio" name="method" value="link"><strong>Email me a sign-in link</strong><br><span class="muted">Open it in this browser.</span></label>
-<button type="submit">Send</button></form>
-<p class="muted">New here? The same form creates your account, or <a href="/signup">sign up</a>.</p>
-{notice}"#,
-        minutes = st.cfg.login_link_ttl.as_secs() / 60,
-        csrf = esc(csrf),
-        notice = OPERATOR_NOTICE,
-    )
-}
-
-fn signin_page(st: &OauthState, status: StatusCode, error: Option<&str>) -> Response {
-    let csrf = random_token("");
-    let mut r = no_store((status, page("Sign in", &signin_form(st, &csrf, error))));
     r.headers_mut().append(
         header::SET_COOKIE,
         format!(
@@ -231,15 +166,57 @@ fn signin_page(st: &OauthState, status: StatusCode, error: Option<&str>) -> Resp
         .parse()
         .expect("header"),
     );
+    r.headers_mut().insert(
+        header::REFERRER_POLICY,
+        "no-referrer".parse().expect("header"),
+    );
     r
 }
 
-/// `GET /signin`: the web sign-in form (signed-in browsers go to /account).
-pub async fn signin_get(State(st): State<OauthState>, headers: HeaderMap) -> Response {
+#[derive(Debug, Deserialize, Default)]
+pub struct SigninQuery {
+    /// A device user code to return to after signing in.
+    #[serde(default)]
+    pub code: Option<String>,
+}
+
+/// A device code from a form or query, kept only when it is well formed and
+/// still pending (an unknown code is simply not carried).
+fn carried_device_code(st: &OauthState, ip: &str, raw: Option<&str>) -> Option<String> {
+    let code = crate::device::normalize_user_code(raw?)?;
+    st.limits
+        .device_codes_by_ip
+        .check(&format!("devcode-ctx:{ip}"))
+        .ok()?;
+    crate::device::context_html(st, &code).map(|_| code)
+}
+
+/// `GET /signin[?code=XXXX-XXXX]`: the web sign-in form (signed-in browsers
+/// go to /account, or on to /device when a code is carried).
+pub async fn signin_get(
+    State(st): State<OauthState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Query(q): Query<SigninQuery>,
+) -> Response {
+    let ip = client_ip(&headers, Some(peer), st.cfg.behind_proxy);
+    let device = carried_device_code(&st, &ip, q.code.as_deref());
     if current_account(&st, &headers).is_some() {
-        return no_store(Redirect::to("/account"));
+        return match device {
+            Some(c) => no_store(Redirect::to(&format!(
+                "/device?code={}",
+                crate::device::spaced_user_code(&c)
+            ))),
+            None => no_store(Redirect::to("/account")),
+        };
     }
-    signin_page(&st, StatusCode::OK, None)
+    signin_page(&st, StatusCode::OK, None, device.as_deref(), None)
+}
+
+/// `/signup` is the same form as `/signin` (one "Continue with email" for
+/// new and returning people).
+pub async fn signup_get() -> Response {
+    no_store(Redirect::to("/signin"))
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -251,11 +228,16 @@ pub struct SigninForm {
     pub method: Option<String>,
     #[serde(default)]
     pub csrf: Option<String>,
+    /// A device user code to return to after signing in.
+    #[serde(default)]
+    pub device: Option<String>,
 }
 
 /// `POST /signin`: mail a one-time code (and show the code box) or a link
 /// (HTML `<a rel="nofollow">`), as the person chose. Same response whether
-/// or not the address has an account.
+/// or not the address has an account. A carried device code is the
+/// server-side return-to: it rides in the pending login, so it works even
+/// when the email is opened on another device.
 pub async fn signin_post(
     State(st): State<OauthState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -273,27 +255,47 @@ pub async fn signin_post(
         _ => Delivery::Code,
     };
     let ip = client_ip(&headers, Some(peer), st.cfg.behind_proxy);
-    let email = f.email.as_deref().unwrap_or_default();
+    let email = f.email.as_deref().unwrap_or_default().trim().to_string();
+    let device = carried_device_code(&st, &ip, f.device.as_deref());
     match send_signin_email(
         &st,
         &ip,
-        email,
-        WEB_SIGNIN.to_string(),
+        &email,
+        signin_authz(device.as_deref()),
         "sign in to your BotWhisper account",
         delivery,
     )
     .await
     {
-        Ok(Some(handle)) => code_page(&st, &handle, "sign in to your account", None),
-        Ok(None) => check_email_page(&st, "sign in to your account"),
+        Ok(Some(handle)) => {
+            let csrf = cookie_value(&headers, SIGNIN_CSRF_COOKIE);
+            code_page_ctx(
+                &st,
+                &handle,
+                "sign in to your account",
+                None,
+                &CodeCtx {
+                    email: Some(&email),
+                    device: device.as_deref(),
+                    resend_csrf: csrf.as_deref(),
+                },
+            )
+        }
+        Ok(None) => check_email_page(&st, "sign in to your account", Some(&email)),
         Err(SigninError::InvalidEmail) => signin_page(
             &st,
             StatusCode::OK,
             Some("That is not a valid email address."),
+            device.as_deref(),
+            Some(&email),
         ),
-        Err(SigninError::RateLimited) => {
-            signin_page(&st, StatusCode::TOO_MANY_REQUESTS, Some(RATE_LIMITED_MSG))
-        }
+        Err(SigninError::RateLimited) => signin_page(
+            &st,
+            StatusCode::TOO_MANY_REQUESTS,
+            Some(RATE_LIMITED_MSG),
+            device.as_deref(),
+            Some(&email),
+        ),
         Err(e) => signin_failure_page(&e),
     }
 }
@@ -329,18 +331,13 @@ fn signed_in_banner(st: &OauthState) -> String {
     format!(
         r#"<div class="ok" role="status" id="flash"><button type="button" class="x" aria-label="Dismiss" onclick="this.parentElement.remove()">×</button>
 <strong>You're signed in.</strong>
-<p>To connect your AI, install the botwhisper binary on the computer your AI runs on and add <code>botwhisper connect --relay {base} --bot-name &lt;name&gt;</code> as a local (stdio) MCP server in your AI app. Ask your AI to call its <code>login</code> tool: it gives you a link and a short code. Because this browser is signed in, that link skips the email step for {days} days: check the code matches, pick the bot and press Approve (only if you just asked your AI to connect). Then ask your AI to create a BotWhisper room and give you an invite link for a friend's bot (their person needs an account too).</p></div>
+<p>Next: press <strong>Add a bot</strong> below, paste the prompt into your AI app, and approve the link it sends you (this browser stays signed in for {days} days, so there is no email step). Only approve a link you just asked for.</p></div>
 "#,
-        base = esc(&st.cfg.public_url()),
         days = session_days(st),
     )
 }
 
 // ----- account -----
-
-fn opt_time(t: Option<u64>) -> String {
-    t.map(fmt_utc).unwrap_or_else(|| "never".into())
-}
 
 fn short(s: &str) -> String {
     s.chars().take(8).collect()
@@ -399,81 +396,161 @@ fn doorbell_html(
     html
 }
 
+/// A long id shortened for display (the copy button keeps the full value).
+fn trunc(s: &str) -> String {
+    let n = s.chars().count();
+    if n <= 18 {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(9).collect();
+    let tail: String = s.chars().skip(n - 5).collect();
+    format!("{head}…{tail}")
+}
+
+/// A labelled id: truncated, with a Copy button and a one-line explanation.
+fn id_row(label: &str, value: &str, what: &str) -> String {
+    format!(
+        r#"<div class="idrow"><span>{label}</span> <code title="{full}">{short}</code> {copy}</div><p class="muted">{what}</p>"#,
+        label = esc(label),
+        full = esc(value),
+        short = esc(&trunc(value)),
+        copy = copy_button(value, "Copy"),
+        what = esc(what),
+    )
+}
+
+/// How a bot is doing, in plain words.
+enum BotStatus {
+    Connected,
+    Waiting,
+    NotConnected,
+}
+
+fn bot_status(db: &crate::db::Db, bot: &BotRow, now: u64) -> BotStatus {
+    if db.bot_waiting(&bot.id, now).unwrap_or(false) {
+        BotStatus::Waiting
+    } else if db.bot_live_client(&bot.id, now).ok().flatten().is_some() {
+        BotStatus::Connected
+    } else {
+        BotStatus::NotConnected
+    }
+}
+
+fn status_pill(s: &BotStatus) -> &'static str {
+    match s {
+        BotStatus::Connected => r#"<span class="status on">Connected</span>"#,
+        BotStatus::Waiting => {
+            r#"<span class="status wait" data-waiting>Waiting for your AI</span>"#
+        }
+        BotStatus::NotConnected => r#"<span class="status off">Not connected</span>"#,
+    }
+}
+
 fn account_html(st: &OauthState, acct: &AccountRow, csrf: &str) -> String {
     let now = now_unix();
     let db = &st.db;
+    let base = st.cfg.public_url();
     let all_bots = db.account_bots(&acct.id).unwrap_or_default();
     let rooms = db.account_rooms(&acct.id).unwrap_or_default();
     let seats = db.account_seats(&acct.id).unwrap_or_default();
     let invites = db.account_invites(&acct.id).unwrap_or_default();
 
     let mut bots = String::new();
+    let mut any_waiting = false;
     for b in &all_bots {
         let my_seats: Vec<String> = bot_seats(acct, b, &seats)
             .map(|s| {
                 format!(
-                    "{} (member <code>{}</code> in room <code>{}</code>)",
+                    "{} (<code>{}</code> in room <code>{}</code>)",
                     esc(s.display_name.as_deref().unwrap_or("unnamed")),
                     esc(&s.member_id),
-                    esc(&s.room_id)
+                    esc(&short(&s.room_id))
                 )
             })
             .collect();
+        let status = bot_status(db, b, now);
         let live = db.bot_live_client(&b.id, now).ok().flatten();
-        let app = match &live {
-            Some((_, n)) => format!(
-                "Connected to <strong>{}</strong>",
-                esc(n.as_deref().unwrap_or("an MCP client"))
+        let detail = match (&status, &live) {
+            (BotStatus::Waiting, _) => {
+                any_waiting = true;
+                "Approved. Your AI should finish connecting in a few seconds; this page refreshes by itself.".to_string()
+            }
+            (BotStatus::Connected, Some((_, n))) => format!(
+                "Using {}{}.",
+                esc(n.as_deref().unwrap_or("an MCP client")),
+                b.last_used_at
+                    .map(|t| format!(", last seen {}", time_html(t)))
+                    .unwrap_or_default()
             ),
-            None => format!(
-                "Not connected (last connected with {})",
-                esc(b.last_client_name.as_deref().unwrap_or("an MCP client"))
-            ),
+            _ => match b.last_used_at {
+                Some(t) => format!(
+                    "Last seen {}{}.",
+                    time_html(t),
+                    b.last_client_name
+                        .as_deref()
+                        .map(|n| format!(" with {}", esc(n)))
+                        .unwrap_or_default()
+                ),
+                None => "Never connected yet. Ask your AI to call <code>login</code>.".into(),
+            },
         };
         let mut bells = String::new();
         if let Ok(Some((cfg, status))) = db.bot_doorbell(&b.agent_id) {
-            bells.push_str(&doorbell_html(
-                st,
-                "Default doorbell (all rooms)",
-                &cfg,
-                &status,
-            ));
+            bells.push_str(&doorbell_html(st, "Wake-ups on (all rooms)", &cfg, &status));
         }
         for s in bot_seats(acct, b, &seats) {
             if let Ok(Some((cfg, status))) = db.room_doorbell(&s.room_id, &s.member_id) {
                 bells.push_str(&doorbell_html(
                     st,
-                    &format!("Doorbell in room {}", short(&s.room_id)),
+                    &format!("Wake-ups on in room {}", short(&s.room_id)),
                     &cfg,
                     &status,
                 ));
             }
         }
         if bells.is_empty() {
-            bells = r#"<p class="muted">No doorbell: this bot is only woken when its app checks in. Ask it to call <code>set_doorbell</code>.</p>"#.into();
+            bells = r#"<p class="muted">Wake-ups off: your bot only sees messages when it checks in. <a href="https://botwhisper.si/#wakeups">What does this mean?</a></p>"#.into();
         }
         let disconnect = if live.is_some() {
             format!(
-                r#" <form class="inline" method="post" action="/account/disconnect"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="bot_id" value="{id}"><button type="submit" class="ghost">Disconnect</button></form>"#,
+                r#" <form class="inline" method="post" action="/account/disconnect"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="bot_id" value="{id}"><button type="submit" class="ghost small">Disconnect</button></form>"#,
                 csrf = esc(csrf),
                 id = esc(&b.id),
             )
         } else {
             String::new()
         };
+        let connect_cmd = format!(
+            "botwhisper connect --relay {base} --bot-name \"{}\"",
+            b.name.replace('"', "")
+        );
+        let reconnect = if matches!(status, BotStatus::NotConnected) {
+            format!(
+                r#"<details><summary class="muted">Reconnect this bot</summary><p class="muted">Ask your AI to call <code>login</code> and pick <strong>{name}</strong> on the approval page, or run:</p><div class="idrow"><code>{cmd}</code> {copy}</div></details>"#,
+                name = esc(&b.name),
+                cmd = esc(&connect_cmd),
+                copy = copy_button(&connect_cmd, "Copy"),
+            )
+        } else {
+            String::new()
+        };
         bots.push_str(&format!(
-            r#"<div class="row"><p><strong>{name}</strong></p>
-<p class="muted">{app}<br>
-Created {created} · last used {used}<br>
-Member id <code>{agent}</code><br>
-In rooms: {seats}</p>
-{bells}
-<form method="post" action="/account/bots/rename"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="bot_id" value="{id}"><label for="name-{id}">Name</label><input id="name-{id}" name="name" type="text" maxlength="60" value="{name}"><button type="submit" class="ghost">Rename</button></form>
-{disconnect} <form class="inline" method="post" action="/account/bots/delete"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="bot_id" value="{id}"><button type="submit" class="ghost">Delete</button></form></div>"#,
+            r#"<div class="row"><p><strong>{name}</strong> {pill}</p>
+<p class="muted">{detail}<br>Created {created}<br>In rooms: {seats}</p>
+{id_row}
+{bells}{reconnect}
+<form method="post" action="/account/bots/rename"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="bot_id" value="{id}"><label for="name-{id}">Name</label><input id="name-{id}" name="name" type="text" maxlength="60" value="{name}"><button type="submit" class="ghost small">Rename</button></form>
+{disconnect}
+<div class="danger-zone"><form method="post" action="/account/bots/delete"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="bot_id" value="{id}"><button type="submit" class="danger small">Delete this bot…</button></form></div></div>"#,
             name = esc(&b.name),
-            created = fmt_utc(b.created_at),
-            used = opt_time(b.last_used_at),
-            agent = esc(&b.agent_id),
+            pill = status_pill(&status),
+            detail = detail,
+            created = time_html(b.created_at),
+            id_row = id_row(
+                "Member ID",
+                &b.agent_id,
+                "Your bot's identity in every room it joins: this is what the other members' bots see. Not a password."
+            ),
             id = esc(&b.id),
             seats = if my_seats.is_empty() {
                 "none".to_string()
@@ -481,18 +558,21 @@ In rooms: {seats}</p>
                 my_seats.join("; ")
             },
             bells = bells,
+            reconnect = reconnect,
+            disconnect = disconnect,
             csrf = esc(csrf),
         ));
     }
     if bots.is_empty() {
-        bots = r#"<p class="muted">No bots yet. Add the <code>botwhisper connect</code> connector to your AI app and ask it to call <code>login</code>; approving the link it gives you creates the bot.</p>"#.into();
+        bots =
+            r#"<p class="muted">No bots yet. Press <strong>Add a bot</strong> above.</p>"#.into();
     }
 
     let mut room_html = String::new();
     for r in &rooms {
         let status = match r.expires_at {
-            Some(e) if e <= now => format!("expired {}", fmt_utc(e)),
-            Some(e) => format!("open, expires {}", fmt_utc(e)),
+            Some(e) if e <= now => format!("expired {}", time_html(e)),
+            Some(e) => format!("open, expires {}", time_html(e)),
             None => "open, never expires".into(),
         };
         let mine: Vec<String> = seats
@@ -504,21 +584,19 @@ In rooms: {seats}</p>
                     esc(s.display_name.as_deref().unwrap_or("unnamed")),
                     esc(&s.member_id),
                     esc(&s.role),
-                    fmt_utc(s.joined_at)
+                    time_html(s.joined_at)
                 )
             })
             .collect();
         room_html.push_str(&format!(
             r#"<div class="row"><p><strong>Room <code>{id}</code></strong> · {role}</p>
-<p class="muted">{n} of {max} seats · mode {mode} · the title is encrypted (only members' connectors know it)<br>
-Created {created} · {status}<br>
+<p class="muted">{n} of {max} seats · mode {mode} · {status}<br>
 Your bots here: {mine}</p></div>"#,
             role = if r.owned { "you own it" } else { "member" },
             id = esc(&r.id),
             mode = esc(&r.mode),
             n = r.member_count,
             max = r.max_members,
-            created = fmt_utc(r.created_at),
             mine = if mine.is_empty() {
                 "none".to_string()
             } else {
@@ -526,16 +604,18 @@ Your bots here: {mine}</p></div>"#,
             },
         ));
     }
-    if room_html.is_empty() {
-        room_html = r#"<p class="muted">No rooms yet.</p>"#.into();
-    }
+    let rooms_section = if room_html.is_empty() {
+        String::new()
+    } else {
+        format!("<h2>Rooms</h2>{room_html}")
+    };
 
     let mut inv_html = String::new();
     for i in &invites {
         let state = match i.redeemed_at {
-            Some(t) => format!("used {}", fmt_utc(t)),
-            None if i.expires_at <= now => format!("expired {}", fmt_utc(i.expires_at)),
-            None => format!("unused, expires {}", fmt_utc(i.expires_at)),
+            Some(t) => format!("used {}", time_html(t)),
+            None if i.expires_at <= now => format!("expired {}", time_html(i.expires_at)),
+            None => format!("unused, expires {}", time_html(i.expires_at)),
         };
         inv_html.push_str(&format!(
             r#"<p class="muted">Invite <code>{id}…</code> for room <code>{room}</code>{label} · {state}</p>"#,
@@ -548,62 +628,67 @@ Your bots here: {mine}</p></div>"#,
                 .unwrap_or_default(),
         ));
     }
-    if inv_html.is_empty() {
-        inv_html = r#"<p class="muted">No invites.</p>"#.into();
-    }
+    let invites_section = if inv_html.is_empty() {
+        String::new()
+    } else {
+        format!("<h2>Invites you created</h2>{inv_html}")
+    };
+
+    let refresh = if any_waiting {
+        r#"<script>setTimeout(function(){var a=document.activeElement;if(a&&a.tagName==='INPUT'&&a.value&&a.id==='addbot-name')return;location.reload()},5000)</script>"#
+    } else {
+        ""
+    };
 
     format!(
-        r#"<h1>Your account</h1>
-<p>Signed in as <strong>{email}</strong>.</p>
-<p class="muted">Account id <code>{id}</code> · created (email confirmed) {created}. All times are UTC.</p>
-<h2>Add a bot</h2>
-{add_bot}
+        r##"<div class="nav"><a href="/account">Account</a><a href="#add-bot">Add a bot</a><form method="post" action="/account/logout"><input type="hidden" name="csrf" value="{csrf}"><button type="submit" class="linklike">Sign out</button></form></div>
+<h1>Your account</h1>
+<p>Signed in as <strong>{email}</strong>. Created {created}.</p>
+{account_id}
+<div id="add-bot">{add_bot}</div>
 <h2>Your bots</h2>
-<p class="muted">Each bot is its own member in rooms, so two of your bots can talk to each other. Each connection picks its bot on the sign-in page; one bot has one live connection.</p>{bots}
-<h2>Rooms</h2>{room_html}
-<p class="muted">Closed rooms are deleted, so they don't appear here.</p>
-<h2>Invites you created</h2>{inv_html}
-<p class="muted">Invite links themselves are never stored, only a hash, so only a short reference is shown.</p>
-<h2>Messages</h2>
-<p class="muted">Messages are end-to-end encrypted and never stored: the relay holds ciphertext in memory only until every recipient has it, so there is no message history to show and nothing the relay could read.</p>
+<p class="muted">Each bot is its own member in rooms. A bot has one live connection at a time.</p><div data-autorefresh>{bots}</div>
+{rooms_section}{invites_section}
 <hr>
-<form method="post" action="/account/logout"><input type="hidden" name="csrf" value="{csrf}"><button type="submit" class="ghost">Sign out</button></form>
-<p class="muted">Each connector needs its own sign-in: if an app reuses one sign-in for two connectors, they are one bot.</p>"#,
+<p class="muted">Messages are end-to-end encrypted and never stored, so there is no history here.</p>{refresh}"##,
         email = esc(&acct.email),
-        id = esc(&acct.id),
-        created = fmt_utc(acct.created_at),
+        created = time_html(acct.created_at),
+        account_id = id_row(
+            "Account ID",
+            &acct.id,
+            "Identifies your account to BotWhisper (share it only when asking for support). Not a password."
+        ),
         csrf = esc(csrf),
-        add_bot = add_bot_html(&st.cfg.public_url()),
+        add_bot = add_bot_html(&base),
     )
 }
 
-/// The "Add a bot" block: a name field and a ready-to-paste prompt for the
-/// person's AI, with a Copy button. Inline script (no outside resources);
-/// the prompt is also plain text, so it works without JavaScript.
+/// The "Add a bot" block: a button that opens a name field and a
+/// ready-to-paste prompt for the person's AI, with a Copy button. The
+/// prompt is also plain text, so it works without JavaScript.
 fn add_bot_html(base: &str) -> String {
     let default = "My AI";
+    let prompt = add_bot_prompt(base, default);
     format!(
-        r#"<div class="row addbot">
-<p>Paste this to your AI app (Claude Code, Codex, Cursor, ...). It installs the connector and gives you a link to approve.</p>
+        r#"<details class="addbot"><summary class="btn">Add a bot</summary>
+<p>Paste this to your AI app (Grok Bot, Claude Code, Codex, Cursor, ...). It installs the connector and gives you a link to approve.</p>
 <label for="addbot-name">Name for the new bot</label><input id="addbot-name" type="text" maxlength="60" value="{default}" autocomplete="off">
-<p><code id="addbot-prompt" class="prompt">{prompt}</code></p>
-<p><button type="button" id="addbot-copy">Copy</button></p>
-</div>
+<p><code id="addbot-prompt" class="prompt">{prompt_html}</code></p>
+<p><button type="button" id="addbot-copy" class="copy" data-copy="{prompt_attr}" data-label="Copy prompt">Copy prompt</button></p>
+</details>
 <script>
 (function(){{
 var n=document.getElementById('addbot-name'),p=document.getElementById('addbot-prompt'),b=document.getElementById('addbot-copy');
 if(!n||!p||!b)return;
 var base={base_js};
-function text(){{var v=n.value.replace(/["\\\r\n]/g,'').trim()||'My AI';
-return 'Connect to BotWhisper as "'+v+'": follow the instructions at https://botwhisper.si/connect to install botwhisper, add it as an MCP server (botwhisper connect --relay '+base+' --bot-name "'+v+'"), and sign in. Call login and send me the link and code.';}}
-n.addEventListener('input',function(){{p.textContent=text()}});
-b.addEventListener('click',function(){{var t=text();p.textContent=t;
-function ok(){{b.textContent='Copied';setTimeout(function(){{b.textContent='Copy'}},1800)}}
-function fb(){{var r=document.createRange();r.selectNodeContents(p);var s=getSelection();s.removeAllRanges();s.addRange(r);try{{document.execCommand('copy');ok()}}catch(e){{}}}}
-if(navigator.clipboard&&navigator.clipboard.writeText){{navigator.clipboard.writeText(t).then(ok,fb)}}else{{fb()}}}});
+n.addEventListener('input',function(){{var v=n.value.replace(/["\\\r\n]/g,'').trim()||'My AI';
+var t='Connect to BotWhisper as "'+v+'": follow the instructions at https://botwhisper.si/connect to install botwhisper, add it as an MCP server (botwhisper connect --relay '+base+' --bot-name "'+v+'"), and sign in. Call login and send me the link and code.';
+p.textContent=t;b.setAttribute('data-copy',t)}});
+if(location.hash==='#add-bot'){{n.closest('details').open=true}}
 }})();
 </script>"#,
-        prompt = esc(&add_bot_prompt(base, default)),
+        prompt_html = esc(&prompt),
+        prompt_attr = esc(&prompt),
         base_js = serde_json::to_string(base)
             .unwrap_or_else(|_| "\"\"".into())
             .replace('<', "\\u003c"),
@@ -777,7 +862,7 @@ pub async fn delete_post(
     };
     let seats = st.db.account_seats(&acct.id).unwrap_or_default();
     let mine: Vec<&AccountSeat> = bot_seats(&acct, &bot, &seats).collect();
-    if !mine.is_empty() && f.confirm.as_deref() != Some("yes") {
+    if f.confirm.as_deref() != Some("yes") {
         let rooms: Vec<String> = mine
             .iter()
             .map(|s| {
@@ -798,15 +883,29 @@ pub async fn delete_post(
             "Delete bot",
             &format!(
                 r#"<h1>Delete {name}?</h1>
-<p>{name} is in {n} room{s}. Deleting it removes it from {them}, and ends its connection:</p>
-<ul>{rooms}</ul>
-<form method="post" action="/account/bots/delete"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="bot_id" value="{id}"><input type="hidden" name="confirm" value="yes"><button type="submit">Delete and leave rooms</button></form>
-<p><a href="/account">Cancel</a></p>"#,
+<p>This cannot be undone. {rooms_line}</p>
+{rooms}
+<form method="post" action="/account/bots/delete"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="bot_id" value="{id}"><input type="hidden" name="confirm" value="yes"><button type="submit" class="danger">Yes, delete {name}</button> <a href="/account">Cancel</a></form>"#,
                 name = esc(&bot.name),
-                n = mine.len(),
-                s = if mine.len() == 1 { "" } else { "s" },
-                them = if mine.len() == 1 { "it" } else { "them" },
-                rooms = rooms.join(""),
+                rooms_line = if mine.is_empty() {
+                    format!(
+                        "{} is not in any room; deleting it ends its connection.",
+                        esc(&bot.name)
+                    )
+                } else {
+                    format!(
+                        "{} is in {} room{}; deleting it removes it from {} and ends its connection:",
+                        esc(&bot.name),
+                        mine.len(),
+                        if mine.len() == 1 { "" } else { "s" },
+                        if mine.len() == 1 { "it" } else { "them" }
+                    )
+                },
+                rooms = if mine.is_empty() {
+                    String::new()
+                } else {
+                    format!("<ul>{}</ul>", rooms.join(""))
+                },
                 csrf = esc(&csrf),
                 id = esc(&bot.id),
             ),

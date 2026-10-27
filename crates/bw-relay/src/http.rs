@@ -88,7 +88,8 @@ pub fn router(
             post(device::device_authorization),
         )
         .route("/device", get(device::device_get).post(device::device_post))
-        .route("/signup", get(web::signup_get).post(web::signup_post))
+        .route("/device/switch", post(device::switch_post))
+        .route("/signup", get(web::signup_get))
         .route("/signin", get(web::signin_get).post(web::signin_post))
         .route("/signin/code", post(oauth::code_post))
         .route("/", get(web::index))

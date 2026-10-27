@@ -90,11 +90,18 @@ fn device_code(v: &Value) -> String {
     v["device_code"].as_str().unwrap().to_string()
 }
 
-/// Sign a browser in on the web with an emailed code (no device link).
-async fn web_sign_in(relay: &TestRelay, http: &Client, email: &str) -> reqwest::Response {
+/// Sign a browser in on the web with an emailed code. `signin_path` is
+/// where it starts (`/signin`, or `/signin?code=...` after a device link);
+/// the hidden `device` field is carried along the way a browser would.
+async fn web_sign_in_at(
+    relay: &TestRelay,
+    http: &Client,
+    email: &str,
+    signin_path: &str,
+) -> reqwest::Response {
     let base = relay.base();
     let page = http
-        .get(format!("{base}/signin"))
+        .get(format!("{base}{signin_path}"))
         .send()
         .await
         .unwrap()
@@ -102,22 +109,37 @@ async fn web_sign_in(relay: &TestRelay, http: &Client, email: &str) -> reqwest::
         .await
         .unwrap();
     let csrf = hidden(&page, "csrf");
+    let mut form = vec![
+        ("email", email.to_string()),
+        ("method", "code".to_string()),
+        ("csrf", csrf),
+    ];
+    if page.contains(r#"name="device""#) {
+        form.push(("device", hidden(&page, "device")));
+    }
     let r = http
         .post(format!("{base}/signin"))
-        .form(&[
-            ("email", email),
-            ("method", "code"),
-            ("csrf", csrf.as_str()),
-        ])
+        .form(&form)
         .send()
         .await
         .unwrap();
     assert_eq!(r.status(), StatusCode::OK);
-    let pending = hidden(&r.text().await.unwrap(), "pending");
+    let code_page = r.text().await.unwrap();
+    if signin_path.contains("code=") {
+        assert!(
+            code_page.contains("After you sign in, we"),
+            "the code page keeps the device context: {code_page}"
+        );
+    }
+    let pending = hidden(&code_page, "pending");
     let mail = relay.mail.lock().unwrap().pop().expect("a mail");
     let code = mail_code(&mail.body);
+    let mut form = vec![("pending", pending), ("code", code)];
+    if code_page.contains(r#"name="device""#) {
+        form.push(("device", hidden(&code_page, "device")));
+    }
     http.post(format!("{base}/signin/code"))
-        .form(&[("pending", pending.as_str()), ("code", code.as_str())])
+        .form(&form)
         .send()
         .await
         .unwrap()
@@ -151,8 +173,10 @@ async fn open_approval(
     // Signed out: the link goes to the web sign-in and remembers the code.
     let r = http.get(link).send().await.unwrap();
     assert_eq!(r.status(), StatusCode::SEE_OTHER);
-    assert_eq!(r.headers()["location"], "/signin");
-    let r = web_sign_in(relay, http, email).await;
+    let uc = start["user_code"].as_str().unwrap();
+    let to = r.headers()["location"].to_str().unwrap().to_string();
+    assert_eq!(to, format!("/signin?code={uc}"));
+    let r = web_sign_in_at(relay, http, email, &to).await;
     assert_eq!(r.status(), StatusCode::SEE_OTHER);
     assert_eq!(
         r.headers()["location"],
@@ -253,7 +277,9 @@ async fn device_flow_happy_path() {
     )
     .await;
     assert_eq!(r.status(), StatusCode::OK);
-    assert!(r.text().await.unwrap().contains("Connected"));
+    let done = r.text().await.unwrap();
+    assert!(done.contains("You're connected"), "{done}");
+    assert!(done.contains(r#"href="/account""#));
 
     let (s, t) = poll(&http, &base, &cid, &device_code(&v)).await;
     assert_eq!(s, StatusCode::OK, "{t}");
@@ -317,6 +343,14 @@ async fn existing_bot_is_preselected_by_name() {
     )
     .await;
     poll(&http, &base, &cid, &device_code(&v)).await;
+    // That bot's connection ends (so it is not "connected on another computer").
+    let acct = relay
+        .db
+        .account_by_email("pre@example.com")
+        .unwrap()
+        .unwrap();
+    let alpha = relay.db.account_bots(&acct.id).unwrap()[0].id.clone();
+    relay.db.revoke_bot_grants(&alpha).unwrap();
 
     let cid2 = client_id(&http, &base).await;
     let v2 = start(&http, &base, &cid2, Some("alpha")).await;
@@ -503,7 +537,11 @@ async fn device_page_needs_a_web_sign_in_and_hides_codes_from_strangers() {
             .unwrap(),
     ] {
         assert_eq!(r.status(), StatusCode::SEE_OTHER);
-        assert_eq!(r.headers()["location"], "/signin");
+        let to = r.headers()["location"].to_str().unwrap().to_string();
+        assert!(
+            to == "/signin" || to == format!("/signin?code={}", user_code(&v)),
+            "{to}"
+        );
     }
     let r = stranger
         .post(format!("{base}/device"))
@@ -763,5 +801,368 @@ async fn codes_copy_as_one_token_and_inputs_take_any_form() {
             "{typed:?}: one bare token on the approval page"
         );
     }
+    relay.shutdown().await;
+}
+
+/// The device link keeps its code through sign-in, shows what is being
+/// connected, offers "Switch account", and never silently takes over a bot
+/// that is connected somewhere else.
+#[tokio::test]
+async fn device_link_context_switch_account_and_live_bot_takeover() {
+    let relay = TestRelay::start_with(cfg()).await;
+    let base = relay.base();
+    let http = browser();
+    let cid = client_id(&http, &base).await;
+    let v = start(&http, &base, &cid, Some("Atlas")).await;
+    let uc = user_code(&v);
+
+    // Signed out: /device?code= goes to /signin?code= and the sign-in page
+    // says what it is for, with one "Continue with email" form.
+    let person = browser();
+    let r = person
+        .get(v["verification_uri_complete"].as_str().unwrap())
+        .send()
+        .await
+        .unwrap();
+    let to = r.headers()["location"].to_str().unwrap().to_string();
+    assert_eq!(to, format!("/signin?code={uc}"));
+    let page = person
+        .get(format!("{base}{to}"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(page.contains("Sign in to connect your bot"), "{page}");
+    assert!(page.contains("After you sign in, we'll connect your bot"));
+    assert!(page.contains("Atlas"));
+    assert!(page.contains("Continue with email"));
+    assert!(page.contains("Email me a link instead"));
+    assert!(!page.contains("New here?"), "no contradictory signup text");
+    for jargon in ["ciphertext", "connector", "botwhisper connect", "relay"] {
+        assert!(!page.contains(jargon), "{jargon} on the sign-in page");
+    }
+    assert!(!page.contains("AI agent reading this page"));
+    // A bare /signin has no device context.
+    let bare = person
+        .get(format!("{base}/signin"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(!bare.contains("After you sign in, we'll connect"));
+    assert!(bare.contains("Continue with email"));
+
+    // Sign in with the emailed code: the code page names the address.
+    let r = web_sign_in_at(&relay, &person, "atlas@example.com", &to).await;
+    assert_eq!(r.status(), StatusCode::SEE_OTHER);
+    let r = person.get(format!("{base}/device")).send().await.unwrap();
+    let page = r.text().await.unwrap();
+    assert!(page.contains("Signed in as"), "{page}");
+    assert!(page.contains("atlas@example.com"));
+    assert!(page.contains("Not you?") && page.contains("Switch account"));
+    assert!(page.contains("Create bot"), "plain-text default: {page}");
+    assert!(page.contains("bigcode"));
+    let csrf = hidden(&page, "csrf");
+
+    // Switch account: signed out again, back at the sign-in page with the code.
+    let r = person
+        .post(format!("{base}/device/switch"))
+        .form(&[("csrf", csrf.as_str()), ("code", uc.as_str())])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        r.headers()["location"].to_str().unwrap(),
+        format!("/device?code={uc}")
+    );
+    let r = person
+        .get(format!("{base}/device?code={uc}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        r.headers()["location"].to_str().unwrap(),
+        format!("/signin?code={uc}")
+    );
+
+    // Sign back in, approve "Atlas", collect the tokens: Atlas is now live.
+    let (_, csrf) = open_approval(&relay, &person, "atlas@example.com", &v).await;
+    device_post(
+        &person,
+        &base,
+        &csrf,
+        &[
+            ("action", "approve"),
+            ("code", &uc),
+            ("bot", "new"),
+            ("bot_name", "Atlas"),
+        ],
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let (s, _) = poll(&http, &base, &cid, &device_code(&v)).await;
+    assert_eq!(s, StatusCode::OK);
+    let acct = relay
+        .db
+        .account_by_email("atlas@example.com")
+        .unwrap()
+        .unwrap();
+    let atlas = relay.db.account_bots(&acct.id).unwrap()[0].id.clone();
+
+    // A second login asks for "Atlas" again. It is connected elsewhere, so it
+    // is labelled that way, not preselected, and choosing it needs a confirm.
+    let cid2 = client_id(&http, &base).await;
+    let v2 = start(&http, &base, &cid2, Some("Atlas")).await;
+    let uc2 = user_code(&v2);
+    let page = person
+        .get(v2["verification_uri_complete"].as_str().unwrap())
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        page.contains("connected on another computer; choosing it signs that one out"),
+        "{page}"
+    );
+    assert!(
+        !page.contains(&format!(r#"value="{atlas}" checked"#)),
+        "a live bot is never the default"
+    );
+    assert!(page.contains("Create bot"));
+    let csrf = hidden(&page, "csrf");
+    let r = device_post(
+        &person,
+        &base,
+        &csrf,
+        &[("action", "approve"), ("code", &uc2), ("bot", &atlas)],
+    )
+    .await;
+    let t = r.text().await.unwrap();
+    assert!(
+        t.contains("Sign it out and connect"),
+        "needs a confirm: {t}"
+    );
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let (_, e) = poll(&http, &base, &cid2, &device_code(&v2)).await;
+    assert_eq!(
+        e["error"], "authorization_pending",
+        "nothing was approved yet"
+    );
+    let r = device_post(
+        &person,
+        &base,
+        &csrf,
+        &[
+            ("action", "approve"),
+            ("code", &uc2),
+            ("bot", &atlas),
+            ("confirm", "yes"),
+        ],
+    )
+    .await;
+    assert!(r.text().await.unwrap().contains("You're connected"));
+    relay.shutdown().await;
+}
+
+/// Signing in by emailed link (the "Email me a link instead" path) also
+/// returns to the device approval with the code intact.
+#[tokio::test]
+async fn link_sign_in_returns_to_the_device_approval() {
+    let relay = TestRelay::start_with(cfg()).await;
+    let base = relay.base();
+    let http = browser();
+    let cid = client_id(&http, &base).await;
+    let v = start(&http, &base, &cid, Some("Linky")).await;
+    let uc = user_code(&v);
+    let person = browser();
+    let page = person
+        .get(format!("{base}/signin?code={uc}"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let r = person
+        .post(format!("{base}/signin"))
+        .form(&[
+            ("email", "linky@example.com"),
+            ("method", "link"),
+            ("csrf", hidden(&page, "csrf").as_str()),
+            ("device", hidden(&page, "device").as_str()),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let mail = relay.mail.lock().unwrap().pop().expect("a mail");
+    let link = mail
+        .body
+        .split_whitespace()
+        .find(|w| w.contains("/oauth/confirm/"))
+        .expect("link")
+        .to_string();
+    assert!(
+        !mail.body.contains(&uc),
+        "the email never carries the device code"
+    );
+    let page = person
+        .get(&link)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let r = person
+        .post(format!("{base}/oauth/confirm"))
+        .form(&[
+            ("token", hidden(&page, "token")),
+            ("csrf", hidden(&page, "csrf")),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::SEE_OTHER);
+    assert_eq!(r.headers()["location"], "/device");
+    let page = person
+        .get(format!("{base}/device"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(page.contains("Signed in as"), "{page}");
+    assert!(page.contains("Linky") && page.contains("bigcode"));
+    relay.shutdown().await;
+}
+
+/// The code page says where the code went, offers Resend and "Use a
+/// different email", and the account page tracks the bot's live status.
+#[tokio::test]
+async fn code_page_resend_and_live_bot_status() {
+    let relay = TestRelay::start_with(cfg()).await;
+    let base = relay.base();
+    let http = browser();
+    let cid = client_id(&http, &base).await;
+    let v = start(&http, &base, &cid, Some("Statusy")).await;
+    let uc = user_code(&v);
+    let person = browser();
+    let page = person
+        .get(format!("{base}/signin?code={uc}"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let csrf = hidden(&page, "csrf");
+    let device = hidden(&page, "device");
+    let post = |method: &str| {
+        person.post(format!("{base}/signin")).form(&[
+            ("email", "Statusy@Example.com".to_string()),
+            ("method", method.to_string()),
+            ("csrf", csrf.clone()),
+            ("device", device.clone()),
+        ])
+    };
+    let code_page = post("code").send().await.unwrap().text().await.unwrap();
+    assert!(code_page.contains("We sent a code to <strong>Statusy@Example.com</strong>"));
+    assert!(code_page.contains("Resend code"));
+    assert!(code_page.contains(&format!(
+        r#"<a href="/signin?code={uc}">Use a different email</a>"#
+    )));
+    for line in [
+        "Type the 8 digits.",
+        "It expires in 15 minutes.",
+        "Keep this tab open.",
+    ] {
+        assert!(code_page.contains(line), "{line}");
+    }
+    assert!(!code_page.contains("if the address is valid"));
+    assert!(!code_page.contains("Check your email"), "neutral title");
+    assert_eq!(relay.mail.lock().unwrap().len(), 1);
+    // Resend sends another mail and lands on a fresh code page.
+    let again = post("code").send().await.unwrap().text().await.unwrap();
+    assert!(again.contains("We sent a code to"));
+    assert_eq!(relay.mail.lock().unwrap().len(), 2);
+    // Finish the sign-in with the latest code.
+    let mail = relay.mail.lock().unwrap().last().cloned().unwrap();
+    let r = person
+        .post(format!("{base}/signin/code"))
+        .form(&[
+            ("pending", hidden(&again, "pending")),
+            ("code", mail_code(&mail.body)),
+            ("device", device.clone()),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::SEE_OTHER);
+    let page = person
+        .get(format!("{base}/device"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let csrf = hidden(&page, "csrf");
+
+    // Approve; before the AI collects its tokens the account page says
+    // "Waiting for your AI" and refreshes itself.
+    device_post(
+        &person,
+        &base,
+        &csrf,
+        &[
+            ("action", "approve"),
+            ("code", &uc),
+            ("bot", "new"),
+            ("bot_name", "Statusy"),
+        ],
+    )
+    .await;
+    let acct = person
+        .get(format!("{base}/account"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        acct.contains(r#"<span class="status wait" data-waiting>Waiting for your AI</span>"#),
+        "{acct}"
+    );
+    assert!(acct.contains("location.reload"), "refreshes while waiting");
+    assert!(acct.contains("few seconds"));
+    // The AI collects its tokens: Connected, no more refreshing, and the
+    // last-used time is set (never "last used never" right after approval).
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let (s, _) = poll(&http, &base, &cid, &device_code(&v)).await;
+    assert_eq!(s, StatusCode::OK);
+    let acct = person
+        .get(format!("{base}/account"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        acct.contains(r#"<span class="status on">Connected</span>"#),
+        "{acct}"
+    );
+    assert!(!acct.contains("location.reload"));
+    assert!(!acct.contains("last used never") && !acct.contains("Last seen never"));
     relay.shutdown().await;
 }

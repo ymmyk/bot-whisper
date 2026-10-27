@@ -37,10 +37,11 @@ use crate::{
     db::{new_bot_id, unique_bot_name, AccountRow, BotRow, ClientRow, DeviceRow},
     doorbell::now_unix,
     oauth::{
-        app_name, bot_radio_list, clean_bot_name, client_ip, client_label, code_token_html,
+        app_name, clean_bot_name, clear_session_cookies, client_ip, client_label, code_token_html,
         connector_only_message, cookie_value, csrf_from_headers, csrf_ok, current_account,
         error_page, esc, is_connector_client, issue_tokens, no_store, oauth_error, page,
         random_token, too_many, OauthState, TokenForm, OPERATOR_NOTICE, SCOPE_ROOMS,
+        SESSION_COOKIE,
     },
 };
 
@@ -295,7 +296,7 @@ pub fn token_grant(st: &OauthState, client: &ClientRow, form: &TokenForm, now: u
 
 // ----- the /device page -----
 
-fn next_cookie(st: &OauthState, value: &str, max_age: u64) -> String {
+pub(crate) fn next_cookie(st: &OauthState, value: &str, max_age: u64) -> String {
     format!(
         "{NEXT_COOKIE}={value}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}{}",
         if st.cfg.is_https() { "; Secure" } else { "" }
@@ -319,6 +320,34 @@ fn private(mut r: Response) -> Response {
     r
 }
 
+/// "Signed in as X. Not you? Switch account" (signs out, back to /device
+/// with the code still attached).
+fn signed_in_line(account: &AccountRow, csrf: &str, code: Option<&str>) -> String {
+    format!(
+        r#"<p class="muted">Signed in as <strong>{email}</strong>. Not you? <form class="inline" method="post" action="/device/switch"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="code" value="{code}"><button type="submit" class="linklike">Switch account</button></form></p>"#,
+        email = esc(&account.email),
+        csrf = esc(csrf),
+        code = esc(code.unwrap_or("")),
+    )
+}
+
+/// "After you sign in, we'll connect your bot “NAME” (code XXXX-XXXX)." for
+/// a valid, pending code; nothing otherwise. Does not count against the
+/// code's lookup budget (the code was already shown to this person).
+pub(crate) fn context_html(st: &OauthState, code: &str) -> Option<String> {
+    let code = normalize_user_code(code)?;
+    let (row, _) = find_pending(st, &code, false)?;
+    let name = row
+        .bot_name
+        .as_deref()
+        .map(|n| format!(" <strong>“{}”</strong>", esc(n)))
+        .unwrap_or_default();
+    Some(format!(
+        r#"<div class="ctx">After you sign in, we'll connect your bot{name} (code {token}).</div>"#,
+        token = code_token_html(&code),
+    ))
+}
+
 fn entry_page(st: &OauthState, account: &AccountRow, csrf: &str, error: Option<&str>) -> Response {
     let err = error
         .map(|e| format!(r#"<div class="err">{}</div>"#, esc(e)))
@@ -327,14 +356,15 @@ fn entry_page(st: &OauthState, account: &AccountRow, csrf: &str, error: Option<&
         "Connect a bot",
         &format!(
             r#"<h1>Connect a bot</h1>
-<p>Signed in as <strong>{email}</strong>. Type the code your AI agent showed you (it looks like <code>{example}</code>; capitals or not, with or without a dash or space).</p>
+{signed}
+<p>Type the code your AI showed you. It looks like <code>{example}</code>.</p>
 {err}
 <form method="post" action="/device"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="action" value="lookup">
-<label for="code">Code</label><input id="code" name="code" type="text" required autocomplete="off" autocapitalize="characters" spellcheck="false" maxlength="40" placeholder="ABCD2346">
+<label for="code">Code</label><input id="code" name="code" type="text" required autocomplete="off" autocapitalize="characters" spellcheck="false" maxlength="40" placeholder="ABCD2346" autofocus>
 <button type="submit">Continue</button></form>
-<p class="muted">Codes expire after {minutes} minutes. Only enter a code your own AI agent just gave you; if someone else sent you this page, close it.</p>
+<p class="muted">Codes expire after {minutes} minutes. Only enter a code your own AI just gave you.</p>
 {notice}"#,
-            email = esc(&account.email),
+            signed = signed_in_line(account, csrf, None),
             csrf = esc(csrf),
             example = code_token_html("ABCD2346"),
             minutes = st.cfg.device_code_ttl.as_secs() / 60,
@@ -352,7 +382,10 @@ fn age_text(created_at: u64, now: u64) -> String {
     }
 }
 
-/// The approval page: who is asking, which bot, Approve or Deny.
+/// The approval page: the code (big), what will be connected, Approve or
+/// Deny. Defaults to creating the requested bot (or reconnecting a
+/// same-named bot that is not connected anywhere); a bot that is connected
+/// elsewhere is never the default and always needs a confirm.
 fn approval_page(
     st: &OauthState,
     account: &AccountRow,
@@ -366,51 +399,72 @@ fn approval_page(
     let bots = st.db.account_bots(&account.id).unwrap_or_default();
     let names: Vec<String> = bots.iter().map(|b| b.name.clone()).collect();
     let wanted = row.bot_name.as_deref();
-    let preselect = wanted
+    let reconnect = wanted
         .and_then(|w| bots.iter().find(|b| b.name.eq_ignore_ascii_case(w)))
-        .or_else(|| {
-            bots.iter()
-                .filter(|b| b.last_client_id.as_deref() == Some(client.id.as_str()))
-                .max_by_key(|b| b.last_used_at.unwrap_or(b.created_at))
-        })
-        .map(|b| b.id.clone());
+        .filter(|b| st.db.bot_live_client(&b.id, now).ok().flatten().is_none());
     let suggested = unique_bot_name(wanted.unwrap_or("My bot"), &names);
-    let list = bot_radio_list(st, &bots, preselect.as_deref(), now);
     let err = error
         .map(|e| format!(r#"<div class="err">{}</div>"#, esc(e)))
         .unwrap_or_default();
-    let asked = match wanted {
-        Some(n) => format!(
-            "It asked to be called <strong>{}</strong>; you can pick another bot or name.",
-            esc(n)
-        ),
-        None => "It did not ask for a bot name.".into(),
+    let plan = match reconnect {
+        Some(b) => format!("Reconnect your bot <strong>“{}”</strong>.", esc(&b.name)),
+        None => format!("Create bot <strong>“{}”</strong>.", esc(&suggested)),
     };
-    private(no_store(page(
-        "Approve this bot?",
-        &format!(
-            r#"<h1>Connect this bot to your account?</h1>
-<p>Signed in as <strong>{email}</strong>.</p>
-<p><strong>{client}</strong> started a login <strong>{age}</strong> and asked you to confirm code <code>{token}</code>. {asked}</p>
-{err}
-<div class="notice"><strong>Only approve if you just asked your AI agent to connect to BotWhisper and the code above is the one it showed you.</strong> If someone sent you this page, or the code is not yours, press Deny: approving gives that program full use of one of your bots, including its rooms.</div>
-<form method="post" action="/device"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="code" value="{code}">
-{list}
+    let mut others = String::new();
+    for b in &bots {
+        let live = st.db.bot_live_client(&b.id, now).ok().flatten();
+        let detail = match live {
+            Some(_) => "connected on another computer; choosing it signs that one out".to_string(),
+            None => format!(
+                "not connected, last used {}",
+                b.last_used_at
+                    .map(crate::web::fmt_utc)
+                    .unwrap_or_else(|| "never".into())
+            ),
+        };
+        others.push_str(&format!(
+            r#"<label class="pick"><input type="radio" name="bot" value="{id}"{checked}><strong>{name}</strong> <span class="muted">({detail})</span></label>"#,
+            id = esc(&b.id),
+            checked = if reconnect.is_some_and(|r| r.id == b.id) { " checked" } else { "" },
+            name = esc(&b.name),
+            detail = esc(&detail),
+        ));
+    }
+    let new_checked = if reconnect.is_none() { " checked" } else { "" };
+    let options = format!(
+        r#"<details><summary class="muted">Change the name{existing}</summary>
 <label class="pick"><input type="radio" name="bot" value="new"{new_checked}><strong>Create a new bot</strong></label>
 <label for="bot_name">New bot's name</label><input id="bot_name" name="bot_name" type="text" maxlength="{max}" value="{suggested}">
-<p class="muted">The bot can create rooms, invite other bots, send and receive messages, and leave or close rooms, as you. One bot has one live connection: picking a bot that is connected elsewhere disconnects it there.</p>
+{others}</details>"#,
+        existing = if bots.is_empty() {
+            ""
+        } else {
+            " or use an existing bot"
+        },
+        max = crate::db::BOT_NAME_MAX,
+        suggested = esc(&suggested),
+    );
+    private(no_store(page(
+        "Connect your bot",
+        &format!(
+            r#"<h1>Connect your bot</h1>
+{signed}
+<span class="bigcode">{token}</span>
+<p style="text-align:center" class="muted">Make sure this is the code your AI just showed you.</p>
+<p><strong>{client}</strong> asked {age} to connect. {plan}</p>
+{err}
+<form method="post" action="/device"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="code" value="{code}">
+{options}
 <button type="submit" name="action" value="approve">Approve</button>
 <button type="submit" name="action" value="deny" class="ghost">Deny</button></form>
+<p class="muted"><strong>Only approve if you just asked your AI to connect.</strong> Approving gives it full use of that bot, including its rooms.</p>
 {notice}"#,
-            email = esc(&account.email),
+            signed = signed_in_line(account, csrf, Some(code)),
+            token = code_token_html(code),
             client = client_label(client),
             age = age_text(row.created_at, now),
-            token = code_token_html(code),
             code = esc(code),
             csrf = esc(csrf),
-            new_checked = if preselect.is_none() { " checked" } else { "" },
-            max = crate::db::BOT_NAME_MAX,
-            suggested = esc(&suggested),
             notice = OPERATOR_NOTICE,
         ),
     )))
@@ -420,6 +474,14 @@ fn done_page(title: &str, msg: &str) -> Response {
     private(no_store(page(
         title,
         &format!("<h1>{}</h1><p>{}</p>", esc(title), esc(msg)),
+    )))
+}
+
+/// After Approve: tell the person what to do next.
+fn connected_page() -> Response {
+    private(no_store(page(
+        "You're connected",
+        r#"<h1>You're connected</h1><p>Go back to your AI. It will pick this up in a few seconds.</p><p class="muted"><a href="/account">Manage your bots</a></p>"#,
     )))
 }
 
@@ -483,7 +545,11 @@ pub async fn device_get(
         let keep = queried
             .and_then(normalize_user_code)
             .unwrap_or_else(|| "entry".into());
-        let r = no_store(Redirect::to("/signin"));
+        let to = match normalize_user_code(&keep) {
+            Some(c) => format!("/signin?code={}", spaced_user_code(&c)),
+            None => "/signin".to_string(),
+        };
+        let r = no_store(Redirect::to(&to));
         return private(with_cookie(&st, r, &keep, 15 * 60));
     };
     let Some(csrf) = csrf_from_headers(&headers) else {
@@ -538,13 +604,13 @@ pub struct DeviceForm {
 
 fn takeover_page(row_code: &str, csrf: &str, bot: &BotRow, live_app: &Option<String>) -> Response {
     private(no_store(page(
-        "Disconnect it elsewhere?",
+        "Sign it out elsewhere?",
         &format!(
-            r#"<h1>Move {bot} to this device?</h1>
-<p><strong>{bot}</strong> is connected to <strong>{app}</strong> right now. Approving will disconnect it from {app}. Continue?</p>
-<p class="muted">It keeps its seats in rooms; only the connection moves. To keep both, go back and create a new bot instead.</p>
+            r#"<h1>Sign {bot} out elsewhere?</h1>
+<p><strong>{bot}</strong> is connected on another computer ({app}). Choosing it signs that one out and connects this one instead.</p>
+<p class="muted">It keeps its seats in rooms; only the connection moves. To keep both, go back and create a new bot.</p>
 <form method="post" action="/device"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="code" value="{code}"><input type="hidden" name="bot" value="{id}"><input type="hidden" name="confirm" value="yes">
-<button type="submit" name="action" value="approve">Continue</button>
+<button type="submit" name="action" value="approve" class="danger">Sign it out and connect</button>
 <button type="submit" name="action" value="lookup" class="ghost">Back</button></form>"#,
             bot = esc(&bot.name),
             app = app_name(live_app),
@@ -553,6 +619,45 @@ fn takeover_page(row_code: &str, csrf: &str, bot: &BotRow, live_app: &Option<Str
             id = esc(&bot.id),
         ),
     )))
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct SwitchForm {
+    #[serde(default)]
+    pub csrf: Option<String>,
+    #[serde(default)]
+    pub code: Option<String>,
+}
+
+/// `POST /device/switch`: "Not you? Switch account". Ends this browser's
+/// session and returns to the sign-in page with the device code still
+/// attached.
+pub async fn switch_post(
+    State(st): State<OauthState>,
+    headers: HeaderMap,
+    Form(f): Form<SwitchForm>,
+) -> Response {
+    let Some(_) = current_account(&st, &headers) else {
+        return no_store(Redirect::to("/signin"));
+    };
+    if !csrf_ok(csrf_from_headers(&headers), f.csrf.as_deref()) {
+        return error_page(
+            StatusCode::FORBIDDEN,
+            "Page expired",
+            "Open the device link again and retry.",
+        );
+    }
+    if let Some(c) = cookie_value(&headers, SESSION_COOKIE) {
+        let _ = st.db.delete_session(&sha256_hex(&c));
+    }
+    let code = f.code.as_deref().and_then(normalize_user_code);
+    let to = match &code {
+        Some(c) => format!("/device?code={}", spaced_user_code(c)),
+        None => "/device".to_string(),
+    };
+    let mut r = private(no_store(Redirect::to(&to)));
+    clear_session_cookies(&st.cfg, &mut r);
+    r
 }
 
 /// `POST /device`: enter a code, approve or deny.
@@ -665,10 +770,7 @@ pub async fn device_post(
             {
                 Ok(true) => {
                     tracing::info!("oauth: device authorization approved");
-                    done_page(
-                        "Connected",
-                        "Approved. Your AI agent will pick this up within a few seconds; you can close this tab.",
-                    )
+                    connected_page()
                 }
                 _ => done_page(
                     "Code expired",

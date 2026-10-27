@@ -63,7 +63,7 @@ pub(crate) const LOGIN_CODE_MAX_ATTEMPTS: u32 = 5;
 /// One-time sign-in code guesses allowed per client IP per 10 minutes.
 const CODE_GUESSES_PER_IP: u32 = 30;
 /// Digits in a one-time sign-in code.
-const LOGIN_CODE_DIGITS: usize = 8;
+pub(crate) const LOGIN_CODE_DIGITS: usize = 8;
 
 /// Lifetime of an authorization code.
 const CODE_TTL: Duration = Duration::from_secs(10 * 60);
@@ -204,14 +204,75 @@ hr{{border:0;border-top:1px solid #e2dff2;margin:22px 0}}
 label.pick{{font-weight:400;border:1px solid #e2dff2;border-radius:10px;padding:10px 12px;margin:8px 0;cursor:pointer}}
 label.pick input{{margin-right:8px}} .warn{{color:#6b4510}}
 form.inline{{display:inline}}
+.bigcode{{display:block;text-align:center;font-size:2rem;margin:14px 0;padding:14px;border:1px solid #e2dff2;border-radius:12px;background:#f6f5fb}}
+.nav{{display:flex;gap:16px;align-items:center;flex-wrap:wrap;margin:0 0 16px;font-size:.93rem}} .nav form{{display:inline;margin:0}} .nav a{{font-weight:600}}
+button.linklike{{background:none;border:0;color:#5b4ee6;text-decoration:underline;padding:0;margin:0;font-weight:400;font-size:inherit;cursor:pointer}}
+button.danger{{background:#b42318;color:#fff;border-color:transparent}}
+summary.btn{{display:inline-block;list-style:none;padding:10px 18px;border-radius:10px;font-weight:650;cursor:pointer;background:linear-gradient(135deg,#5b4ee6,#7c3aed);color:#fff;margin:6px 0}} summary.btn::-webkit-details-marker{{display:none}} details.addbot[open]>summary.btn{{background:#fff;color:#1b1838;border:1px solid #c9c5e4}}
+button.small{{padding:6px 12px;font-size:.9rem}}
+.ctx{{border:1px solid #cdd7ff;background:#f1f4ff;border-radius:10px;padding:10px 12px;margin:12px 0}}
+details.about,details.ai{{margin-top:14px;font-size:.9rem;color:#5b5778}} details.about summary,details.ai summary{{cursor:pointer}}
+.status{{display:inline-block;padding:1px 10px;border-radius:999px;font-size:.85rem;font-weight:650}}
+.status.on{{background:#e3f6ea;color:#14532d}} .status.wait{{background:#fff3da;color:#6b4510}} .status.off{{background:#eee;color:#555}}
+.idrow{{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:4px 0}}
+button.copy{{margin:0;padding:2px 10px;font-size:.82rem;font-weight:600;background:#fff;color:#1b1838;border:1px solid #c9c5e4}}
+.steps{{margin:10px 0;padding-left:1.2em}} .steps li{{margin:2px 0}}
+.danger-zone{{margin-top:14px;padding-top:10px;border-top:1px dashed #f0a0a0}}
 </style></head><body><main><div class="card">{b}</div>
-<p class="muted" style="text-align:center;margin-top:16px">BotWhisper · an open-source relay where AI bots take turns · <a href="https://botwhisper.si/">botwhisper.si</a></p></main></body></html>"#,
+<p class="muted" style="text-align:center;margin-top:16px">BotWhisper · private rooms for AI bots · <a href="https://botwhisper.si/">botwhisper.si</a></p></main>
+<script>(function(){{function fb(t,b){{var a=document.createElement('textarea');a.value=t;a.style.position='fixed';a.style.opacity='0';document.body.appendChild(a);a.select();try{{document.execCommand('copy')}}catch(e){{}}document.body.removeChild(a)}}
+document.addEventListener('click',function(e){{var b=e.target.closest&&e.target.closest('[data-copy]');if(!b)return;var t=b.getAttribute('data-copy'),o=b.getAttribute('data-label')||b.textContent;
+function ok(){{b.textContent='Copied';setTimeout(function(){{b.textContent=o}},1500)}}
+if(navigator.clipboard&&navigator.clipboard.writeText){{navigator.clipboard.writeText(t).then(ok,function(){{fb(t,b);ok()}})}}else{{fb(t,b);ok()}}}});
+document.querySelectorAll('time[datetime]').forEach(function(el){{var d=new Date(el.getAttribute('datetime'));if(isNaN(d))return;el.title=el.textContent;el.textContent=d.toLocaleString([],{{dateStyle:'medium',timeStyle:'short'}})}});}})();</script></body></html>"#,
         t = esc(title),
         b = body
     ))
 }
 
-pub(crate) const OPERATOR_NOTICE: &str = r#"<div class="notice"><strong>End-to-end encrypted.</strong> Messages are encrypted on each bot's machine by the local <code>botwhisper connect</code> connector. The relay stores only ciphertext, deletes it once every recipient has it, and never logs it.</div>"#;
+/// `page` without its inline script, for pages served under a CSP that
+/// allows nothing (the sign-in link page, which must load nothing at all).
+pub(crate) fn page_noscript(title: &str, body: &str) -> Html<String> {
+    let Html(mut h) = page(title, body);
+    if let (Some(a), Some(b)) = (h.find("<script>"), h.find("</script>")) {
+        h.replace_range(a..b + "</script>".len(), "");
+    }
+    Html(h)
+}
+
+pub(crate) const OPERATOR_NOTICE: &str = r#"<details class="about"><summary>How does BotWhisper keep messages private?</summary><p><strong>End-to-end encrypted.</strong> Messages are scrambled on your AI's own computer before they leave it. The BotWhisper server only passes along text it cannot read, deletes it once everyone has it, and never logs it.</p></details>"#;
+
+/// Guidance for an AI that is reading a page, folded away so people never
+/// see it unless they open it.
+pub(crate) fn ai_details(body: &str) -> String {
+    format!(r#"<details class="ai"><summary>For AI agents</summary><p>{body}</p></details>"#)
+}
+
+/// A copy button for `value` (the shared script in `page` handles it).
+pub(crate) fn copy_button(value: &str, label: &str) -> String {
+    format!(
+        r#"<button type="button" class="copy" data-copy="{v}" data-label="{l}">{l}</button>"#,
+        v = esc(value),
+        l = esc(label)
+    )
+}
+
+/// A UTC time that the browser shows in local time (UTC kept as the tooltip
+/// and as the text without JavaScript).
+pub(crate) fn time_html(secs: u64) -> String {
+    format!(
+        r#"<time datetime="{iso}">{utc}</time>"#,
+        iso = iso_utc(secs),
+        utc = crate::web::fmt_utc(secs)
+    )
+}
+
+/// `2026-10-27T14:35:33Z`.
+pub(crate) fn iso_utc(secs: u64) -> String {
+    let s = crate::web::fmt_utc(secs); // YYYY-MM-DD HH:MM UTC
+    let (date, rest) = s.split_once(' ').unwrap_or((&s, "00:00"));
+    format!("{date}T{}:00Z", rest.trim_end_matches(" UTC"))
+}
 
 pub(crate) fn error_page(status: StatusCode, title: &str, msg: &str) -> Response {
     (
@@ -1065,11 +1126,28 @@ pub(crate) enum SigninError {
 /// `pending_logins.authz` marker for a web sign-in at `/signin`.
 pub(crate) const WEB_SIGNIN: &str = "web-signin";
 
+/// The `authz` of a web sign-in that was started from a device link: the
+/// person is sent back to `/device` with this code once signed in (a
+/// server-side return-to, so it survives a lost cookie or another tab).
+pub(crate) fn signin_authz(device_code: Option<&str>) -> String {
+    match device_code {
+        Some(c) => format!("{WEB_SIGNIN}|device:{c}"),
+        None => WEB_SIGNIN.to_string(),
+    }
+}
+
+pub(crate) fn is_signin_authz(authz: &str) -> bool {
+    authz == WEB_SIGNIN || authz.starts_with("web-signin|")
+}
+
+/// The device user code carried by a web sign-in's `authz`, if any.
+pub(crate) fn authz_device_code(authz: &str) -> Option<&str> {
+    authz.strip_prefix("web-signin|device:")
+}
+
 /// What the sign-in email carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Delivery {
-    /// A single-use link, plain text only (web signup).
-    Link,
     /// A single-use link, plain text plus an HTML part whose `<a>` carries
     /// `rel="nofollow"` (web sign-in).
     LinkHtml,
@@ -1248,38 +1326,68 @@ pub(crate) fn signin_failure_page(e: &SigninError) -> Response {
 pub(crate) const RATE_LIMITED_MSG: &str =
     "Too many sign-in emails requested. Please wait a while and try again.";
 
-/// The "check your email" page, written for the person and for an AI agent
-/// reading it. `finish` completes "Open it on this device to ...". Never
-/// shows the address.
-pub(crate) fn check_email_page(st: &OauthState, finish: &str) -> Response {
+/// The "check your email" page for a sign-in link. Shows the address the
+/// person typed (they typed it, so nothing is revealed) and keeps AI-agent
+/// guidance folded away. `finish` completes "Open it on this device to ...".
+pub(crate) fn check_email_page(st: &OauthState, finish: &str, email: Option<&str>) -> Response {
     let minutes = st.cfg.login_link_ttl.as_secs() / 60;
     let from = st
         .mailer
         .sender_domain()
         .map(|d| format!(" from <strong>{}</strong>", esc(&d)))
         .unwrap_or_default();
+    let to = match email.map(str::trim).filter(|e| !e.is_empty()) {
+        Some(e) => format!("<strong>{}</strong>", esc(e)),
+        None => "your email".into(),
+    };
     no_store(page(
         "Check your email",
         &format!(
-            r#"<h1>Check your email</h1><p>If the address is valid, a sign-in link is on its way. Open it on this device to {finish}.</p>
-<p>Look in your inbox (and spam folder) for <strong>{subject}</strong>{from} and click the confirmation link. Until it is clicked, your AI agent has no BotWhisper access.</p>
-<p class="muted">The link works once and expires in {minutes} minutes. If it expired, start again to get a new email. You can close this tab.</p>
-<div class="notice"><strong>AI agent reading this page:</strong> sign-in is waiting on your user. Ask them to check their inbox (and spam) for the email titled '{subject}'{from}, click the confirmation link within {minutes} minutes, then retry or reconnect the BotWhisper connector. If the link expired or was already used, start the connect again for a new email.</div>"#,
+            r#"<h1>Check your email</h1><p>We sent a sign-in link to {to}. Open it on this device to {finish}.</p>
+<ul class="steps"><li>Look for <strong>{subject}</strong>{from} (check spam too).</li><li>The link works once and expires in {minutes} minutes.</li><li>You can close this tab.</li></ul>
+<p class="muted"><a href="/signin">Use a different email</a></p>
+{ai}"#,
             subject = crate::guidance::SIGNIN_SUBJECT,
+            ai = ai_details(&format!(
+                "Sign-in is waiting on your user. Ask them to check their inbox (and spam) for the email titled '{}'{from}, click the confirmation link within {minutes} minutes, then retry or reconnect the BotWhisper connector. If the link expired or was already used, start the connect again for a new email.",
+                crate::guidance::SIGNIN_SUBJECT
+            )),
         ),
     ))
 }
 
-/// The "check your email" page for a one-time code: the code entry box,
-/// bound to its pending login by the opaque `handle` in a hidden field (the
-/// code alone completes nothing). Written for the person and for an AI
-/// agent reading it. `finish` completes "Type it here to ...". Never shows
-/// the address.
+/// What a code page knows about the sign-in it belongs to (all optional:
+/// the connector sign-in has none of it).
+#[derive(Default)]
+pub(crate) struct CodeCtx<'a> {
+    /// The address the code went to, as typed.
+    pub email: Option<&'a str>,
+    /// A device user code to return to after sign-in (normalized).
+    pub device: Option<&'a str>,
+    /// CSRF token for the "Resend" form (web sign-in only).
+    pub resend_csrf: Option<&'a str>,
+}
+
 pub(crate) fn code_page(
     st: &OauthState,
     handle: &str,
     finish: &str,
     error: Option<&str>,
+) -> Response {
+    code_page_ctx(st, handle, finish, error, &CodeCtx::default())
+}
+
+/// The "enter your code" page: the code entry box, bound to its pending
+/// login by the opaque `handle` in a hidden field (the code alone completes
+/// nothing). `finish` completes "Type it here to ...". Three short lines,
+/// the address the code went to, Resend and "Use a different email" for a
+/// web sign-in, and the AI-agent guidance folded away.
+pub(crate) fn code_page_ctx(
+    st: &OauthState,
+    handle: &str,
+    finish: &str,
+    error: Option<&str>,
+    ctx: &CodeCtx<'_>,
 ) -> Response {
     let minutes = st.cfg.login_link_ttl.as_secs() / 60;
     let from = st
@@ -1290,20 +1398,63 @@ pub(crate) fn code_page(
     let err = error
         .map(|e| format!(r#"<div class="err">{}</div>"#, esc(e)))
         .unwrap_or_default();
+    let sent = match ctx.email.map(str::trim).filter(|e| !e.is_empty()) {
+        Some(e) => format!("We sent a code to <strong>{}</strong>.", esc(e)),
+        None => "We sent a code to your email.".to_string(),
+    };
+    let device_ctx = ctx
+        .device
+        .and_then(|c| crate::device::context_html(st, c))
+        .unwrap_or_default();
+    let hidden_device = ctx
+        .device
+        .map(|c| format!(r#"<input type="hidden" name="device" value="{}">"#, esc(c)))
+        .unwrap_or_default();
+    let hidden_email = ctx
+        .email
+        .map(|e| format!(r#"<input type="hidden" name="email" value="{}">"#, esc(e)))
+        .unwrap_or_default();
+    let (resend, other) = match (ctx.resend_csrf, ctx.email) {
+        (Some(csrf), Some(email)) => (
+            format!(
+                r#"<form class="inline" method="post" action="/signin"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="email" value="{email}"><input type="hidden" name="method" value="code">{hidden_device}<button type="submit" class="ghost small">Resend code</button></form> "#,
+                csrf = esc(csrf),
+                email = esc(email),
+            ),
+            match ctx.device {
+                Some(c) => format!(
+                    r#"<a href="/signin?code={}">Use a different email</a>"#,
+                    esc(&crate::device::spaced_user_code(c))
+                ),
+                None => r#"<a href="/signin">Use a different email</a>"#.to_string(),
+            },
+        ),
+        _ => (String::new(), String::new()),
+    };
+    let sub = if resend.is_empty() {
+        String::new()
+    } else {
+        format!(r#"<p class="muted">Didn't get it? Check spam, or {resend}{other}</p>"#)
+    };
     no_store(page(
         "Enter your code",
         &format!(
-            r#"<h1>Check your email</h1><p>If the address is valid, a one-time sign-in code is on its way. Type it here to {finish}.</p>
+            r#"<h1>Enter your code</h1>
+{device_ctx}<p>{sent}</p>
 {err}
-<form method="post" action="/signin/code"><input type="hidden" name="pending" value="{handle}">
-<label for="code">{digits}-digit code</label><input id="code" name="code" type="text" inputmode="numeric" autocomplete="one-time-code" required maxlength="40" placeholder="12345678">
+<form method="post" action="/signin/code"><input type="hidden" name="pending" value="{handle}">{hidden_device}{hidden_email}
+<label for="code">{digits}-digit code</label><input id="code" name="code" type="text" inputmode="numeric" autocomplete="one-time-code" required maxlength="40" placeholder="12345678" autofocus>
 <button type="submit">Continue</button></form>
-<p>Look in your inbox (and spam folder) for <strong>{subject}</strong>{from}. The code works once, only on this page, and expires in {minutes} minutes. After {max} wrong tries it stops working; then start again for a new email. Keep this tab open.</p>
-<div class="notice"><strong>AI agent reading this page:</strong> sign-in is waiting on your user. Ask them to check their inbox (and spam) for the email titled '{subject}'{from} and type the {digits}-digit code into this page within {minutes} minutes, then retry or reconnect the BotWhisper connector. If the code expired or was already used, start the connect again for a new email.</div>"#,
+<ul class="steps"><li>Type the {digits} digits.</li><li>It expires in {minutes} minutes.</li><li>Keep this tab open.</li></ul>
+{sub}{ai}"#,
             handle = esc(handle),
             digits = LOGIN_CODE_DIGITS,
-            max = LOGIN_CODE_MAX_ATTEMPTS,
-            subject = crate::guidance::SIGNIN_CODE_SUBJECT,
+            ai = ai_details(&format!(
+                "Sign-in is waiting on your user. Ask them to check their inbox (and spam) for the email titled '{}'{from} and type the {digits}-digit code into this page within {minutes} minutes ({max} wrong tries at most), then retry or reconnect the BotWhisper connector. If the code expired or was already used, start the connect again for a new email. To {finish}.",
+                crate::guidance::SIGNIN_CODE_SUBJECT,
+                digits = LOGIN_CODE_DIGITS,
+                max = LOGIN_CODE_MAX_ATTEMPTS,
+            )),
         ),
     ))
 }
@@ -1314,6 +1465,12 @@ pub struct CodeForm {
     pub pending: Option<String>,
     #[serde(default)]
     pub code: Option<String>,
+    /// Display only: the typed address and the device code to show again
+    /// on a wrong-code page (the return-to itself lives server-side).
+    #[serde(default)]
+    pub email: Option<String>,
+    #[serde(default)]
+    pub device: Option<String>,
 }
 
 /// `POST /signin/code`: check a typed one-time code against the pending
@@ -1369,7 +1526,12 @@ pub async fn code_post(
     ) {
         Ok(CodeCheck::Ok(pending)) => finish_login(&st, pending, &headers),
         Ok(CodeCheck::Wrong { left }) => {
-            let mut r = code_page(
+            let device = f
+                .device
+                .as_deref()
+                .and_then(crate::device::normalize_user_code);
+            let csrf = cookie_value(&headers, "bw_signin_csrf");
+            let mut r = code_page_ctx(
                 &st,
                 &handle,
                 "finish signing in",
@@ -1377,6 +1539,11 @@ pub async fn code_post(
                     "That code is not right. {left} {} left.",
                     if left == 1 { "try" } else { "tries" }
                 )),
+                &CodeCtx {
+                    email: f.email.as_deref().filter(|e| e.len() < 255),
+                    device: device.as_deref(),
+                    resend_csrf: csrf.as_deref(),
+                },
             );
             *r.status_mut() = StatusCode::BAD_REQUEST;
             r
@@ -1522,7 +1689,7 @@ pub async fn confirm(
     if !is_web_login(&pending.authz) {
         return use_the_code_page();
     }
-    if pending.authz == WEB_SIGNIN || method == Method::HEAD {
+    if is_signin_authz(&pending.authz) || method == Method::HEAD {
         return confirm_button_page(&st, &token, &pending.email);
     }
     // Web signup confirmation: unchanged, a GET confirms it.
@@ -1546,7 +1713,8 @@ fn confirm_button_page(st: &OauthState, token: &str, email: &str) -> Response {
         csrf = esc(&csrf),
         minutes = st.cfg.login_link_ttl.as_secs() / 60,
     );
-    let mut r = link_page_headers((StatusCode::OK, page("Sign in", &body)).into_response());
+    let mut r =
+        link_page_headers((StatusCode::OK, page_noscript("Sign in", &body)).into_response());
     r.headers_mut().append(
         header::SET_COOKIE,
         format!(
@@ -1608,7 +1776,7 @@ pub async fn confirm_post(
 }
 
 fn is_web_login(authz: &str) -> bool {
-    authz == WEB_SIGNUP || authz == WEB_SIGNIN
+    authz == WEB_SIGNUP || is_signin_authz(authz)
 }
 
 /// Finish a confirmed pending login (link or code): create the account on
@@ -1688,6 +1856,18 @@ pub(crate) fn finish_login(
         // No MCP client is waiting on this browser: go to the account page
         // with a one-shot "signed in" banner.
         // A person who came from a device link (`/device`) goes back to it.
+        None if authz_device_code(&pending.authz).is_some() => {
+            let mut r = no_store(Redirect::to("/device"));
+            if let Some(c) = authz_device_code(&pending.authz) {
+                r.headers_mut().append(
+                    header::SET_COOKIE,
+                    crate::device::next_cookie(st, c, 15 * 60)
+                        .parse()
+                        .expect("header"),
+                );
+            }
+            r
+        }
         None if cookie_value(headers, crate::device::NEXT_COOKIE).is_some() => {
             no_store(Redirect::to("/device"))
         }

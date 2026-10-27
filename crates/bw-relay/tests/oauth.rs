@@ -199,9 +199,9 @@ async fn sign_in_as(
         .unwrap();
     assert_eq!(r.status(), StatusCode::OK);
     let body = r.text().await.unwrap();
-    assert!(body.contains("Check your email"));
+    assert!(body.contains("Enter your code"));
     assert!(
-        body.contains("AI agent reading this page")
+        body.contains("For AI agents")
             && body.contains("check their inbox (and spam)")
             && body.contains("Your BotWhisper sign-in code")
             && body.contains("type the 8-digit code into this page")
@@ -954,7 +954,11 @@ async fn unconfirmed_clients_are_told_to_confirm_the_email() {
     assert_eq!(r.status(), StatusCode::OK);
     let page = r.text().await.unwrap();
     assert!(!page.contains("pending@example.com"));
-    assert!(page.contains("AI agent reading this page"));
+    assert!(page.contains("For AI agents"));
+    assert!(
+        page.contains(r#"<details class="ai">"#),
+        "AI guidance is collapsed, not shown to people"
+    );
 
     // 401 on /mcp, with no token and with a bogus one: header and body.
     for auth in [None, Some("Bearer bwa_not-a-real-token")] {
@@ -981,7 +985,7 @@ async fn unconfirmed_clients_are_told_to_confirm_the_email() {
         assert!(body.contains("from this BotWhisper relay"));
         assert!(body.contains(&format!("create an account first at {base}/signup")));
         assert!(body.contains(&format!(
-            "`claude mcp add botwhisper -- botwhisper connect --relay {base} --bot-name <name>`"
+            "`claude mcp add botwhisper -- botwhisper connect --relay {base} --bot-name YOUR-BOT-NAME`"
         )));
         assert!(body.contains("Call the connector's `login` tool"));
         assert!(body.contains("botwhisper-installer.sh | sh"));
@@ -1041,7 +1045,7 @@ async fn unconfirmed_clients_are_told_to_confirm_the_email() {
     assert!(page.contains("ACCOUNT_REQUIRED"));
     assert!(page.contains("Call the connector's `login` tool"));
     assert!(page.contains(&format!(
-        "`claude mcp add botwhisper -- botwhisper connect --relay {base} --bot-name <name>`"
+        "`claude mcp add botwhisper -- botwhisper connect --relay {base} --bot-name YOUR-BOT-NAME`"
     )));
     assert!(page.contains("~/.cursor/mcp.json"));
     assert!(page.contains("call `join_room` with this invite URL"));
@@ -1067,7 +1071,7 @@ async fn mcp_instructions_explain_email_confirmation() {
         "{ins}"
     );
     assert!(ins.contains("three steps") && ins.contains("call its `login` tool"));
-    assert!(ins.contains("--bot-name <your name>"));
+    assert!(ins.contains("--bot-name YOUR-BOT-NAME"));
     assert!(ins.contains("no tool here that reads or writes message text"));
     assert!(ins.contains(&format!("{}/signup", relay.base())));
     assert!(ins.contains("check their inbox (and spam)"));

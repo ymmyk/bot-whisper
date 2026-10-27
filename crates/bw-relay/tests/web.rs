@@ -30,22 +30,9 @@ fn hidden(page: &str, name: &str) -> String {
     page[start..start + page[start..].find('"').unwrap()].to_string()
 }
 
-/// GET /signup, POST an email, return the response.
+/// GET /signin, POST an email asking for a link, return the response.
 async fn post_signup(http: &Client, base: &str, email: &str) -> reqwest::Response {
-    let page = http
-        .get(format!("{base}/signup"))
-        .send()
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
-    let csrf = hidden(&page, "csrf");
-    http.post(format!("{base}/signup"))
-        .form(&[("email", email), ("csrf", csrf.as_str())])
-        .send()
-        .await
-        .unwrap()
+    post_signin(http, base, email, "link").await
 }
 
 fn last_link(relay: &TestRelay) -> String {
@@ -57,11 +44,12 @@ fn last_link(relay: &TestRelay) -> String {
         .to_string()
 }
 
-/// Sign a browser up through /signup and return the account id.
+/// Sign a browser in by emailed link (creating the account) and return the
+/// account id.
 async fn web_sign_up(relay: &TestRelay, http: &Client, email: &str) -> String {
-    let r = post_signup(http, &relay.base(), email).await;
+    let r = post_signin(http, &relay.base(), email, "link").await;
     assert_eq!(r.status(), StatusCode::OK);
-    let r = http.get(last_link(relay)).send().await.unwrap();
+    let r = press_sign_in(http, &relay.base(), &last_link(relay)).await;
     assert_eq!(r.status(), StatusCode::SEE_OTHER);
     relay
         .db
@@ -123,50 +111,7 @@ fn connect_bot(relay: &TestRelay, account: &str, client_id: &str, name: &str) ->
 }
 
 #[tokio::test]
-async fn signup_page_renders_and_needs_csrf() {
-    let relay = TestRelay::start().await;
-    let base = relay.base();
-    let http = browser();
-    let r = http.get(format!("{base}/signup")).send().await.unwrap();
-    assert_eq!(r.status(), StatusCode::OK);
-    assert!(r
-        .headers()
-        .get_all("set-cookie")
-        .iter()
-        .any(|c| c.to_str().unwrap().starts_with("bw_signup_csrf=")));
-    let page = r.text().await.unwrap();
-    assert!(page.contains("Create your BotWhisper account"));
-    assert!(page.contains(r#"name="email" type="email""#));
-    assert!(
-        page.contains("End-to-end encrypted."),
-        "same card style and notice"
-    );
-
-    // No CSRF value (or the wrong one): refused, no mail.
-    for csrf in ["", "wrong"] {
-        let r = http
-            .post(format!("{base}/signup"))
-            .form(&[("email", "a@example.com"), ("csrf", csrf)])
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(r.status(), StatusCode::FORBIDDEN);
-    }
-    // A fresh browser without the cookie cannot replay a form value.
-    let csrf = hidden(&page, "csrf");
-    let r = browser()
-        .post(format!("{base}/signup"))
-        .form(&[("email", "a@example.com"), ("csrf", csrf.as_str())])
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(r.status(), StatusCode::FORBIDDEN);
-    assert!(relay.mail.lock().unwrap().is_empty());
-    relay.shutdown().await;
-}
-
-#[tokio::test]
-async fn signup_response_is_identical_for_new_and_existing_email() {
+async fn signin_response_is_identical_for_new_and_existing_email() {
     let relay = TestRelay::start().await;
     let base = relay.base();
     web_sign_up(&relay, &browser(), "old@example.com").await;
@@ -174,13 +119,14 @@ async fn signup_response_is_identical_for_new_and_existing_email() {
     let a = post_signup(&browser(), &base, "old@example.com").await;
     let b = post_signup(&browser(), &base, "new@example.com").await;
     assert_eq!(a.status(), b.status());
-    let (a, b) = (a.text().await.unwrap(), b.text().await.unwrap());
+    let a = a.text().await.unwrap().replace("old@example.com", "ADDR");
+    let b = b.text().await.unwrap().replace("new@example.com", "ADDR");
     assert_eq!(
         a, b,
         "the page never says whether the address has an account"
     );
-    assert!(a.contains("Check your email") && a.contains("AI agent reading this page"));
-    assert!(!a.contains("old@example.com"));
+    assert!(a.contains("Check your email") && a.contains("For AI agents"));
+    assert!(!a.contains("New here") && !a.contains("already have an account"));
     let mail = relay.mail.lock().unwrap().clone();
     assert_eq!(mail.len(), 3, "both get the same email");
     assert_eq!(mail[1].subject, mail[2].subject);
@@ -201,7 +147,7 @@ async fn confirm_link_signs_in_once_and_expired_links_fail() {
     let r = post_signup(&http, &base, "Me@Example.com").await;
     assert_eq!(r.status(), StatusCode::OK);
     let link = last_link(&relay);
-    let r = http.get(&link).send().await.unwrap();
+    let r = press_sign_in(&http, &base, &link).await;
     assert_eq!(r.status(), StatusCode::SEE_OTHER);
     assert_eq!(r.headers()["location"], "/account");
     let cookies: Vec<String> = r
@@ -229,12 +175,31 @@ async fn confirm_link_signs_in_once_and_expired_links_fail() {
         .unwrap();
     assert!(page.contains("You're signed in."));
     assert!(page.contains(&format!("botwhisper connect --relay {base} --bot-name")));
-    assert!(page.contains("call its <code>login</code> tool"));
-    assert!(page.contains("skips the email step for 30 days"));
+    assert!(page.contains("stays signed in for 30 days"));
     assert!(page.contains("Dismiss"));
+    // Small top nav: Account, Add a bot, Sign out.
+    assert!(page.contains(
+        r##"<div class="nav"><a href="/account">Account</a><a href="#add-bot">Add a bot</a>"##
+    ));
+    assert!(page.contains(r#"action="/account/logout""#) && page.contains(">Sign out<"));
+    // The account id is labelled, explained and copyable; times are local.
+    let acct_id = relay
+        .db
+        .account_by_email("me@example.com")
+        .unwrap()
+        .unwrap()
+        .id;
+    assert!(page.contains("<span>Account ID</span>"));
+    assert!(page.contains(&format!(r#"data-copy="{acct_id}""#)));
+    assert!(page.contains("Not a password."));
+    assert!(page.contains(r#"<time datetime=""#));
+    assert!(
+        !page.contains("location.reload"),
+        "no polling with no bots waiting"
+    );
     // "Add a bot": a ready-to-paste prompt for the person's AI with a Copy
     // button, pointing at /connect and carrying the stdio command.
-    assert!(page.contains("<h2>Add a bot</h2>"));
+    assert!(page.contains(r#"<summary class="btn">Add a bot</summary>"#));
     assert!(page.contains(r#"id="addbot-copy""#) && page.contains(r#"id="addbot-name""#));
     assert!(page.contains("https://botwhisper.si/connect"));
     assert!(page.contains(&format!(
@@ -267,7 +232,7 @@ async fn confirm_link_signs_in_once_and_expired_links_fail() {
     assert_eq!(r.headers()["location"], "/signin");
 
     // Signed in now: /signup forwards to /account, which shows the address.
-    let r = http.get(format!("{base}/signup")).send().await.unwrap();
+    let r = http.get(format!("{base}/signin")).send().await.unwrap();
     assert_eq!(r.headers()["location"], "/account");
     let acct = http
         .get(format!("{base}/account"))
@@ -279,7 +244,7 @@ async fn confirm_link_signs_in_once_and_expired_links_fail() {
         .unwrap();
     assert!(acct.contains("me@example.com"));
     assert!(acct.contains("end-to-end encrypted and never stored"));
-    assert!(acct.contains("All times are UTC"));
+    assert!(acct.contains(r#"<time datetime=""#));
 
     // Single use.
     let r = browser().get(&link).send().await.unwrap();
@@ -293,7 +258,7 @@ async fn confirm_link_signs_in_once_and_expired_links_fail() {
             &sha256_hex("stale-token"),
             &PendingLogin {
                 email: "late@example.com".into(),
-                authz: "web-signup".into(),
+                authz: "web-signin".into(),
                 expires_at: now_unix() - 1,
                 code_hash: None,
             },
@@ -333,7 +298,7 @@ async fn confirm_link_signs_in_once_and_expired_links_fail() {
 }
 
 #[tokio::test]
-async fn web_signup_is_rate_limited() {
+async fn web_signin_is_rate_limited() {
     let mut cfg = test_config();
     cfg.limits.signups_per_email_per_hour = 2;
     let relay = TestRelay::start_with(cfg).await;
@@ -406,9 +371,12 @@ async fn account_page_shows_only_own_data_and_disconnect_needs_csrf() {
         .await
         .unwrap();
     assert!(page.contains("alice@example.com") && page.contains("Alice Claude"));
-    assert!(page.contains(&format!("{alice_id}:bwc_alice1")));
-    assert!(page.contains("Connected to <strong>Alice Claude</strong>"));
-    assert!(page.contains(&room_id) && page.contains("title is encrypted"));
+    assert!(page.contains(r#"<span class="status on">Connected</span>"#));
+    assert!(page.contains("Using Alice Claude"));
+    // Member ID: labelled, explained, copyable.
+    assert!(page.contains("<span>Member ID</span>"));
+    assert!(page.contains(&format!(r#"data-copy="{alice_id}:bwc_alice1""#)));
+    assert!(page.contains(&room_id));
     assert!(page.contains("you own it") && page.contains("for Sam") && page.contains("unused"));
     assert!(page.contains("Rename") && page.contains("Delete"));
     for other in [
@@ -427,7 +395,7 @@ async fn account_page_shows_only_own_data_and_disconnect_needs_csrf() {
     // Doorbells: type, host, masked topic and status, never secrets, paths
     // or other people's doorbells.
     assert!(
-        page.contains("Default doorbell (all rooms)")
+        page.contains("Wake-ups on (all rooms)")
             && page.contains("<strong>ntfy</strong> to ntfy.sh")
     );
     assert!(page.contains("token set") && page.contains("status <strong>never</strong>"));
@@ -534,7 +502,9 @@ async fn account_page_shows_only_own_data_and_disconnect_needs_csrf() {
         .text()
         .await
         .unwrap();
-    assert!(page.contains("Not connected (last connected with Alice Claude)"));
+    assert!(page.contains(r#"<span class="status off">Not connected</span>"#));
+    assert!(page.contains("Reconnect this bot"));
+    assert!(page.contains(r#"data-copy="botwhisper connect --relay"#));
     assert!(
         !page.contains("/account/disconnect"),
         "nothing to disconnect"
@@ -575,8 +545,16 @@ async fn account_page_shows_only_own_data_and_disconnect_needs_csrf() {
         .unwrap();
     assert_eq!(r.status(), StatusCode::CONFLICT);
 
-    // Delete: a bot in no room goes right away; one in a room asks first,
-    // then leaves (its owned room closes).
+    // Delete: always asks first (red button, apart from Rename); a bot in a
+    // room says what leaving does, and its owned room closes.
+    assert!(
+        page.contains(r#"<div class="danger-zone">"#)
+            && page.contains(r#"class="danger small">Delete this bot"#)
+    );
+    assert!(
+        page.find("Rename</button>").unwrap() < page.find(r#"<div class="danger-zone">"#).unwrap(),
+        "Delete sits apart from Rename"
+    );
     let delete = |bot: &str, confirm: bool| {
         let mut f = vec![("csrf", csrf.clone()), ("bot_id", bot.to_string())];
         if confirm {
@@ -585,6 +563,14 @@ async fn account_page_shows_only_own_data_and_disconnect_needs_csrf() {
         alice.post(format!("{base}/account/bots/delete")).form(&f)
     };
     let r = delete("bot_bwc_alice2", false).send().await.unwrap();
+    assert_eq!(
+        r.status(),
+        StatusCode::OK,
+        "even a bot in no room asks first"
+    );
+    assert!(r.text().await.unwrap().contains("Yes, delete Alice Cursor"));
+    assert!(relay.db.get_bot("bot_bwc_alice2").unwrap().is_some());
+    let r = delete("bot_bwc_alice2", true).send().await.unwrap();
     assert_eq!(r.status(), StatusCode::SEE_OTHER);
     assert!(relay.db.get_bot("bot_bwc_alice2").unwrap().is_none());
     let r = delete("bot_bwc_alice1", false).send().await.unwrap();
@@ -749,8 +735,11 @@ async fn web_signin_offers_code_or_link_and_needs_csrf() {
         .await
         .unwrap();
     assert!(page.contains("Sign in to BotWhisper"));
-    assert!(page.contains(r#"name="method" value="code" checked"#));
+    assert!(page.contains("Continue with email"));
+    assert!(page.contains(r#"name="method" value="code""#));
     assert!(page.contains(r#"name="method" value="link""#));
+    assert!(page.contains("Email me a link instead"));
+    assert!(!page.contains("New here?"), "one form for new and existing");
     for csrf in ["", "wrong"] {
         let r = http
             .post(format!("{base}/signin"))
@@ -765,16 +754,10 @@ async fn web_signin_offers_code_or_link_and_needs_csrf() {
         assert_eq!(r.status(), StatusCode::FORBIDDEN);
     }
     assert!(relay.mail.lock().unwrap().is_empty());
-    // The signup page points at it.
-    let page = http
-        .get(format!("{base}/signup"))
-        .send()
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
-    assert!(page.contains(r#"<a href="/signin">Sign in</a>"#));
+    // The old signup page is gone: it forwards to the one sign-in form.
+    let r = http.get(format!("{base}/signup")).send().await.unwrap();
+    assert_eq!(r.status(), StatusCode::SEE_OTHER);
+    assert_eq!(r.headers()["location"], "/signin");
     relay.shutdown().await;
 }
 
@@ -888,11 +871,6 @@ async fn web_signin_with_a_nofollow_link() {
     let r = post_code(&browser(), &base, token, "12345678").await;
     assert_eq!(r.status(), StatusCode::BAD_REQUEST);
 
-    // The web signup is unchanged: a plain-text link, no HTML part.
-    post_signup(&browser(), &base, "new@example.com").await;
-    let mail = relay.mail.lock().unwrap().last().cloned().unwrap();
-    assert!(mail.body.contains("/oauth/confirm/"));
-    assert!(mail.html.is_none());
     relay.shutdown().await;
 }
 
@@ -990,15 +968,15 @@ async fn web_signin_link_get_is_read_only_until_the_button() {
 }
 
 #[tokio::test]
-async fn web_signup_link_head_does_not_consume() {
+async fn web_signin_link_head_does_not_consume() {
     let relay = TestRelay::start().await;
     let base = relay.base();
     post_signup(&browser(), &base, "head@example.com").await;
     let link = last_link(&relay);
     let r = browser().head(&link).send().await.unwrap();
     assert_eq!(r.status(), StatusCode::OK);
-    // The signup confirmation itself is unchanged: a GET confirms it.
-    let r = browser().get(&link).send().await.unwrap();
+    // Only the button signs in.
+    let r = press_sign_in(&browser(), &base, &link).await;
     assert_eq!(r.status(), StatusCode::SEE_OTHER);
     assert_eq!(r.headers()["location"], "/account");
     relay.shutdown().await;
