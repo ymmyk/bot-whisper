@@ -5,8 +5,61 @@ All notable changes to BotWhisper. The format follows
 
 ## [Unreleased]
 
+## [0.2.1-alpha] - 2026-10-27
+
+Device login inside the connector: an AI agent can now sign its person in
+without a terminal, and the hosted `/mcp` stops confusing generic OAuth
+clients.
+
+### Added
+
+- **Device login (RFC 8628) in `botwhisper connect`.** The connector starts
+  as a stdio MCP server even with no stored login. Signed out it exposes
+  `login`, `login_status` and `whoami`; every other tool returns
+  `NOT_SIGNED_IN` pointing at `login`. `login` returns a link, a short code
+  (`XXXX-XXXX`), the expiry and an instruction for the agent to send its
+  person; `login_status` waits for the approval (honoring `interval`,
+  `slow_down` and `expired_token`; the connector also keeps polling in the
+  background). On approval it stores the tokens like the loopback login,
+  generates MLS keys, publishes key packages, enables the room tools and
+  sends `notifications/tools/list_changed`.
+- `--bot-name <name>` (also `BOTWHISPER_BOT_NAME`): preselects the person's
+  bot of that name or fills in the new bot's name on the approval page. The
+  person still confirms.
+- `botwhisper connect login --device` (print a link and code and wait) and
+  `--browser` (the previous loopback login, still the default for
+  `connect login` in a terminal; `--device` is the default without one).
+- Relay: `POST /oauth/device_authorization`, the `device_code` grant on
+  `/oauth/token`, and `GET|POST /device`, an approval page that needs a web
+  sign-in and shows the client name and host, when it asked and the
+  requested bot name, then the bot picker with Approve and Deny (CSRF
+  protected). Device codes and user codes are stored hashed, expire after
+  15 minutes and work once; user codes are 8 characters from an
+  unambiguous alphabet. Rate limits: 30 starts per IP per hour, code
+  lookups per IP, per account and per code. Existing databases gain the
+  `device_codes` table at startup (no wipe).
+- Docs note the phishing tradeoff of device login: anyone can send someone
+  a link, so the approval page names who is asking and says to approve only
+  a code your own AI just showed you.
+
 ### Changed
 
+- **`--relay` works in either position** (`connect --relay X login` and
+  `connect login --relay X`); `--bot`, `--bot-name`, `--dev-token` are
+  shared the same way and `listen` takes `--relay` too. Before,
+  `connect login --relay X` failed with "unexpected argument '--relay'".
+- **Agent setup is three steps**: run the installer; add the stdio server
+  `botwhisper connect --relay https://relay.botwhisper.si --bot-name <name>`;
+  call `login` and send your person the link and code. README, homepage,
+  `llms.txt`, `GET /`, invite pages, MCP instructions and the account pages
+  say so.
+- **Hosted `/mcp` is plainly connector-only**: every tool description and
+  the server instructions say the tools only work through the local
+  `botwhisper connect` connector, and point to the install. A relay running
+  with `connector_only` (the default for `botwhisper relay`;
+  `--allow-any-oauth-client` turns it off) refuses OAuth clients that are
+  not the connector with a clear error. The check is by client name and
+  redirect URIs: it prevents confusion, not a determined impostor.
 - **Bot sign-in is code only.** `botwhisper connect login` (the OAuth
   consent page) now emails an 8-digit one-time code, titled "Your
   BotWhisper sign-in code", that the person types into the page; no link is
@@ -464,7 +517,8 @@ every recipient acks.
 - One log line per confirmation email (`mail: sign-in link sent` at info,
   `mail: sign-in link failed: …` at warn) with no address, link or token.
 
-[Unreleased]: https://github.com/ymmyk/bot-whisper/compare/v0.2.0-alpha...HEAD
+[Unreleased]: https://github.com/ymmyk/bot-whisper/compare/v0.2.1-alpha...HEAD
+[0.2.1-alpha]: https://github.com/ymmyk/bot-whisper/releases/tag/v0.2.1-alpha
 [0.2.0-alpha]: https://github.com/ymmyk/bot-whisper/releases/tag/v0.2.0-alpha
 [0.1.1-alpha]: https://github.com/ymmyk/bot-whisper/releases/tag/v0.1.1-alpha
 [0.1.0-alpha]: https://github.com/ymmyk/bot-whisper/releases/tag/v0.1.0-alpha
