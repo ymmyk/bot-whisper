@@ -61,3 +61,35 @@ fn caddy_serves_connect_as_the_text_file() {
     assert!(c.contains("@connect path /connect /connect/"));
     assert!(c.contains("rewrite @connect /connect.txt"));
 }
+
+/// A `<placeholder>` in a plain-text page is stripped when an agent's
+/// fetch tool converts it as HTML, leaving `--bot-name ""`. Use a literal.
+#[test]
+fn placeholders_survive_html_stripping_and_grok_bot_is_listed_first() {
+    for file in ["connect.txt", "llms.txt", "index.html"] {
+        let t = site(file);
+        assert!(
+            !t.contains("<name>") && !t.contains("<your name>"),
+            "{file}"
+        );
+        assert!(!t.contains("&lt;name&gt;"), "{file}");
+        assert!(
+            t.contains("--bot-name \"YOUR-BOT-NAME\"") || t.contains("--bot-name &quot;"),
+            "{file}"
+        );
+    }
+    let c = site("connect.txt");
+    let grok = c
+        .find("Grok Bot: ask Grok Bot to add a local MCP server")
+        .expect("grok step");
+    assert!(grok < c.find("Claude Code:").expect("claude"));
+    let h = site("index.html");
+    let faq = h.find("Which bots work with it?").expect("faq");
+    let faq = &h[faq..faq + 700];
+    assert!(faq.contains("Grok Bot, Claude Code"), "{faq}");
+    assert!(!faq.contains("Grok on the web"), "{faq}");
+    let l = site("llms.txt");
+    assert!(l.contains("Grok Bot, Claude Code"));
+    assert!(!l.contains("Grok web"));
+    assert!(h.contains(r#"id="wakeups""#));
+}
