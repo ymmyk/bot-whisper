@@ -37,10 +37,10 @@ use crate::{
     db::{new_bot_id, unique_bot_name, AccountRow, BotRow, ClientRow, DeviceRow},
     doorbell::now_unix,
     oauth::{
-        app_name, bot_radio_list, clean_bot_name, client_ip, client_label, connector_only_message,
-        cookie_value, csrf_from_headers, csrf_ok, current_account, error_page, esc,
-        is_connector_client, issue_tokens, no_store, oauth_error, page, random_token, too_many,
-        OauthState, TokenForm, OPERATOR_NOTICE, SCOPE_ROOMS,
+        app_name, bot_radio_list, clean_bot_name, client_ip, client_label, code_token_html,
+        connector_only_message, cookie_value, csrf_from_headers, csrf_ok, current_account,
+        error_page, esc, is_connector_client, issue_tokens, no_store, oauth_error, page,
+        random_token, too_many, OauthState, TokenForm, OPERATOR_NOTICE, SCOPE_ROOMS,
     },
 };
 
@@ -327,15 +327,16 @@ fn entry_page(st: &OauthState, account: &AccountRow, csrf: &str, error: Option<&
         "Connect a bot",
         &format!(
             r#"<h1>Connect a bot</h1>
-<p>Signed in as <strong>{email}</strong>. Type the code your AI agent showed you (it looks like <code>ABCD-2346</code>).</p>
+<p>Signed in as <strong>{email}</strong>. Type the code your AI agent showed you (it looks like <code>{example}</code>; capitals or not, with or without a dash or space).</p>
 {err}
 <form method="post" action="/device"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="action" value="lookup">
-<label for="code">Code</label><input id="code" name="code" type="text" required autocomplete="off" autocapitalize="characters" spellcheck="false" maxlength="12" placeholder="XXXX-XXXX">
+<label for="code">Code</label><input id="code" name="code" type="text" required autocomplete="off" autocapitalize="characters" spellcheck="false" maxlength="40" placeholder="ABCD2346">
 <button type="submit">Continue</button></form>
 <p class="muted">Codes expire after {minutes} minutes. Only enter a code your own AI agent just gave you; if someone else sent you this page, close it.</p>
 {notice}"#,
             email = esc(&account.email),
             csrf = esc(csrf),
+            example = code_token_html("ABCD2346"),
             minutes = st.cfg.device_code_ttl.as_secs() / 60,
             notice = OPERATOR_NOTICE,
         ),
@@ -390,7 +391,7 @@ fn approval_page(
         &format!(
             r#"<h1>Connect this bot to your account?</h1>
 <p>Signed in as <strong>{email}</strong>.</p>
-<p><strong>{client}</strong> started a login <strong>{age}</strong> and asked you to confirm code <code>{spaced}</code>. {asked}</p>
+<p><strong>{client}</strong> started a login <strong>{age}</strong> and asked you to confirm code <code>{token}</code>. {asked}</p>
 {err}
 <div class="notice"><strong>Only approve if you just asked your AI agent to connect to BotWhisper and the code above is the one it showed you.</strong> If someone sent you this page, or the code is not yours, press Deny: approving gives that program full use of one of your bots, including its rooms.</div>
 <form method="post" action="/device"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="code" value="{code}">
@@ -404,7 +405,7 @@ fn approval_page(
             email = esc(&account.email),
             client = client_label(client),
             age = age_text(row.created_at, now),
-            spaced = esc(&spaced_user_code(code)),
+            token = code_token_html(code),
             code = esc(code),
             csrf = esc(csrf),
             new_checked = if preselect.is_none() { " checked" } else { "" },

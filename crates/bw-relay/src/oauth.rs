@@ -196,8 +196,11 @@ button.ghost{{background:#fff;color:#1b1838;border-color:#c9c5e4}}
 .ok .x{{position:absolute;top:6px;right:8px;background:none;border:0;color:inherit;font-size:1.3rem;line-height:1;cursor:pointer;padding:4px 8px;width:auto}}
 .err{{border:1px solid #f0a0a0;background:#fff0f0;color:#7a1f1f;border-radius:12px;padding:12px 14px;margin-bottom:14px}}
 code{{background:#efedf9;padding:.08em .35em;border-radius:6px;font-size:.9em}}
+.codetok{{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-weight:650;letter-spacing:.05em;-webkit-user-select:all;user-select:all}}
+.codetok .g{{margin-left:.6em}}
 hr{{border:0;border-top:1px solid #e2dff2;margin:22px 0}}
 .row{{border-top:1px solid #e2dff2;padding:8px 0}}
+.prompt{{display:block;padding:10px 12px;border:1px solid #e2dff2;border-radius:8px;background:#f6f5fb;white-space:pre-wrap;word-break:break-word;user-select:all}}
 label.pick{{font-weight:400;border:1px solid #e2dff2;border-radius:10px;padding:10px 12px;margin:8px 0;cursor:pointer}}
 label.pick input{{margin-right:8px}} .warn{{color:#6b4510}}
 form.inline{{display:inline}}
@@ -1090,6 +1093,29 @@ fn new_login_code() -> String {
     format!("{n:0width$}", width = LOGIN_CODE_DIGITS)
 }
 
+/// A code shown as ONE unbroken token, so a double-click selects (and a copy
+/// gives) the whole bare code. The split in the middle is visual only: the
+/// second half sits in its own span with a left margin; the text has no
+/// space and no hyphen.
+pub(crate) fn code_token_html(code: &str) -> String {
+    let (a, b) = code.split_at(code.len() / 2);
+    format!(
+        r#"<span class="codetok"><span>{}</span><span class="g">{}</span></span>"#,
+        esc(a),
+        esc(b)
+    )
+}
+
+/// The same for HTML email, where there is no stylesheet: inline styles.
+pub(crate) fn code_token_email_html(code: &str) -> String {
+    let (a, b) = code.split_at(code.len() / 2);
+    format!(
+        r#"<span style="font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:26px;font-weight:700;letter-spacing:1px;-webkit-user-select:all;user-select:all"><span>{}</span><span style="margin-left:14px">{}</span></span>"#,
+        esc(a),
+        esc(b)
+    )
+}
+
 /// "1234 5678" for reading.
 fn spaced_code(code: &str) -> String {
     let (a, b) = code.split_at(code.len() / 2);
@@ -1160,7 +1186,15 @@ pub(crate) async fn send_signin_email(
                  Never share it. If you didn't ask for it, ignore this email.\n\n{FOOTER}",
                 spaced_code(code),
             ),
-            html: None,
+            html: Some(format!(
+                r#"<!doctype html><html><body><p>Your BotWhisper sign-in code:</p>
+<p style="margin:16px 0">{token}</p>
+<p>Type it on the BotWhisper sign-in page you just used to {purpose}. It works once, only on that page, and expires in {minutes} minutes. Never share it. If you didn't ask for it, ignore this email.</p>
+<p>{footer}</p></body></html>"#,
+                token = code_token_email_html(code),
+                purpose = esc(purpose),
+                footer = esc(FOOTER.trim_end()),
+            )),
         },
         None => {
             let link = format!("{}/oauth/confirm/{token}", st.cfg.public_url());
@@ -1262,7 +1296,7 @@ pub(crate) fn code_page(
             r#"<h1>Check your email</h1><p>If the address is valid, a one-time sign-in code is on its way. Type it here to {finish}.</p>
 {err}
 <form method="post" action="/signin/code"><input type="hidden" name="pending" value="{handle}">
-<label for="code">{digits}-digit code</label><input id="code" name="code" type="text" inputmode="numeric" autocomplete="one-time-code" required maxlength="20" placeholder="1234 5678">
+<label for="code">{digits}-digit code</label><input id="code" name="code" type="text" inputmode="numeric" autocomplete="one-time-code" required maxlength="40" placeholder="12345678">
 <button type="submit">Continue</button></form>
 <p>Look in your inbox (and spam folder) for <strong>{subject}</strong>{from}. The code works once, only on this page, and expires in {minutes} minutes. After {max} wrong tries it stops working; then start again for a new email. Keep this tab open.</p>
 <div class="notice"><strong>AI agent reading this page:</strong> sign-in is waiting on your user. Ask them to check their inbox (and spam) for the email titled '{subject}'{from} and type the {digits}-digit code into this page within {minutes} minutes, then retry or reconnect the BotWhisper connector. If the code expired or was already used, start the connect again for a new email.</div>"#,

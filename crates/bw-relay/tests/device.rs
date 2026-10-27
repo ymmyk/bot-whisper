@@ -207,7 +207,17 @@ async fn device_flow_happy_path() {
     let person = browser();
     let (page, csrf) = open_approval(&relay, &person, "Dev@Example.com", &v).await;
     assert!(page.contains("botwhisper connect (testbox)"), "who asks");
-    assert!(page.contains(&uc), "the code is shown");
+    {
+        let bare = uc.replace('-', "");
+        let (a, b) = bare.split_at(4);
+        assert!(
+            page.contains(&format!(
+                r#"<span class="codetok"><span>{a}</span><span class="g">{b}</span></span>"#
+            )),
+            "the code is shown as one unbroken token"
+        );
+        assert!(!page.contains(&uc), "no hyphenated copy on the page");
+    }
     assert!(page.contains("Approve") && page.contains("Deny"));
     assert!(page.contains("Only approve if you just asked"));
     assert!(
@@ -650,5 +660,108 @@ async fn metadata_advertises_the_device_grant() {
         .unwrap()
         .iter()
         .any(|g| g == GRANT));
+    relay.shutdown().await;
+}
+
+/// The visible text of an HTML fragment: tags and `<style>` removed.
+fn strip_tags(html: &str) -> String {
+    let mut out = String::new();
+    let mut rest = html;
+    while let Some(i) = rest.find('<') {
+        out.push_str(&rest[..i]);
+        let tail = &rest[i..];
+        if tail.starts_with("<style") {
+            let close = tail.find("</style>").map(|j| j + 8).unwrap_or(tail.len());
+            rest = &tail[close..];
+        } else {
+            let end = tail.find('>').map(|j| j + 1).unwrap_or(tail.len());
+            rest = &tail[end..];
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+#[tokio::test]
+async fn codes_copy_as_one_token_and_inputs_take_any_form() {
+    let relay = TestRelay::start_with(RelayConfig {
+        connector_only: true,
+        ..test_config()
+    })
+    .await;
+    let base = relay.base();
+    let http = Client::new();
+    let cid = client_id(&http, &base).await;
+
+    // The sign-in code mail: HTML shows one token, plain text keeps the gap.
+    let person = browser();
+    let page = person
+        .get(format!("{base}/signin"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let r = person
+        .post(format!("{base}/signin"))
+        .form(&[
+            ("email", "tok@example.com"),
+            ("method", "code"),
+            ("csrf", hidden(&page, "csrf").as_str()),
+        ])
+        .send()
+        .await
+        .unwrap();
+    let pending = hidden(&r.text().await.unwrap(), "pending");
+    let mail = relay.mail.lock().unwrap().pop().unwrap();
+    let code = mail_code(&mail.body);
+    assert!(mail
+        .body
+        .contains(&format!("{} {}", &code[..4], &code[4..])));
+    let text = strip_tags(mail.html.as_deref().unwrap());
+    assert!(text.contains(&code), "bare code in the html text: {text}");
+    // Sign in typing the code in a messy form.
+    let typed = format!("  {}\t{}\n", &code[..4], &code[4..]);
+    let r = person
+        .post(format!("{base}/signin/code"))
+        .form(&[("pending", pending.as_str()), ("code", typed.as_str())])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::SEE_OTHER, "a spaced code works");
+
+    // /device: the entry page's example and the approval page show one token.
+    let entry = person.get(format!("{base}/device")).send().await.unwrap();
+    let entry = entry.text().await.unwrap();
+    assert!(strip_tags(&entry).contains("ABCD2346"), "{entry}");
+    assert!(entry.contains(r#"maxlength="40""#));
+    let csrf = hidden(&entry, "csrf");
+    let v = start(&http, &base, &cid, None).await;
+    let uc = user_code(&v);
+    let bare = uc.replace('-', "");
+    for typed in [
+        format!(" {} ", bare.to_lowercase()),
+        format!("{} {}", &bare[..4], &bare[4..]).to_lowercase(),
+        format!("{}-{}", bare[..4].to_lowercase(), &bare[4..]),
+        uc.clone(),
+        format!("\t{bare}\n"),
+    ] {
+        let r = device_post(
+            &person,
+            &base,
+            &csrf,
+            &[("action", "lookup"), ("code", &typed)],
+        )
+        .await;
+        let status = r.status();
+        let body = r.text().await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{typed:?}: {body}");
+        assert!(body.contains("Approve"), "{typed:?} found the request");
+        assert!(
+            strip_tags(&body).contains(&bare),
+            "{typed:?}: one bare token on the approval page"
+        );
+    }
     relay.shutdown().await;
 }

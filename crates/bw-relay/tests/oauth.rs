@@ -222,8 +222,21 @@ async fn sign_in_as(
         "bot sign-in mails a code only, never a link: {}",
         mail.body
     );
-    assert!(mail.html.is_none());
+    // The HTML part shows the code as one unbroken token (the gap is a
+    // style, not text) and carries no link either.
+    let html = mail.html.as_deref().expect("html part for a code mail");
+    assert!(
+        !html.contains("http") && !html.contains("/oauth/confirm/"),
+        "{html}"
+    );
     let code = mail_code(&mail.body);
+    let (a, b) = code.split_at(4);
+    assert!(
+        html.contains(&format!(
+            "<span>{a}</span><span style=\"margin-left:14px\">{b}</span>"
+        )),
+        "{html}"
+    );
     let pending = hidden(&body, "pending");
     assert!(!body.contains(&code), "the page never shows the code");
 
