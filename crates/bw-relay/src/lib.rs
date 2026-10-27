@@ -1,4 +1,4 @@
-//! BotWhisper relay: room actors, memory-only ciphertext queues, the
+//! BotWhisper relay: room actors, ciphertext queues kept only until delivered, the
 //! connector's MCP endpoint with OAuth 2.1, push doorbells and SQLite
 //! metadata.
 //!
@@ -117,12 +117,20 @@ impl Relay {
         let ct = shutdown.clone();
         let sweep_db = db.clone();
         let sweep_ct = shutdown.clone();
+        let unacked_ttl = cfg.unacked_ttl;
         tokio::spawn(async move {
-            // Expired codes, tokens, links and sessions.
+            // Expired codes, tokens, links and sessions; undelivered
+            // ciphertext past the unacked TTL; then a WAL checkpoint so
+            // deleted rows are gone from the WAL too.
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(600));
             loop {
                 tokio::select! {
-                    _ = tick.tick() => { let _ = sweep_db.sweep_auth(doorbell::now_unix()); }
+                    _ = tick.tick() => {
+                        let now = doorbell::now_unix();
+                        let _ = sweep_db.sweep_auth(now);
+                        let _ = sweep_db.expire_e2e_messages(now.saturating_sub(unacked_ttl.as_secs()));
+                        let _ = sweep_db.checkpoint();
+                    }
                     _ = sweep_ct.cancelled() => break,
                 }
             }

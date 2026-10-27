@@ -366,9 +366,7 @@ impl Gateway {
                     home_bot: have,
                     wanted: want.to_string(),
                 };
-                *i.resume_note.lock().expect("lock") = Some(format!(
-                    "{e}. Call `login` only if you want to sign in a bot named \"{want}\" in this home."
-                ));
+                *i.resume_note.lock().expect("lock") = Some(e.to_string());
                 return Err(e.into());
             }
         }
@@ -386,10 +384,7 @@ impl Gateway {
                     *i.busy.lock().expect("lock") = Some(held.to_string());
                     *i.resume_note.lock().expect("lock") = None;
                 } else if let Some(w) = e.downcast_ref::<super::server::WrongBot>() {
-                    *i.resume_note.lock().expect("lock") = Some(format!(
-                        "{w}. Call `login` only if you want to sign in a bot named \"{}\" in this home.",
-                        w.wanted
-                    ));
+                    *i.resume_note.lock().expect("lock") = Some(w.to_string());
                 } else {
                     *i.resume_note.lock().expect("lock") = Some(format!(
                         "The stored sign-in could not be used ({e}). Call `login` to sign in again."

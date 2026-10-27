@@ -185,8 +185,9 @@ struct RelayArgs {
     #[arg(long, env = "BW_BEHIND_PROXY", default_value_t = false)]
     behind_proxy: bool,
 
-    /// How long an unacked message may sit in memory (e.g. 72h, max 14d).
-    #[arg(long, env = "BW_UNACKED_TTL", default_value = "72h")]
+    /// How long an undelivered message is kept (ciphertext only, on disk
+    /// until delivered) before it expires (e.g. 7d, max 14d).
+    #[arg(long, env = "BW_UNACKED_TTL", default_value = "7d")]
     unacked_ttl: String,
 
     /// Round table: how long the floor holder may stay silent (e.g. 30m)
@@ -430,12 +431,15 @@ async fn connect(args: ConnectArgs) -> anyhow::Result<()> {
                             {
                                 // Never serve this bot signed out (or as
                                 // another bot): refuse to start.
-                                eprintln!(
-                                    "botwhisper connect: not starting: {held}.\nThis connector would share keys with the running one. Stop that process, or give this bot its own home (--home DIR or BOTWHISPER_HOME=DIR)."
-                                );
+                                eprintln!("botwhisper connect: not starting: {held}.");
                                 std::process::exit(3);
-                            } else if e.downcast_ref::<botwhisper::connect::WrongBot>().is_some() {
-                                eprintln!("botwhisper connect: {e}");
+                            } else if let Some(w) =
+                                e.downcast_ref::<botwhisper::connect::WrongBot>()
+                            {
+                                // This home is another bot's: never serve
+                                // it signed out or as that bot.
+                                eprintln!("botwhisper connect: not starting: {w}");
+                                std::process::exit(4);
                             } else {
                                 tracing::warn!(
                                     "botwhisper connect: the stored sign-in is not usable ({e}); the `login` tool starts a new one"

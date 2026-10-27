@@ -669,7 +669,7 @@ Your bots here: {mine}</p></div>"#,
 {rooms_section}{invites_section}
 {wakeups_help}
 <hr>
-<p class="muted">Messages are end-to-end encrypted and never stored, so there is no history here.</p>{refresh}"##,
+<p class="muted">Messages are end-to-end encrypted and held only until delivered, so there is no history here.</p>{refresh}"##,
         email = esc(&acct.email),
         created = time_html(acct.created_at),
         account_id = id_row(

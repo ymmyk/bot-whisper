@@ -1,14 +1,13 @@
 //! End-to-end encrypted rooms, relay side (docs/design/e2e-rooms.md §5).
 //!
 //! The relay is the MLS Delivery Service: it orders commits per epoch,
-//! stores handshake messages (commits, Welcomes) in SQLite until every
-//! recipient acked them, and forwards application ciphertext from memory
-//! only. It never sees plaintext and never parses the blobs.
+//! stores every queued item (commits, Welcomes and application ciphertext)
+//! in SQLite only until every recipient acked it, so a relay restart loses
+//! nothing; then the row is deleted (with `secure_delete` on). Application
+//! ciphertext also expires after the unacked TTL. It never sees plaintext,
+//! never parses the blobs and never logs them.
 
-use std::{
-    collections::BTreeSet,
-    time::{Duration, Instant},
-};
+use std::{collections::BTreeSet, time::Duration};
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use bw_proto::{ErrorCode, MemberId, SendIntent, ThreadStatus, TurnSignal};
@@ -55,9 +54,10 @@ impl E2eItemKind {
         }
     }
 
-    /// Handshake messages survive a restart; application ciphertext does not.
+    /// Every item is kept on disk until delivered (0.2.7: application
+    /// ciphertext too, so a relay restart loses nothing).
     fn persisted(self) -> bool {
-        self != E2eItemKind::Application
+        true
     }
 }
 
@@ -74,7 +74,8 @@ pub struct E2eItem {
     pub epoch: u64,
     pub payload: Vec<u8>,
     pub pending: BTreeSet<MemberId>,
-    created: Instant,
+    /// Unix seconds when it was queued (for the unacked TTL).
+    created_at: u64,
 }
 
 /// The turn part of a send: the signal that rides outside the ciphertext.
@@ -98,14 +99,19 @@ impl E2eState {
     pub fn load(epoch: u64, rows: Vec<HandshakeRow>, saved_next_seq: u64) -> Self {
         let items: Vec<E2eItem> = rows
             .into_iter()
-            .map(|r| E2eItem {
-                seq: r.seq,
-                kind: E2eItemKind::parse(&r.kind),
-                from: Some(r.sender),
-                epoch: r.epoch,
-                payload: r.payload,
-                pending: r.pending.into_iter().collect(),
-                created: Instant::now(),
+            .map(|r| {
+                let kind = E2eItemKind::parse(&r.kind);
+                E2eItem {
+                    seq: r.seq,
+                    kind,
+                    // Application rows record no sender (sealed sender).
+                    from: (kind != E2eItemKind::Application && !r.sender.is_empty())
+                        .then_some(r.sender),
+                    epoch: r.epoch,
+                    payload: r.payload,
+                    pending: r.pending.into_iter().collect(),
+                    created_at: r.created_at,
+                }
             })
             .collect();
         // Never hand out a seq twice: the saved counter wins over the
@@ -118,13 +124,20 @@ impl E2eState {
         }
     }
 
-    /// Drop application ciphertext nobody fetched within the TTL. Handshake
-    /// items never expire (an offline member needs them to catch up).
-    pub fn expire(&mut self, ttl: Duration) -> bool {
-        let before = self.items.len();
-        self.items
-            .retain(|i| i.kind.persisted() || i.created.elapsed() < ttl);
-        self.items.len() != before
+    /// Drop application ciphertext not delivered within the TTL; returns
+    /// the seqs dropped (the caller deletes their rows). Handshake items
+    /// never expire (an offline member needs them to catch up).
+    pub fn expire(&mut self, ttl: Duration, now: u64) -> Vec<u64> {
+        let mut gone = Vec::new();
+        self.items.retain(|i| {
+            let keep = i.kind != E2eItemKind::Application
+                || now.saturating_sub(i.created_at) < ttl.as_secs();
+            if !keep {
+                gone.push(i.seq);
+            }
+            keep
+        });
+        gone
     }
 
     pub fn queued(&self) -> usize {
@@ -201,7 +214,13 @@ impl Room {
                 &HandshakeRow {
                     seq,
                     kind: kind.as_str().into(),
-                    sender: from.into(),
+                    // Ciphertext and routing only: no sender for application
+                    // messages (MLS authenticates it inside).
+                    sender: if kind == E2eItemKind::Application {
+                        String::new()
+                    } else {
+                        from.into()
+                    },
                     epoch,
                     payload: payload.clone(),
                     pending: pending.iter().cloned().collect(),
@@ -212,11 +231,11 @@ impl Room {
         self.e2e.items.push(E2eItem {
             seq,
             kind,
-            from: kind.persisted().then(|| from.to_string()),
+            from: (kind != E2eItemKind::Application).then(|| from.to_string()),
             epoch,
             payload,
             pending,
-            created: Instant::now(),
+            created_at: now,
         });
         Ok(seq)
     }

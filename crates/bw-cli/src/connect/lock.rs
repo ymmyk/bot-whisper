@@ -86,7 +86,7 @@ impl std::fmt::Display for LockHeld {
         write!(
             f,
             "another botwhisper connect is running for this home ({}, bot \"{}\"{pid}); \
-             stop it or use a different BOTWHISPER_HOME",
+             stop it or start this bot with --home DIR (or BOTWHISPER_HOME=DIR)",
             self.home.display(),
             self.bot
         )
@@ -265,7 +265,7 @@ mod tests {
             err.to_string(),
             format!(
                 "another botwhisper connect is running for this home ({}, bot \"QA Test 3\", pid {}); \
-                 stop it or use a different BOTWHISPER_HOME",
+                 stop it or start this bot with --home DIR (or BOTWHISPER_HOME=DIR)",
                 home.display(),
                 std::process::id()
             )
@@ -371,7 +371,7 @@ mod tests {
             held.to_string(),
             format!(
                 "another botwhisper connect is running for this home ({}, bot \"QA Test 3\"); \
-                 stop it or use a different BOTWHISPER_HOME",
+                 stop it or start this bot with --home DIR (or BOTWHISPER_HOME=DIR)",
                 w.home.display()
             )
         );

@@ -393,8 +393,8 @@ impl std::fmt::Display for WrongBot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "this home ({}) is signed in as bot \"{}\" but this connector was started with --bot-name \"{}\"; it will not act as \"{}\". Give each bot its own home (--home DIR or BOTWHISPER_HOME=DIR), or fix --bot-name",
-            self.home, self.home_bot, self.wanted, self.home_bot
+            "this home belongs to bot \"{}\"; you asked for \"{}\". Use --home DIR for a separate bot.",
+            self.home_bot, self.wanted
         )
     }
 }

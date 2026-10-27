@@ -554,6 +554,22 @@ impl std::fmt::Debug for Db {
     }
 }
 
+/// The doorbell a pre-0.2.6 connector made at sign-in with `set_doorbell {}`.
+fn is_sign_in_default(cfg: &DoorbellConfig) -> bool {
+    let default_events = cfg.events.len() == crate::doorbell::DEFAULT_EVENTS.len()
+        && crate::doorbell::DEFAULT_EVENTS
+            .iter()
+            .all(|e| cfg.events.iter().any(|x| x == e));
+    matches!(
+        &cfg.target,
+        crate::doorbell::DoorbellTarget::Ntfy {
+            server: None,
+            token: None,
+            ..
+        }
+    ) && default_events
+}
+
 impl Db {
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
@@ -571,7 +587,11 @@ impl Db {
     }
 
     fn init(conn: Connection) -> Result<Self> {
-        conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;")?;
+        // secure_delete: deleted rows (delivered ciphertext) are overwritten
+        // with zeros, not left in free pages.
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA secure_delete = ON;",
+        )?;
         conn.execute_batch(SCHEMA)?;
         for (table, column, decl) in ADDED_COLUMNS {
             let has: bool = conn
@@ -583,9 +603,44 @@ impl Db {
                 conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"))?;
             }
         }
+        Self::migrate(&conn)?;
         Ok(Db {
             conn: Arc::new(Mutex::new(conn)),
         })
+    }
+
+    /// One-time data migrations, guarded by `PRAGMA user_version` so each
+    /// runs once per database.
+    fn migrate(conn: &Connection) -> Result<()> {
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if version < 1 {
+            // 0.2.7: bot-wide doorbells the connector made at sign-in before
+            // 0.2.6 have no `auto` flag, so the account page showed wake-ups
+            // as on. Those connectors sent `set_doorbell {}`, which always
+            // made exactly this: ntfy on the relay's default server, no
+            // token, the default events. Mark those as automatic. (A
+            // doorbell set up on purpose the same way looks identical; it
+            // still works, only the account page wording changes.)
+            let rows: Vec<(String, String)> = {
+                let mut st = conn.prepare("SELECT agent_id, config FROM bot_doorbells")?;
+                let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                rows.collect::<rusqlite::Result<_>>()?
+            };
+            for (agent, raw) in rows {
+                let Ok(mut cfg) = serde_json::from_str::<DoorbellConfig>(&raw) else {
+                    continue;
+                };
+                if is_sign_in_default(&cfg) && !cfg.auto {
+                    cfg.auto = true;
+                    conn.execute(
+                        "UPDATE bot_doorbells SET config = ?2 WHERE agent_id = ?1",
+                        params![agent, serde_json::to_string(&cfg).unwrap_or(raw)],
+                    )?;
+                }
+            }
+            conn.execute_batch("PRAGMA user_version = 1;")?;
+        }
+        Ok(())
     }
 
     fn with<T>(&self, f: impl FnOnce(&Connection) -> rusqlite::Result<T>) -> Result<T> {
@@ -704,6 +759,35 @@ impl Db {
             )?;
             Ok(())
         })
+    }
+
+    /// Delete undelivered application ciphertext queued before `cutoff`
+    /// (unix seconds), in every room (loaded or not). Handshakes stay.
+    pub fn expire_e2e_messages(&self, cutoff: u64) -> Result<usize> {
+        self.with(|c| {
+            c.execute(
+                "DELETE FROM e2e_handshakes WHERE kind = 'application' AND created_at < ?1",
+                params![cutoff as i64],
+            )
+        })
+    }
+
+    /// Undelivered application messages on disk (tests and health).
+    pub fn count_e2e_messages(&self, room_id: Option<&str>) -> Result<u64> {
+        self.with(|c| {
+            c.query_row(
+                "SELECT COUNT(*) FROM e2e_handshakes WHERE kind = 'application' AND (?1 IS NULL OR room_id = ?1)",
+                params![room_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|v| v as u64)
+        })
+    }
+
+    /// Fold the WAL back into the database file and truncate it, so deleted
+    /// rows do not linger in old WAL frames.
+    pub fn checkpoint(&self) -> Result<()> {
+        self.with(|c| c.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);"))
     }
 
     /// Delete a room and everything attached to it.
@@ -2204,6 +2288,119 @@ fn account_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<AccountRow> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_sign_in_doorbells_are_marked_automatic_once() {
+        let dir = std::env::temp_dir().join(format!("bw-mig-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("relay.sqlite3");
+        let events = r#"["thread_started","message","turn","thread_done","stalled"]"#;
+        let legacy =
+            format!(r#"{{"target":{{"type":"ntfy","topic":"bw-legacy"}},"events":{events}}}"#);
+        let custom = format!(
+            r#"{{"target":{{"type":"ntfy","server":"https://ntfy.example","topic":"bw-custom"}},"events":{events}}}"#
+        );
+        {
+            let db = Db::open(&path).unwrap();
+            db.with(|c| {
+                // A database from before 0.2.7.
+                c.execute_batch("PRAGMA user_version = 0;")?;
+                c.execute(
+                    "INSERT INTO bot_doorbells (agent_id, config) VALUES ('legacy', ?1), ('custom', ?2)",
+                    params![legacy, custom],
+                )
+            })
+            .unwrap();
+        }
+        let read = |db: &Db, id: &str| {
+            db.all_bot_doorbells()
+                .unwrap()
+                .into_iter()
+                .find(|(a, _, _)| a == id)
+                .unwrap()
+                .1
+        };
+        let db = Db::open(&path).unwrap();
+        assert!(read(&db, "legacy").auto, "the sign-in default is automatic");
+        assert!(
+            !read(&db, "custom").auto,
+            "a custom server was set on purpose"
+        );
+        // Set on purpose after the upgrade, identical to a sign-in default:
+        // never re-marked on a later start.
+        db.with(|c| {
+            c.execute(
+                "INSERT INTO bot_doorbells (agent_id, config) VALUES ('later', ?1)",
+                params![legacy],
+            )
+        })
+        .unwrap();
+        drop(db);
+        let db = Db::open(&path).unwrap();
+        assert!(!read(&db, "later").auto, "the migration ran once");
+        assert!(read(&db, "legacy").auto);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delivered_ciphertext_is_really_gone_from_the_file() {
+        let dir = std::env::temp_dir().join(format!("bw-secdel-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("relay.sqlite3");
+        let db = Db::open(&path).unwrap();
+        let on: i64 = db
+            .with(|c| c.query_row("PRAGMA secure_delete", [], |r| r.get(0)))
+            .unwrap();
+        assert_eq!(on, 1, "secure_delete is on");
+        db.insert_room(&RoomRow {
+            id: "r1".into(),
+            owner: "m1".into(),
+            created_at: 1,
+            expires_at: None,
+            max_members: 8,
+            next_member_n: 2,
+            owner_account: None,
+            e2e_epoch: 0,
+            mode: TurnMode::RoundTable,
+            thread_start: ThreadStart::Anyone,
+        })
+        .unwrap();
+        let marker: Vec<u8> = b"BW-SECURE-DELETE-MARKER-".repeat(100);
+        db.insert_handshake(
+            "r1",
+            &HandshakeRow {
+                seq: 1,
+                kind: "application".into(),
+                sender: String::new(),
+                epoch: 0,
+                payload: marker.clone(),
+                pending: vec!["m2".into()],
+                created_at: 1,
+            },
+        )
+        .unwrap();
+        db.checkpoint().unwrap();
+        let has = |bytes: &[u8]| bytes.windows(marker.len()).any(|w| w == marker.as_slice());
+        assert!(
+            has(&std::fs::read(&path).unwrap()),
+            "stored before delivery"
+        );
+        assert_eq!(db.count_e2e_messages(Some("r1")).unwrap(), 1);
+        db.set_handshake_pending("r1", 1, &[]).unwrap();
+        db.checkpoint().unwrap();
+        assert_eq!(db.count_e2e_messages(None).unwrap(), 0);
+        assert!(
+            !has(&std::fs::read(&path).unwrap()),
+            "overwritten after delivery"
+        );
+        let wal = path.with_extension("sqlite3-wal");
+        if let Ok(w) = std::fs::read(&wal) {
+            assert!(!has(&w), "not left in the WAL");
+        }
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn room_lifecycle_cascades() {

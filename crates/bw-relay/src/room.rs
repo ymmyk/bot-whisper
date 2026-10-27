@@ -877,7 +877,13 @@ impl Room {
                 return;
             }
         }
-        let mut changed = self.e2e.expire(self.cfg.unacked_ttl);
+        let expired = self.e2e.expire(self.cfg.unacked_ttl, now);
+        for seq in &expired {
+            if let Err(e) = self.db.set_handshake_pending(&self.id, *seq, &[]) {
+                tracing::warn!("could not delete an expired item: {e}");
+            }
+        }
+        let mut changed = !expired.is_empty();
         let roster = self.roster();
         if let Some(t) = &mut self.thread {
             if t.expire_lease(&roster, now) {

@@ -355,10 +355,84 @@ fn a_busy_bot_refuses_to_start() {
         err.contains("not starting") && err.contains(&format!("pid {}", std::process::id())),
         "{err}"
     );
-    assert!(err.contains("--home"), "{err}");
+    assert!(
+        err.contains("stop it or start this bot with --home DIR (or BOTWHISPER_HOME=DIR)"),
+        "{err}"
+    );
+    assert_eq!(
+        err.matches("--home").count(),
+        1,
+        "the home advice once: {err}"
+    );
     assert!(
         !err.contains("login") && out.is_empty(),
         "no signed-out server: {err}{out}"
     );
     let _ = std::fs::remove_dir_all(&h);
+}
+
+/// A home that belongs to another bot: `connect --bot-name` for a different
+/// name exits 4 before serving (nothing listens at NOWHERE), with one plain
+/// line and no login suggestion.
+#[test]
+fn a_wrong_bot_name_refuses_to_start() {
+    let h = home("wrongbot");
+    let s = fake_bot(&h, "atlas");
+    s.save_bot_name("Atlas").unwrap();
+    let mut child = Command::new(BIN)
+        .args(["connect", "--relay", NOWHERE, "--bot-name", "QA Test 2"])
+        .env("BOTWHISPER_HOME", &h)
+        .env_remove("BOTWHISPER_RELAY")
+        .env_remove("BOTWHISPER_BOT")
+        .env_remove("BOTWHISPER_BOT_NAME")
+        .env_remove("BOTWHISPER_DEV_TOKEN")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let start = std::time::Instant::now();
+    let status = loop {
+        if let Some(st) = child.try_wait().unwrap() {
+            break st;
+        }
+        assert!(
+            start.elapsed().as_secs() < 20,
+            "connect kept running for the wrong bot"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    let mut err = String::new();
+    std::io::Read::read_to_string(child.stderr.as_mut().unwrap(), &mut err).unwrap();
+    let mut out = String::new();
+    std::io::Read::read_to_string(child.stdout.as_mut().unwrap(), &mut out).unwrap();
+    assert_eq!(status.code(), Some(4), "{err}");
+    assert!(
+        err.contains(
+            "this home belongs to bot \"Atlas\"; you asked for \"QA Test 2\". Use --home DIR for a separate bot."
+        ),
+        "{err}"
+    );
+    assert!(
+        !err.contains("login") && out.is_empty(),
+        "no signed-out server, no login hint: {err}{out}"
+    );
+    let _ = std::fs::remove_dir_all(&h);
+}
+
+/// The installer's success message is printed verbatim by cargo-dist (no
+/// format arguments), so it must not contain a `%` placeholder.
+#[test]
+fn installer_success_message_has_no_placeholder() {
+    let toml = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../dist-workspace.toml"
+    ))
+    .unwrap();
+    let line = toml
+        .lines()
+        .find(|l| l.trim_start().starts_with("install-success-msg"))
+        .expect("install-success-msg is set");
+    assert!(!line.contains('%'), "{line}");
+    assert!(line.contains("botwhisper is installed."), "{line}");
 }

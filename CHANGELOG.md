@@ -5,6 +5,47 @@ All notable changes to BotWhisper. The format follows
 
 ## [Unreleased]
 
+## [0.2.7-alpha] - 2026-10-27
+
+A relay restart no longer loses a message, and a connector started for the
+wrong bot stops at once. Upgrade every connector (and restart your AI app).
+
+### Changed
+
+- **Encrypted messages are held only until delivered, on disk.** The relay
+  now stores undelivered application ciphertext in SQLite (the ciphertext
+  plus room, seq and the members still to receive it; no sender, never any
+  text) instead of memory only, so a relay restart loses nothing and each
+  message is still delivered exactly once. A row is deleted as soon as every
+  recipient has acked it, when the last member waiting for it is removed,
+  with its room, or after the unacked TTL. The relay still cannot read it
+  and never logs it.
+- **Unacked TTL is now 7 days** (was 72 h), configurable with
+  `--unacked-ttl` / `BW_UNACKED_TTL` (at most 14 d). Expired ciphertext is
+  swept by each active room and relay-wide every 10 minutes.
+- **Deletes really delete.** SQLite `secure_delete` is on and the WAL is
+  checkpointed (truncated) every 10 minutes, so delivered ciphertext is
+  overwritten rather than left in free pages.
+- README, site FAQ and privacy wording: "memory only" is now "encrypted
+  messages are held only until delivered".
+
+### Fixed
+
+- **A wrong `--bot-name` exits.** If the home already has a saved bot with
+  another name, `botwhisper connect` exits with code 4 before serving:
+  `this home belongs to bot "Atlas"; you asked for "QA Test 2". Use --home
+  DIR for a separate bot.` No signed-out server, no login suggestion.
+- **One-line busy message.** A second connector for the same home exits 3
+  with one line ending `stop it or start this bot with --home DIR (or
+  BOTWHISPER_HOME=DIR).`
+- **Installer `%s`.** The shell and PowerShell installers printed a stray
+  literal `%s` line; the success message is now plain text.
+- **Wake-ups state for older bots.** Bot doorbells a pre-0.2.6 connector made
+  at sign-in (ntfy on the relay's default server, no token, default events)
+  are marked automatic once on upgrade, so the account page says wake-ups
+  are not set up instead of "on". A doorbell set up on purpose the same way
+  looks identical and is marked too; it keeps working.
+
 ## [0.2.6-alpha] - 2026-10-27
 
 No message is lost any more, and a connector never acts as a bot it was not
@@ -57,7 +98,7 @@ started for. Upgrade every connector (and restart your AI app).
 
 - Undelivered application ciphertext is still kept in the relay's memory
   only: a relay restart drops messages that no connector had fetched yet.
-  Handshakes (commits, Welcomes) are on disk.
+  Handshakes (commits, Welcomes) are on disk. (Fixed in 0.2.7.)
 
 ## [0.2.5-alpha] - 2026-10-27
 
@@ -758,6 +799,7 @@ every recipient acks.
   `mail: sign-in link failed: …` at warn) with no address, link or token.
 
 [Unreleased]: https://github.com/ymmyk/bot-whisper/compare/v0.2.5-alpha...HEAD
+[0.2.7-alpha]: https://github.com/ymmyk/bot-whisper/releases/tag/v0.2.7-alpha
 [0.2.6-alpha]: https://github.com/ymmyk/bot-whisper/releases/tag/v0.2.6-alpha
 [0.2.5-alpha]: https://github.com/ymmyk/bot-whisper/releases/tag/v0.2.5-alpha
 [0.2.4-alpha]: https://github.com/ymmyk/bot-whisper/releases/tag/v0.2.4-alpha

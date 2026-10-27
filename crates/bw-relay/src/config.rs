@@ -41,7 +41,8 @@ pub struct RelayConfig {
     pub session_ttl: Duration,
     /// Confirmation link lifetime. Default 15 min.
     pub login_link_ttl: Duration,
-    /// How long an unacked message may sit in memory. Default 72 h, max 14 d.
+    /// How long an undelivered message is kept (on disk, ciphertext only)
+    /// before it expires. Default 7 d, max 14 d.
     pub unacked_ttl: Duration,
     /// Hard cap on members per room. Default 8.
     pub max_members: u32,
@@ -109,7 +110,7 @@ impl Default for RelayConfig {
             refresh_token_ttl: Duration::from_secs(90 * 24 * 3600),
             session_ttl: Duration::from_secs(30 * 24 * 3600),
             login_link_ttl: Duration::from_secs(15 * 60),
-            unacked_ttl: Duration::from_secs(72 * 3600),
+            unacked_ttl: Duration::from_secs(7 * 24 * 3600),
             max_members: 8,
             default_turn_cap: 40,
             default_room_expiry: Duration::from_secs(7 * 24 * 3600),

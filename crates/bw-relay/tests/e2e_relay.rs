@@ -1,7 +1,8 @@
 //! The relay side of end-to-end encrypted rooms, with opaque blobs standing
 //! in for MLS messages: key packages, commits with epoch ordering, Welcomes,
-//! ciphertext fan-out, pending seats, persistence of handshakes across a
-//! restart, and the size and argument checks.
+//! ciphertext fan-out, pending seats, persistence of handshakes and
+//! undelivered ciphertext across a restart (deleted once acked, on member
+//! removal and on expiry), and the size and argument checks.
 
 mod common;
 
@@ -276,14 +277,26 @@ async fn e2e_room_lifecycle_through_the_relay() {
         .await;
     assert_eq!(
         payloads(&f),
-        vec![(
-            "commit".to_string(),
-            "m1".to_string(),
-            "COMMIT-2".to_string()
-        )],
-        "the unacked commit survived the restart; the application ciphertext (memory only) did not"
+        vec![
+            (
+                "commit".to_string(),
+                "m1".to_string(),
+                "COMMIT-2".to_string()
+            ),
+            (
+                "application".to_string(),
+                String::new(),
+                "CT-after-add".to_string()
+            )
+        ],
+        "the unacked commit and the undelivered ciphertext both survived the restart"
     );
     assert_eq!(f["items"][0]["seq"], commit_seq);
+    assert_eq!(f["items"][1]["seq"], app_seq, "same seq after the restart");
+    let f = bob
+        .ok("e2e_fetch", json!({ "room_id": room, "timeout_s": 1 }))
+        .await;
+    assert!(payloads(&f).is_empty(), "delivered once, not again");
     // The seq counter and the open thread survive the restart: a new item
     // never reuses a seq, and the thread is not reset to adhoc-1.
     let st = bob.ok("get_status", json!({ "room_id": room })).await;
@@ -311,7 +324,7 @@ async fn e2e_room_lifecycle_through_the_relay() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|i| i["kind"] == "application")
+        .find(|i| i["kind"] == "application" && i["payload"] == b64("CT-after-restart"))
         .expect("the new message")["seq"]
         .as_u64()
         .unwrap();
@@ -329,6 +342,11 @@ async fn e2e_room_lifecycle_through_the_relay() {
         .ok("e2e_fetch", json!({ "room_id": room, "timeout_s": 1 }))
         .await;
     assert!(payloads(&f).is_empty(), "acked on fetch");
+    assert_eq!(
+        relay.db.count_e2e_messages(Some(&room)).unwrap(),
+        0,
+        "every recipient acked: no ciphertext row is left on disk"
+    );
 
     // Removing a member drops it from every pending set; the removed bot is
     // locked out at the relay and the others are told.
@@ -710,5 +728,170 @@ async fn unconfirmed_welcomes_are_not_joined_and_meta_is_not_a_turn() {
     carol.ok("leave_room", json!({ "room_id": room })).await;
     let st = alice.ok("get_status", json!({ "room_id": room })).await;
     assert_eq!(st["e2e"]["welcoming"], json!([]));
+    relay.shutdown().await;
+}
+
+/// Alice's room with Bob (and Carol) joined and confirmed.
+async fn joined_room(relay: &TestRelay, alice: &Bot, others: &[(&Bot, &str)]) -> String {
+    let room = alice.ok("create_room", json!({})).await["room_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    for (epoch, (bot, member)) in others.iter().enumerate() {
+        bot.ok(
+            "e2e_publish_key_packages",
+            json!({ "key_packages": [b64(&format!("KP-{member}"))] }),
+        )
+        .await;
+        let inv = alice.ok("create_invite", json!({ "room_id": room })).await;
+        bot.ok("join_room", json!({ "invite_url": inv["invite_url"] }))
+            .await;
+        alice
+            .ok(
+                "e2e_claim_key_package",
+                json!({ "room_id": room, "member_id": member }),
+            )
+            .await;
+        alice
+            .ok(
+                "e2e_commit",
+                json!({ "room_id": room, "epoch": epoch, "commit": b64(&format!("C-{member}")),
+                        "welcome": b64(&format!("W-{member}")), "welcome_to": [member], "added": [member] }),
+            )
+            .await;
+        bot.ok(
+            "e2e_fetch",
+            json!({ "room_id": room, "timeout_s": 5, "confirm_welcome": true }),
+        )
+        .await;
+        bot.ok("e2e_confirm_joined", json!({ "room_id": room }))
+            .await;
+    }
+    // Everyone else has the commits too.
+    for (bot, _) in others {
+        bot.ok("e2e_fetch", json!({ "room_id": room, "timeout_s": 1 }))
+            .await;
+    }
+    let _ = relay;
+    room
+}
+
+#[tokio::test]
+async fn undelivered_ciphertext_is_on_disk_until_acked_removed_or_expired() {
+    let relay = TestRelay::start().await;
+    let alice = relay.bot(TOKENS[0]).await;
+    let bob = relay.bot(TOKENS[1]).await;
+    let carol = relay.bot(TOKENS[2]).await;
+    let room = joined_room(&relay, &alice, &[(&bob, "m2"), (&carol, "m3")]).await;
+    assert_eq!(relay.db.count_e2e_messages(Some(&room)).unwrap(), 0);
+
+    // Two messages, nobody fetches; the relay restarts.
+    for ct in ["CT-one", "CT-two"] {
+        alice
+            .ok(
+                "e2e_send",
+                json!({ "room_id": room, "ciphertext": b64(ct) }),
+            )
+            .await;
+    }
+    assert_eq!(relay.db.count_e2e_messages(Some(&room)).unwrap(), 2);
+    drop((alice, bob, carol));
+    let (cfg, db) = relay.shutdown().await;
+    let relay = TestRelay::start_on(cfg, db).await;
+    let alice = relay.bot(TOKENS[0]).await;
+    let bob = relay.bot(TOKENS[1]).await;
+    let carol = relay.bot(TOKENS[2]).await;
+
+    // Bob gets both exactly once; the rows stay for Carol.
+    let f = bob
+        .ok("e2e_fetch", json!({ "room_id": room, "timeout_s": 5 }))
+        .await;
+    let got: Vec<String> = payloads(&f).into_iter().map(|p| p.2).collect();
+    assert_eq!(got, vec!["CT-one", "CT-two"]);
+    let f = bob
+        .ok("e2e_fetch", json!({ "room_id": room, "timeout_s": 1 }))
+        .await;
+    assert!(payloads(&f).is_empty(), "delivered once");
+    assert_eq!(relay.db.count_e2e_messages(Some(&room)).unwrap(), 2);
+
+    // Carol acks the first explicitly: that row is gone, the second stays.
+    let f = carol
+        .ok(
+            "e2e_fetch",
+            json!({ "room_id": room, "timeout_s": 5, "auto_ack": false }),
+        )
+        .await;
+    let first = f["items"][0]["seq"].as_u64().unwrap();
+    carol
+        .ok("e2e_ack", json!({ "room_id": room, "up_to_seq": first }))
+        .await;
+    assert_eq!(relay.db.count_e2e_messages(Some(&room)).unwrap(), 1);
+
+    // Removing Carol, the last one waiting, deletes the second row.
+    alice
+        .ok(
+            "remove_member",
+            json!({ "room_id": room, "member_id": "m3" }),
+        )
+        .await;
+    assert_eq!(
+        relay.db.count_e2e_messages(Some(&room)).unwrap(),
+        0,
+        "a removed member's pending messages are cleared"
+    );
+    assert_eq!(relay.queued(&room).await, 0);
+
+    // The relay-wide sweep deletes ciphertext past the TTL, room loaded or not.
+    alice
+        .ok(
+            "e2e_send",
+            json!({ "room_id": room, "ciphertext": b64("CT-old") }),
+        )
+        .await;
+    assert_eq!(relay.db.count_e2e_messages(Some(&room)).unwrap(), 1);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    assert_eq!(
+        relay.db.expire_e2e_messages(now - 3600).unwrap(),
+        0,
+        "not old yet"
+    );
+    assert_eq!(relay.db.expire_e2e_messages(now + 1).unwrap(), 1);
+    assert_eq!(relay.db.count_e2e_messages(None).unwrap(), 0);
+    relay.shutdown().await;
+}
+
+#[tokio::test]
+async fn undelivered_ciphertext_expires_after_the_ttl() {
+    let mut cfg = test_config();
+    cfg.unacked_ttl = std::time::Duration::from_secs(1);
+    let relay = TestRelay::start_with(cfg).await;
+    let alice = relay.bot(TOKENS[0]).await;
+    let bob = relay.bot(TOKENS[1]).await;
+    let room = joined_room(&relay, &alice, &[(&bob, "m2")]).await;
+    alice
+        .ok(
+            "e2e_send",
+            json!({ "room_id": room, "ciphertext": b64("CT-late") }),
+        )
+        .await;
+    assert_eq!(relay.db.count_e2e_messages(Some(&room)).unwrap(), 1);
+    // The room's sweep (every 200 ms here) drops it once it is 1 s old.
+    let mut gone = false;
+    for _ in 0..40 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        if relay.db.count_e2e_messages(Some(&room)).unwrap() == 0 {
+            gone = true;
+            break;
+        }
+    }
+    assert!(gone, "expired ciphertext is deleted from disk");
+    assert_eq!(relay.queued(&room).await, 0, "and from memory");
+    let f = bob
+        .ok("e2e_fetch", json!({ "room_id": room, "timeout_s": 1 }))
+        .await;
+    assert!(payloads(&f).is_empty());
     relay.shutdown().await;
 }

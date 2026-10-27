@@ -265,7 +265,7 @@ async fn confirm_link_signs_in_once_and_expired_links_fail() {
         .await
         .unwrap();
     assert!(acct.contains("me@example.com"));
-    assert!(acct.contains("end-to-end encrypted and never stored"));
+    assert!(acct.contains("end-to-end encrypted and held only until delivered"));
     assert!(acct.contains(r#"<time datetime=""#));
 
     // Single use.
