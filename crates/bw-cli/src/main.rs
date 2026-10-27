@@ -417,10 +417,16 @@ async fn connect(args: ConnectArgs) -> anyhow::Result<()> {
                             }
                         }
                         Err(e) => {
-                            tracing::warn!(
-                                "botwhisper connect: the stored sign-in is not usable ({e}); the `login` tool starts a new one"
-                            );
-                            gateway.resume_pending_login().await;
+                            if e.downcast_ref::<botwhisper::connect::lock::LockHeld>()
+                                .is_some()
+                            {
+                                tracing::warn!("botwhisper connect: {e}");
+                            } else {
+                                tracing::warn!(
+                                    "botwhisper connect: the stored sign-in is not usable ({e}); the `login` tool starts a new one"
+                                );
+                                gateway.resume_pending_login().await;
+                            }
                         }
                     }
                     gateway

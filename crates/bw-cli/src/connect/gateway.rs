@@ -38,6 +38,7 @@ use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
 use super::{
+    lock::LockHeld,
     login::{self, DevicePoll, DeviceStart},
     relay::RelayClient,
     server::{respond, room_tools, Connector},
@@ -167,6 +168,9 @@ struct Inner {
     peer: StdMutex<Option<Peer<RoleServer>>>,
     /// Why the stored sign-in could not be resumed at startup.
     resume_note: StdMutex<Option<String>>,
+    /// Set while another `botwhisper connect` holds this bot's home: the
+    /// plain sentence to show, instead of any sign-in advice.
+    busy: StdMutex<Option<String>>,
 }
 
 /// The stdio MCP server of `botwhisper connect`. Cheap to clone.
@@ -250,6 +254,7 @@ impl Gateway {
                 login: Mutex::new(LoginState::default()),
                 peer: StdMutex::new(None),
                 resume_note: StdMutex::new(None),
+                busy: StdMutex::new(None),
             }),
         }
     }
@@ -319,12 +324,19 @@ impl Gateway {
             Ok(c) => {
                 *i.connector.write().expect("lock") = Some(c);
                 *i.resume_note.lock().expect("lock") = None;
+                *i.busy.lock().expect("lock") = None;
                 Ok(true)
             }
             Err(e) => {
-                *i.resume_note.lock().expect("lock") = Some(format!(
-                    "The stored sign-in could not be used ({e}). Call `login` to sign in again."
-                ));
+                if let Some(held) = e.downcast_ref::<LockHeld>() {
+                    // Not a sign-in problem: say only who is in the way.
+                    *i.busy.lock().expect("lock") = Some(held.to_string());
+                    *i.resume_note.lock().expect("lock") = None;
+                } else {
+                    *i.resume_note.lock().expect("lock") = Some(format!(
+                        "The stored sign-in could not be used ({e}). Call `login` to sign in again."
+                    ));
+                }
                 Err(e)
             }
         }
@@ -452,9 +464,14 @@ impl Gateway {
                         Step::SignedIn
                     }
                     Err(e) => {
-                        st.last_failure = Some(format!(
-                            "Approved, but finishing the sign-in failed: {e}. Call `login` again."
-                        ));
+                        if let Some(held) = e.downcast_ref::<LockHeld>() {
+                            *self.inner.busy.lock().expect("lock") = Some(held.to_string());
+                            st.last_failure = None;
+                        } else {
+                            st.last_failure = Some(format!(
+                                "Approved, but finishing the sign-in failed: {e}. Call `login` again."
+                            ));
+                        }
                         Step::Failed
                     }
                 }
@@ -471,6 +488,7 @@ impl Gateway {
         let connector = Connector::new(client, Some(signed.store), Some(&i.config)).await?;
         *i.connector.write().expect("lock") = Some(connector);
         *i.resume_note.lock().expect("lock") = None;
+        *i.busy.lock().expect("lock") = None;
         tracing::info!(bot = %signed.agent_id, "botwhisper connect: signed in through device login");
         self.notify_tools_changed().await;
         Ok(())
@@ -835,6 +853,14 @@ impl ServerHandler for Gateway {
                 Ok(response)
             }
             None => {
+                let busy = self.inner.busy.lock().expect("lock").clone();
+                if let Some(message) = busy {
+                    return Ok(CallToolResult::structured_error(json!({
+                        "error": "CONNECTOR_BUSY",
+                        "message": message,
+                    }))
+                    .into());
+                }
                 let (detail, note) = {
                     let st = self.inner.login.lock().await;
                     (

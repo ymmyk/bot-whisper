@@ -33,13 +33,13 @@ impl std::fmt::Display for LockHeld {
         match self.pid {
             Some(pid) => write!(
                 f,
-                "another botwhisper connect is already running for this bot (pid {pid}). \
-                 Stop it or use a different BOTWHISPER_HOME"
+                "another botwhisper connect is running for this home (pid {pid}); \
+                 stop it or use a different BOTWHISPER_HOME"
             ),
             None => write!(
                 f,
-                "another botwhisper connect is already running for this bot. \
-                 Stop it or use a different BOTWHISPER_HOME"
+                "another botwhisper connect is running for this home; \
+                 stop it or use a different BOTWHISPER_HOME"
             ),
         }
     }
@@ -126,8 +126,8 @@ mod tests {
         assert_eq!(
             err.to_string(),
             format!(
-                "another botwhisper connect is already running for this bot (pid {}). \
-                 Stop it or use a different BOTWHISPER_HOME",
+                "another botwhisper connect is running for this home (pid {}); \
+                 stop it or use a different BOTWHISPER_HOME",
                 std::process::id()
             )
         );

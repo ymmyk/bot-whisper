@@ -692,7 +692,7 @@ async fn second_process_is_refused_and_join_survives_a_restart() {
             .expect("second connector refused");
         let msg = err.to_string();
         assert!(
-            msg.contains("another botwhisper connect is already running for this bot")
+            msg.contains("another botwhisper connect is running for this home")
                 && msg.contains("BOTWHISPER_HOME"),
             "{msg}"
         );
@@ -742,6 +742,262 @@ async fn second_process_is_refused_and_join_survives_a_restart() {
         )
         .await;
         assert_eq!(got["messages"][0]["content"], "hello after restart");
+        let _ = std::fs::remove_dir_all(&dir);
+        relay.shutdown().await;
+    })
+    .await
+    .expect("the test must not hang");
+}
+
+/// Stop a served connector and wait until its config-dir lock is released.
+async fn stop(svc: rmcp::service::RunningService<rmcp::RoleClient, ()>) {
+    svc.cancel().await.ok();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+}
+
+/// The connector's group state survives a restart for BOTH roles: after the
+/// owner restarts it can send and receive; after the member restarts it can
+/// receive what was sent while it was down and send; list_rooms stays active.
+#[tokio::test]
+async fn restart_keeps_rooms_working_for_owner_and_member() {
+    tokio::time::timeout(Duration::from_secs(120), async {
+        let relay = TestRelay::start().await;
+        let dir = tmp_dir("restart-rooms");
+        let store = |who: &str| BotStore::new(&dir, &relay.base(), who);
+        let client = |t: &str| RelayClient::with_token(&relay.base(), t);
+        let start = |t: &'static str, who: &'static str| {
+            let c = client(t);
+            let st = store(who);
+            async move { serve_connector(Connector::new(c, Some(st), None).await.unwrap()).await }
+        };
+
+        let alice = start(TOKENS[0], "alice").await;
+        let bob = start(TOKENS[1], "bob").await;
+        let created = call(&alice, "create_room", json!({ "title": "Persist" })).await;
+        let room = created["room_id"].as_str().unwrap().to_string();
+        let inv = call(&alice, "create_invite", json!({ "room_id": room })).await;
+        call(
+            &bob,
+            "join_room",
+            json!({ "invite_url": inv["invite_url"] }),
+        )
+        .await;
+        call(
+            &alice,
+            "wait_for_message",
+            json!({ "room_id": room, "timeout_s": 3 }),
+        )
+        .await;
+        call(
+            &bob,
+            "wait_for_message",
+            json!({ "room_id": room, "timeout_s": 3 }),
+        )
+        .await;
+        call(
+            &alice,
+            "send_message",
+            json!({ "room_id": room, "text": "before" }),
+        )
+        .await;
+        let got = call(
+            &bob,
+            "wait_for_message",
+            json!({ "room_id": room, "timeout_s": 5 }),
+        )
+        .await;
+        assert_eq!(got["messages"][0]["content"], "before", "{got}");
+
+        // ---- the owner restarts: restart-then-send, restart-then-receive ----
+        stop(alice).await;
+        let alice = start(TOKENS[0], "alice").await;
+        let rooms = call(&alice, "list_rooms", json!({})).await;
+        assert_eq!(rooms["rooms"][0]["e2e_state"], "active", "{rooms}");
+        assert!(rooms["rooms"][0].get("readable").is_none(), "{rooms}");
+        let sent = call(
+            &alice,
+            "send_message",
+            json!({ "room_id": room, "text": "owner after restart" }),
+        )
+        .await;
+        assert_eq!(sent["delivered_to"], json!(["m2"]), "{sent}");
+        let got = call(
+            &bob,
+            "wait_for_message",
+            json!({ "room_id": room, "timeout_s": 5 }),
+        )
+        .await;
+        assert_eq!(
+            got["messages"][0]["content"], "owner after restart",
+            "{got}"
+        );
+        call(
+            &bob,
+            "send_message",
+            json!({ "room_id": room, "text": "member to restarted owner" }),
+        )
+        .await;
+        let got = call(
+            &alice,
+            "wait_for_message",
+            json!({ "room_id": room, "timeout_s": 5 }),
+        )
+        .await;
+        assert_eq!(
+            got["messages"][0]["content"], "member to restarted owner",
+            "{got}"
+        );
+
+        // ---- the member restarts, with a message sent while it is down ----
+        stop(bob).await;
+        call(
+            &alice,
+            "send_message",
+            json!({ "room_id": room, "text": "while bob was down" }),
+        )
+        .await;
+        let bob = start(TOKENS[1], "bob").await;
+        let rooms = call(&bob, "list_rooms", json!({})).await;
+        assert_eq!(rooms["rooms"][0]["e2e_state"], "active", "{rooms}");
+        let got = call(
+            &bob,
+            "wait_for_message",
+            json!({ "room_id": room, "timeout_s": 5 }),
+        )
+        .await;
+        assert_eq!(got["messages"][0]["content"], "while bob was down", "{got}");
+        let sent = call(
+            &bob,
+            "send_message",
+            json!({ "room_id": room, "text": "member after restart" }),
+        )
+        .await;
+        assert!(sent["error"].is_null(), "{sent}");
+        let got = call(
+            &alice,
+            "wait_for_message",
+            json!({ "room_id": room, "timeout_s": 5 }),
+        )
+        .await;
+        assert_eq!(
+            got["messages"][0]["content"], "member after restart",
+            "{got}"
+        );
+
+        // The saved files are owner-only.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let s = store("bob");
+            for f in [s.keystore_path(), s.rooms_path()] {
+                assert_eq!(
+                    std::fs::metadata(&f).unwrap().permissions().mode() & 0o777,
+                    0o600,
+                    "{f:?}"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        relay.shutdown().await;
+    })
+    .await
+    .expect("the test must not hang");
+}
+
+/// When group state is truly missing (a home from 0.2.3, or a fresh home),
+/// the room is `needs_rejoin`, unreadable, and every error says how to
+/// recover: a fresh invite and join_room, never wait_for_message.
+#[tokio::test]
+async fn a_room_without_saved_keys_needs_a_rejoin() {
+    tokio::time::timeout(Duration::from_secs(90), async {
+        let relay = TestRelay::start().await;
+        let dir = tmp_dir("unreadable");
+        let store = |who: &str| BotStore::new(&dir, &relay.base(), who);
+        let client = |t: &str| RelayClient::with_token(&relay.base(), t);
+
+        let alice =
+            serve_connector(Connector::new(client(TOKENS[0]), None, None).await.unwrap()).await;
+        let bob = serve_connector(
+            Connector::new(client(TOKENS[1]), Some(store("bob")), None)
+                .await
+                .unwrap(),
+        )
+        .await;
+        let created = call(&alice, "create_room", json!({ "title": "Keys" })).await;
+        let room = created["room_id"].as_str().unwrap().to_string();
+        let inv = call(&alice, "create_invite", json!({ "room_id": room })).await;
+        call(
+            &bob,
+            "join_room",
+            json!({ "invite_url": inv["invite_url"] }),
+        )
+        .await;
+        call(
+            &alice,
+            "wait_for_message",
+            json!({ "room_id": room, "timeout_s": 3 }),
+        )
+        .await;
+        call(
+            &bob,
+            "wait_for_message",
+            json!({ "room_id": room, "timeout_s": 3 }),
+        )
+        .await;
+        call(
+            &alice,
+            "send_message",
+            json!({ "room_id": room, "text": "hi" }),
+        )
+        .await;
+
+        // Bob's home is replaced by an empty one (what an old 0.2.3 home looks like).
+        stop(bob).await;
+        let bob2 = serve_connector(
+            Connector::new(client(TOKENS[1]), Some(store("bob-empty")), None)
+                .await
+                .unwrap(),
+        )
+        .await;
+        let rooms = call(&bob2, "list_rooms", json!({})).await;
+        let r = &rooms["rooms"][0];
+        assert_eq!(r["e2e_state"], "needs_rejoin", "{rooms}");
+        assert_eq!(r["relay_e2e_state"], "active");
+        assert_eq!(r["readable"], false);
+        assert_eq!(r["pending_items_for_you"], 0, "{rooms}");
+        let hint = r["hint"].as_str().unwrap();
+        assert!(
+            hint.contains("fresh invite") && hint.contains("join_room"),
+            "{rooms}"
+        );
+        assert!(!hint.contains("wait_for_message"), "{hint}");
+        let st = call(&bob2, "get_status", json!({ "room_id": room })).await;
+        assert_eq!(st["local"]["state"], "needs_rejoin", "{st}");
+        let w = call(
+            &bob2,
+            "wait_for_message",
+            json!({ "room_id": room, "timeout_s": 3 }),
+        )
+        .await;
+        assert_eq!(w["timed_out"], false, "{w}");
+        assert_eq!(w["readable"], false, "{w}");
+        let warn = w["warnings"][0].as_str().unwrap();
+        assert!(
+            warn.contains("join_room") && !warn.contains("wait_for_message"),
+            "{w}"
+        );
+        let sent = call(
+            &bob2,
+            "send_message",
+            json!({ "room_id": room, "text": "x" }),
+        )
+        .await;
+        let msg = sent["message"].as_str().unwrap_or_default();
+        assert!(
+            msg.contains("fresh invite") && msg.contains("join_room"),
+            "{sent}"
+        );
+        assert!(!msg.contains("wait_for_message"), "{sent}");
         let _ = std::fs::remove_dir_all(&dir);
         relay.shutdown().await;
     })

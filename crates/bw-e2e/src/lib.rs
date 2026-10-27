@@ -166,8 +166,23 @@ impl Identity {
         Ok(Group { group })
     }
 
-    /// The private halves of every key package published so far (and the
-    /// rest of the in-memory key store), to be saved 0600 next to the
+    /// Reload a group from the key store (after
+    /// [`import_keystore`](Self::import_keystore)); `None` when the store
+    /// holds no state for this room.
+    pub fn load_group(&self, room_id: &str) -> Result<Option<Group>> {
+        let id = GroupId::from_slice(room_id.as_bytes());
+        let group = MlsGroup::load(self.provider.storage(), &id).map_err(mls)?;
+        Ok(group.map(|group| Group { group }))
+    }
+
+    /// Delete a group's saved state (after leaving a room).
+    pub fn forget_group(&self, group: &mut Group) {
+        let _ = group.group.delete(self.provider.storage());
+    }
+
+    /// The whole key store: the private halves of every key package
+    /// published so far, and every group's state (tree, epoch secrets, message
+    /// ratchets), to be saved 0600 next to the
     /// identity. A process that restarts loads them back with
     /// [`import_keystore`](Self::import_keystore), so a Welcome built on a
     /// key package an earlier run published can still be opened.
@@ -443,6 +458,72 @@ mod tests {
         assert_eq!(inviter.agent_id, "acct1:alice");
         assert_eq!(g_bob.epoch(), g.epoch());
         assert!(restarted.import_keystore(b"nope").is_err());
+    }
+
+    /// Group state survives a restart for both roles: the owner (who added a
+    /// member) and the member (who joined from a Welcome) save the key store,
+    /// restart, reload the group and keep sending and receiving, including
+    /// messages sent while they were down.
+    #[test]
+    fn group_state_survives_a_restart_for_owner_and_member() {
+        let alice = Identity::new("acct1:alice").unwrap();
+        let bob = Identity::new("acct2:bob").unwrap();
+        let mut ga = alice.create_group("room-r").unwrap();
+        let (_c, welcome) = ga.add_member(&alice, &bob.key_package().unwrap()).unwrap();
+        let (mut gb, _) = bob.join(&welcome).unwrap();
+        let m1 = ga.encrypt(&alice, b"one").unwrap();
+        assert!(matches!(
+            gb.process(&bob, &m1).unwrap(),
+            Event::Message { .. }
+        ));
+        let b1 = gb.encrypt(&bob, b"bob one").unwrap();
+        assert!(matches!(
+            ga.process(&alice, &b1).unwrap(),
+            Event::Message { .. }
+        ));
+        // Sent while Bob is down.
+        let while_down = ga.encrypt(&alice, b"two").unwrap();
+
+        // Both processes exit; each saves its identity and key store.
+        let (a_id, a_keys) = (alice.to_bytes(), alice.export_keystore());
+        let (b_id, b_keys) = (bob.to_bytes(), bob.export_keystore());
+        drop((ga, gb, alice, bob));
+
+        let alice = Identity::from_bytes(&a_id).unwrap();
+        alice.import_keystore(&a_keys).unwrap();
+        let bob = Identity::from_bytes(&b_id).unwrap();
+        bob.import_keystore(&b_keys).unwrap();
+        assert!(Identity::from_bytes(&a_id)
+            .unwrap()
+            .load_group("room-r")
+            .unwrap()
+            .is_none());
+        let mut ga = alice.load_group("room-r").unwrap().expect("owner group");
+        let mut gb = bob.load_group("room-r").unwrap().expect("member group");
+        assert_eq!(ga.members(), gb.members());
+
+        // Restart then receive (the message sent while down), then send.
+        match gb.process(&bob, &while_down).unwrap() {
+            Event::Message { plaintext, .. } => assert_eq!(plaintext, b"two"),
+            e => panic!("{e:?}"),
+        }
+        let m3 = gb.encrypt(&bob, b"bob after restart").unwrap();
+        match ga.process(&alice, &m3).unwrap() {
+            Event::Message { sender, plaintext } => {
+                assert_eq!(sender, "acct2:bob");
+                assert_eq!(plaintext, b"bob after restart");
+            }
+            e => panic!("{e:?}"),
+        }
+        let m4 = ga.encrypt(&alice, b"alice after restart").unwrap();
+        assert!(matches!(
+            gb.process(&bob, &m4).unwrap(),
+            Event::Message { .. }
+        ));
+
+        // Forgetting a group removes its saved state.
+        alice.forget_group(&mut ga);
+        assert!(alice.load_group("room-r").unwrap().is_none());
     }
 
     /// Three bots, two of them on the same account: create, add, exchange,

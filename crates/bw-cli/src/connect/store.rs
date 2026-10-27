@@ -29,6 +29,17 @@ pub struct CachedDoorbell {
     pub has_token: bool,
 }
 
+/// Saved per room, next to the group state in `keystore.json`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoomMeta {
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub me: String,
+    #[serde(default)]
+    pub owner: bool,
+}
+
 /// The host part of a relay URL, used as a directory name.
 pub fn relay_host(relay_url: &str) -> String {
     reqwest::Url::parse(relay_url)
@@ -94,6 +105,10 @@ impl BotStore {
     pub fn keystore_path(&self) -> PathBuf {
         self.dir.join("keystore.json")
     }
+    /// Per-room facts (title, own seat, ownership) next to the saved groups.
+    pub fn rooms_path(&self) -> PathBuf {
+        self.dir.join("rooms.json")
+    }
     pub fn doorbell_path(&self) -> PathBuf {
         self.dir.join("doorbell.json")
     }
@@ -140,6 +155,25 @@ impl BotStore {
             }
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// What the connector remembers about each room it holds group state
+    /// for (the group itself is in `keystore.json`).
+    pub fn load_room_meta(&self) -> std::collections::BTreeMap<String, RoomMeta> {
+        std::fs::read(self.rooms_path())
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save_room_meta(
+        &self,
+        rooms: &std::collections::BTreeMap<String, RoomMeta>,
+    ) -> std::io::Result<()> {
+        paths::write_private(
+            &self.rooms_path(),
+            &serde_json::to_vec(rooms).expect("json"),
+        )
     }
 
     pub fn load_doorbell(&self) -> Option<CachedDoorbell> {

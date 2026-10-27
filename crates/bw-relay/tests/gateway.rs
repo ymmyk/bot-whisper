@@ -311,7 +311,7 @@ async fn gated_inner() {
         .expect_err("second process is refused");
     assert!(
         err.to_string()
-            .contains("another botwhisper connect is already running for this bot"),
+            .contains("another botwhisper connect is running for this home"),
         "{err}"
     );
     assert!(err.to_string().contains("BOTWHISPER_HOME"), "{err}");
@@ -516,7 +516,14 @@ async fn a_login_finished_elsewhere_is_picked_up_on_the_next_call() {
             .unwrap()
             .to_string();
         assert!(
-            msg.contains("another botwhisper connect is already running for this bot"),
+            msg.contains("another botwhisper connect is running for this home"),
+            "{msg}"
+        );
+        assert!(
+            msg.starts_with("another botwhisper connect is running for this home (pid ")
+                && msg.ends_with("or use a different BOTWHISPER_HOME")
+                && !msg.contains("stored sign-in")
+                && !msg.contains("login"),
             "{msg}"
         );
         // Once it is gone, the first connector (which never polled) just works.

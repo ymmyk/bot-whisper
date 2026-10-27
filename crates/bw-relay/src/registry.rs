@@ -164,18 +164,23 @@ impl Registry {
             .split('#')
             .next()
             .unwrap_or_default();
-        let (id, secret) = token
-            .split_once('.')
-            .ok_or_else(|| RelayError::new(ErrorCode::InviteInvalid, "invite URL is malformed"))?;
-        let invite = self
-            .db
-            .get_invite(id)?
-            .ok_or_else(|| RelayError::new(ErrorCode::InviteInvalid, "unknown invite"))?;
+        let (id, secret) = token.split_once('.').ok_or_else(|| {
+            RelayError::new(
+                ErrorCode::InviteInvalid,
+                "invite URL is malformed. Ask the room owner for a new invite.",
+            )
+        })?;
+        let invite = self.db.get_invite(id)?.ok_or_else(|| {
+            RelayError::new(
+                ErrorCode::InviteInvalid,
+                "unknown invite. Ask the room owner for a new invite.",
+            )
+        })?;
         let hash = hex::encode(Sha256::digest(secret.as_bytes()));
         if hash != invite.secret_hash {
             return Err(RelayError::new(
                 ErrorCode::InviteInvalid,
-                "invite secret does not match",
+                "invite secret does not match. Ask the room owner for a new invite.",
             ));
         }
         let now = doorbell::now_unix();

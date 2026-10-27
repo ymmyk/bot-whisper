@@ -31,7 +31,7 @@ use tokio::sync::Mutex;
 use super::{
     lock::ConfigLock,
     relay::{tool_error_code, RelayClient},
-    store::{BotStore, CachedDoorbell},
+    store::{BotStore, CachedDoorbell, RoomMeta},
     trust::{Observation, TrustStore},
 };
 
@@ -98,6 +98,31 @@ fn join_failure(detail: &str) -> String {
         format!("could not join the room: {detail}. Ask for a fresh invite. This connector has left the room.")
     }
 }
+
+/// What a room looks like from this connector when it holds no group state
+/// for it: `(e2e_state, hint)`, or `None` when the connector can read it.
+/// `relay_state` is the seat state the relay reports (`pending`,
+/// `welcoming` or `active`). Only a Welcome that is really waiting
+/// (`pending`/`welcoming`) is worth a `wait_for_message`; an active seat
+/// with no keys here can only be recovered with a fresh invite.
+pub(crate) fn unreadable_view(
+    has_group: bool,
+    relay_state: &str,
+) -> Option<(&'static str, &'static str)> {
+    if has_group {
+        return None;
+    }
+    match relay_state {
+        "pending" | "welcoming" => Some((
+            "pending",
+            "Waiting to be added. Keep calling wait_for_message; if nothing arrives, ask the room owner for a fresh invite.",
+        )),
+        _ => Some(("needs_rejoin", REJOIN_HINT)),
+    }
+}
+
+/// How to recover a room this connector has no keys for.
+pub(crate) const REJOIN_HINT: &str = "This connector has no keys for this room (its saved state is missing). Ask the room owner for a fresh invite and call join_room with it.";
 
 /// The connector. Cheap to clone (one instance per MCP session).
 #[derive(Clone)]
@@ -388,6 +413,11 @@ impl Connector {
             agent_id,
             _lock: lock,
         };
+        // Reload the rooms this bot was in before the restart.
+        {
+            let mut st = c.state.lock().await;
+            c.load_saved_rooms(&mut st);
+        }
         // Replace whatever earlier runs left on the relay with fresh key
         // packages whose private halves this process (and keystore.json) holds.
         c.top_up_key_packages(true).await?;
@@ -425,8 +455,85 @@ impl Connector {
         Ok(())
     }
 
-    /// Save the key store (0600) so a restart can open Welcomes built on
-    /// key packages this run published.
+    /// Save which rooms we hold and their titles / our seat (0600, atomic).
+    fn persist_rooms(&self, st: &State) {
+        if let Some(s) = &self.store {
+            let meta: std::collections::BTreeMap<String, RoomMeta> = st
+                .rooms
+                .iter()
+                .map(|(id, r)| {
+                    (
+                        id.clone(),
+                        RoomMeta {
+                            title: r.title.clone(),
+                            me: r.me.clone(),
+                            owner: r.owner,
+                        },
+                    )
+                })
+                .collect();
+            if let Err(e) = s.save_room_meta(&meta) {
+                tracing::warn!("could not save rooms.json: {e}");
+            }
+        }
+    }
+
+    /// Reload every saved group (after a restart).
+    fn load_saved_rooms(&self, st: &mut State) {
+        let Some(s) = &self.store else { return };
+        for (id, meta) in s.load_room_meta() {
+            match self.identity.load_group(&id) {
+                Ok(Some(group)) => {
+                    st.rooms.insert(
+                        id,
+                        RoomState {
+                            group,
+                            title: meta.title,
+                            me: meta.me,
+                            owner: meta.owner,
+                        },
+                    );
+                }
+                Ok(None) => tracing::warn!("no saved group state for room {id}"),
+                Err(e) => tracing::warn!("could not reload room {id}: {e}"),
+            }
+        }
+    }
+
+    /// Forget a room's keys here (left or closed).
+    fn forget_room(&self, st: &mut State, room_id: &str) {
+        if let Some(mut r) = st.rooms.remove(room_id) {
+            self.identity.forget_group(&mut r.group);
+        }
+        self.persist_rooms(st);
+        self.persist_keys();
+    }
+
+    /// The error for acting on a room we hold no group for. Points at
+    /// `wait_for_message` only when a Welcome is actually pending.
+    async fn no_group_error(&self, room_id: &str) -> anyhow::Error {
+        let relay_state = match self
+            .relay
+            .call("get_status", json!({ "room_id": room_id }))
+            .await
+        {
+            Ok(v) => v["you"]["e2e_state"]
+                .as_str()
+                .unwrap_or("active")
+                .to_string(),
+            Err(_) => "active".to_string(),
+        };
+        match unreadable_view(false, &relay_state) {
+            Some(("pending", _)) => anyhow::anyhow!(
+                "you are not in this room's group yet: waiting for the owner to add you; call wait_for_message"
+            ),
+            _ => anyhow::anyhow!("{REJOIN_HINT}"),
+        }
+    }
+
+    /// Save the key store (0600, atomic): the key packages this run
+    /// published and every group's state, so a restart can open Welcomes and
+    /// carry on in its rooms.
     fn persist_keys(&self) {
         if let Some(s) = &self.store {
             if let Err(e) =
@@ -468,6 +575,7 @@ impl Connector {
         let seats = fetched["members"].clone();
         let mut messages = Vec::new();
         let items = fetched["items"].as_array().cloned().unwrap_or_default();
+        let had_items = !items.is_empty();
         let mut st = self.state.lock().await;
         let mut files_seen = Vec::new();
         for item in items {
@@ -516,6 +624,7 @@ impl Connector {
                             owner: false,
                         },
                     );
+                    self.persist_rooms(&st);
                     // The Welcome opened: only now does the relay count us as joined.
                     if let Err(e) = self
                         .relay
@@ -593,6 +702,11 @@ impl Connector {
         }
         for f in files_seen {
             st.files.insert(f.file.blob_id.clone(), f);
+        }
+        if had_items {
+            // Application messages advance the message ratchets: save them.
+            self.persist_rooms(&st);
+            self.persist_keys();
         }
         let warnings = match st.rooms.get(room_id) {
             Some(r) => self.audit_keys(room_id, &r.group, &seats).await,
@@ -734,6 +848,7 @@ impl Connector {
             let kp = B64.decode(kp["key_package"].as_str().unwrap_or_default())?;
             let epoch = r.group.epoch();
             let (commit, welcome) = r.group.add_member(&self.identity, &kp)?;
+            self.persist_keys();
             self.relay
                 .call(
                     "e2e_commit",
@@ -750,6 +865,7 @@ impl Connector {
                     file: None,
                 })?;
                 let ct = r.group.encrypt(&self.identity, &meta)?;
+                self.persist_keys();
                 self.relay
                     .call(
                         "e2e_send",
@@ -775,6 +891,35 @@ impl Connector {
                     .collect()
             })
             .unwrap_or_default())
+    }
+
+    /// The relay's seat state is not enough: a room is only readable here
+    /// when this connector holds its group. Rewrite `e2e_state` for rooms it
+    /// does not, keep the relay's word in `relay_e2e_state`, and stop
+    /// counting their queued items as readable.
+    async fn mark_unreadable(&self, list: &mut Value) {
+        let st = self.state.lock().await;
+        let Some(rooms) = list["rooms"].as_array_mut() else {
+            return;
+        };
+        for r in rooms {
+            let Some(id) = r["room_id"].as_str().map(str::to_string) else {
+                continue;
+            };
+            let relay_state = r["e2e_state"].as_str().unwrap_or("active").to_string();
+            let Some((state, hint)) = unreadable_view(st.rooms.contains_key(&id), &relay_state)
+            else {
+                continue;
+            };
+            r["relay_e2e_state"] = json!(relay_state);
+            r["e2e_state"] = json!(state);
+            r["readable"] = json!(false);
+            r["hint"] = json!(hint);
+            if relay_state == "active" {
+                r["unreadable_items"] = r["pending_items_for_you"].take();
+                r["pending_items_for_you"] = json!(0);
+            }
+        }
     }
 
     // ----- tools -----
@@ -829,15 +974,20 @@ impl Connector {
                 let created = self.relay.call("create_room", args).await?;
                 let room_id = created["room_id"].as_str().unwrap_or_default().to_string();
                 let group = self.identity.create_group(&room_id)?;
-                self.state.lock().await.rooms.insert(
-                    room_id.clone(),
-                    RoomState {
-                        group,
-                        title: Some(a.title.clone()),
-                        me: created["member_id"].as_str().unwrap_or("m1").to_string(),
-                        owner: true,
-                    },
-                );
+                {
+                    let mut st = self.state.lock().await;
+                    st.rooms.insert(
+                        room_id.clone(),
+                        RoomState {
+                            group,
+                            title: Some(a.title.clone()),
+                            me: created["member_id"].as_str().unwrap_or("m1").to_string(),
+                            owner: true,
+                        },
+                    );
+                    self.persist_rooms(&st);
+                    self.persist_keys();
+                }
                 Ok(json!({
                     "room_id": room_id,
                     "title": a.title,
@@ -968,7 +1118,8 @@ impl Connector {
                 self.add_pending_joiners(&a.room_id).await?;
                 let mut st = self.state.lock().await;
                 let Some(r) = st.rooms.get_mut(&a.room_id) else {
-                    anyhow::bail!("you are not in this room's group yet (pending_join or not a member); call wait_for_message");
+                    drop(st);
+                    return Err(self.no_group_error(&a.room_id).await);
                 };
                 let inner = serde_json::to_vec(&Inner {
                     v: 1,
@@ -979,6 +1130,8 @@ impl Connector {
                 })?;
                 let ct = r.group.encrypt(&self.identity, &inner)?;
                 let epoch = r.group.epoch();
+                // Save the advanced ratchet before the ciphertext leaves.
+                self.persist_keys();
                 drop(st);
                 let mut args = json!({ "room_id": a.room_id, "ciphertext": B64.encode(ct) });
                 if let Some(t) = &a.turn {
@@ -1124,12 +1277,41 @@ impl Connector {
                 if rooms.is_empty() {
                     anyhow::bail!("you are in no encrypted room");
                 }
+                // Rooms the relay calls active but this connector holds no
+                // group for can never be read here: say so instead of
+                // returning an empty, healthy-looking result.
+                let mut out = Vec::new();
+                let mut any = false;
+                let mut rooms = rooms;
+                let missing: Vec<String> = {
+                    let st = self.state.lock().await;
+                    rooms.iter().filter(|r| !st.rooms.contains_key(*r)).cloned().collect()
+                };
+                if !missing.is_empty() {
+                    let mut list = self.relay.call("list_rooms", json!({})).await?;
+                    self.mark_unreadable(&mut list).await;
+                    for m in list["rooms"].as_array().cloned().unwrap_or_default() {
+                        let id = m["room_id"].as_str().unwrap_or_default().to_string();
+                        if !missing.contains(&id) || m["relay_e2e_state"] != "active" {
+                            continue;
+                        }
+                        rooms.retain(|r| r != &id);
+                        any = true;
+                        out.push(json!({
+                            "room_id": id,
+                            "messages": [],
+                            "events": [],
+                            "closed": false,
+                            "e2e_state": m["e2e_state"],
+                            "readable": false,
+                            "warnings": [m["hint"]],
+                        }));
+                    }
+                }
                 let mut added_all = Vec::new();
                 for r in &rooms {
                     added_all.extend(self.add_pending_joiners(r).await?);
                 }
-                let mut out = Vec::new();
-                let mut any = false;
                 // One long poll per room, concurrently.
                 let polls = rooms.iter().map(|r| {
                     let c = self.clone();
@@ -1171,14 +1353,19 @@ impl Connector {
         respond(
             async {
                 let mut v = match &a.room_id {
-                    Some(r) => self.relay.call("get_status", json!({ "room_id": r })).await?,
+                    Some(r) => {
+                        self.relay
+                            .call("get_status", json!({ "room_id": r }))
+                            .await?
+                    }
                     None => self.relay.call("get_status", json!({})).await?,
                 };
                 if let Some(r) = &a.room_id {
                     let st = self.state.lock().await;
                     if let Some(room) = st.rooms.get(r) {
                         v["title"] = json!(room.title);
-                        v["local"] = json!({ "epoch": room.group.epoch(), "members": room.group.members() });
+                        v["local"] =
+                            json!({ "epoch": room.group.epoch(), "members": room.group.members() });
                         let seats = v["members"].clone();
                         let warnings = self.audit_keys(r, &room.group, &seats).await;
                         let trust = self.trust.lock().await;
@@ -1197,7 +1384,19 @@ impl Connector {
                             v["warnings"] = json!(warnings);
                         }
                     } else {
-                        v["local"] = json!({ "state": if st.pending.contains_key(r) { "pending_join" } else { "no keys for this room" } });
+                        let relay_state = v["you"]["e2e_state"]
+                            .as_str()
+                            .unwrap_or("active")
+                            .to_string();
+                        v["local"] = match unreadable_view(false, &relay_state) {
+                            Some(_) if st.pending.contains_key(r) => {
+                                json!({ "state": "pending_join" })
+                            }
+                            Some((state, hint)) => {
+                                json!({ "state": state, "readable": false, "hint": hint })
+                            }
+                            None => json!({ "state": "no keys for this room" }),
+                        };
                     }
                 }
                 Ok(v)
@@ -1268,7 +1467,14 @@ impl Connector {
         description = "Rooms this bot belongs to, with your member id."
     )]
     async fn list_rooms(&self) -> Result<CallToolResult, ErrorData> {
-        respond(self.relay.call("list_rooms", json!({})).await)
+        respond(
+            async {
+                let mut v = self.relay.call("list_rooms", json!({})).await?;
+                self.mark_unreadable(&mut v).await;
+                Ok(v)
+            }
+            .await,
+        )
     }
 
     #[tool(
@@ -1298,6 +1504,7 @@ impl Connector {
                     if r.group.members().iter().any(|m| m == &target_agent) {
                         let epoch = r.group.epoch();
                         let commit = r.group.remove_member(&self.identity, &target_agent)?;
+                        self.persist_keys();
                         self.relay
                             .call("e2e_commit", json!({ "room_id": a.room_id, "epoch": epoch, "commit": B64.encode(commit) }))
                             .await?;
@@ -1324,7 +1531,7 @@ impl Connector {
                     .call("leave_room", json!({ "room_id": a.room_id }))
                     .await?;
                 let mut st = self.state.lock().await;
-                st.rooms.remove(&a.room_id);
+                self.forget_room(&mut st, &a.room_id);
                 st.pending.remove(&a.room_id);
                 Ok(v)
             }
@@ -1346,7 +1553,10 @@ impl Connector {
                     .relay
                     .call("close_room", json!({ "room_id": a.room_id }))
                     .await?;
-                self.state.lock().await.rooms.remove(&a.room_id);
+                {
+                    let mut st = self.state.lock().await;
+                    self.forget_room(&mut st, &a.room_id);
+                }
                 Ok(v)
             }
             .await,
@@ -1435,7 +1645,8 @@ impl Connector {
         {
             let st = self.state.lock().await;
             if !st.rooms.contains_key(&a.room_id) {
-                anyhow::bail!("you are not in this room's group yet (pending_join or not a member); call wait_for_message");
+                drop(st);
+                return Err(self.no_group_error(&a.room_id).await);
             }
         }
 
@@ -1495,9 +1706,11 @@ impl Connector {
         })?;
         let mut st = self.state.lock().await;
         let Some(r) = st.rooms.get_mut(&a.room_id) else {
-            anyhow::bail!("you are not in this room's group yet");
+            drop(st);
+            return Err(self.no_group_error(&a.room_id).await);
         };
         let ct = r.group.encrypt(&self.identity, &inner)?;
+        self.persist_keys();
         drop(st);
         let sent = self
             .relay
@@ -1673,5 +1886,29 @@ impl ServerHandler for Connector {
                 agent = self.agent_id,
                 relay = self.relay.relay,
             ))
+    }
+}
+
+#[cfg(test)]
+mod unreadable_tests {
+    use super::{unreadable_view, REJOIN_HINT};
+
+    #[test]
+    fn rooms_without_a_group_are_never_active() {
+        // Readable: nothing to say.
+        assert_eq!(unreadable_view(true, "active"), None);
+        // Relay says active but this connector has no keys: rejoin, and the
+        // hint never sends the agent to wait_for_message.
+        let (s, h) = unreadable_view(false, "active").unwrap();
+        assert_eq!(s, "needs_rejoin");
+        assert_eq!(h, REJOIN_HINT);
+        assert!(h.contains("fresh invite") && h.contains("join_room"));
+        assert!(!h.contains("wait_for_message"));
+        // A Welcome that is really pending is a legitimate wait.
+        for st in ["pending", "welcoming"] {
+            let (s, h) = unreadable_view(false, st).unwrap();
+            assert_eq!(s, "pending");
+            assert!(h.contains("wait_for_message"));
+        }
     }
 }

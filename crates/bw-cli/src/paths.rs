@@ -72,26 +72,39 @@ pub fn create_private_dir(dir: &Path) -> std::io::Result<()> {
 
 /// Write a file owner-only (0600 on unix), creating its directory.
 pub fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             create_private_dir(parent)?;
         }
     }
-    #[cfg(unix)]
-    {
-        use std::{io::Write, os::unix::fs::OpenOptionsExt};
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)?;
-        f.write_all(data)
+    // Write a sibling file, flush it to disk, then rename over the target:
+    // a crash leaves the old file or the new one, never half of one.
+    let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
+    tmp_name.push(format!(".tmp{}", std::process::id()));
+    let tmp = path.with_file_name(tmp_name);
+    let result = (|| {
+        #[cfg(unix)]
+        let mut f = {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)?
+        };
+        #[cfg(not(unix))]
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(data)?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(path, data)
-    }
+    result
 }
 
 #[cfg(test)]
