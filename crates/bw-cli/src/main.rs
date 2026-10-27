@@ -349,6 +349,7 @@ async fn connect(args: ConnectArgs) -> anyhow::Result<()> {
                     .ok()
                     .filter(|h| !h.is_empty());
                 botwhisper::next_steps::next_steps(
+                    &botwhisper::next_steps::current_exe_path(),
                     &relay,
                     args.bot_name
                         .as_deref()

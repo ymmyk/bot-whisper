@@ -250,7 +250,7 @@ const DEVICE_GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
 pub struct DeviceStart {
     pub client_id: String,
     pub device_code: String,
-    /// `XXXX-XXXX`.
+    /// `XXXXXXXX`.
     pub user_code: String,
     pub verification_uri: String,
     /// The link with the code in it; what the person should be sent.

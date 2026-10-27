@@ -208,8 +208,15 @@ async fn device_flow_happy_path() {
 
     let v = start(&http, &base, &cid, Some("Will's <b>Claude</b>")).await;
     let uc = user_code(&v);
-    assert_eq!(uc.len(), 9, "XXXX-XXXX");
-    assert_eq!(&uc[4..5], "-");
+    assert_eq!(uc.len(), 8, "XXXXXXXX: one unbroken string");
+    assert!(!uc.contains('-'), "{uc}");
+    assert!(
+        v["verification_uri_complete"]
+            .as_str()
+            .unwrap()
+            .ends_with(&format!("/device?code={uc}")),
+        "{v}"
+    );
     assert!(device_code(&v).starts_with("bwd_"));
     assert_eq!(v["verification_uri"], format!("{base}/device"));
     assert_eq!(
@@ -240,7 +247,14 @@ async fn device_flow_happy_path() {
             )),
             "the code is shown as one unbroken token"
         );
-        assert!(!page.contains(&uc), "no hyphenated copy on the page");
+        assert!(
+            !page.contains(&format!("{a}-{b}")),
+            "no hyphenated copy on the page"
+        );
+        assert!(
+            !page.contains(&format!("{a} {b}")),
+            "no spaced copy on the page"
+        );
     }
     assert!(page.contains("Approve") && page.contains("Deny"));
     assert!(page.contains("Only approve if you just asked"));
@@ -278,7 +292,10 @@ async fn device_flow_happy_path() {
     .await;
     assert_eq!(r.status(), StatusCode::OK);
     let done = r.text().await.unwrap();
-    assert!(done.contains("You're connected"), "{done}");
+    assert!(
+        done.contains("<h1>Will&#39;s Claude is connected.</h1>"),
+        "{done}"
+    );
     assert!(done.contains(r#"href="/account""#));
 
     let (s, t) = poll(&http, &base, &cid, &device_code(&v)).await;
@@ -731,7 +748,7 @@ async fn codes_copy_as_one_token_and_inputs_take_any_form() {
     let http = Client::new();
     let cid = client_id(&http, &base).await;
 
-    // The sign-in code mail: HTML shows one token, plain text keeps the gap.
+    // The sign-in code mail: HTML and plain text both give one unbroken token.
     let person = browser();
     let page = person
         .get(format!("{base}/signin"))
@@ -754,7 +771,11 @@ async fn codes_copy_as_one_token_and_inputs_take_any_form() {
     let pending = hidden(&r.text().await.unwrap(), "pending");
     let mail = relay.mail.lock().unwrap().pop().unwrap();
     let code = mail_code(&mail.body);
-    assert!(mail
+    assert!(
+        mail.body.contains(&format!("\n    {code}\n")),
+        "plain-text mail has the code as one unbroken string"
+    );
+    assert!(!mail
         .body
         .contains(&format!("{} {}", &code[..4], &code[4..])));
     let text = strip_tags(mail.html.as_deref().unwrap());
@@ -863,7 +884,7 @@ async fn device_link_context_switch_account_and_live_bot_takeover() {
     let page = r.text().await.unwrap();
     assert!(page.contains("Signed in as"), "{page}");
     assert!(page.contains("atlas@example.com"));
-    assert!(page.contains("Not you?") && page.contains("Switch account"));
+    assert!(page.contains("Not you?") && page.contains("Sign out and use another email"));
     assert!(page.contains("Create bot"), "plain-text default: {page}");
     assert!(page.contains("bigcode"));
     let csrf = hidden(&page, "csrf");
@@ -967,7 +988,7 @@ async fn device_link_context_switch_account_and_live_bot_takeover() {
         ],
     )
     .await;
-    assert!(r.text().await.unwrap().contains("You're connected"));
+    assert!(r.text().await.unwrap().contains("Atlas is connected."));
     relay.shutdown().await;
 }
 

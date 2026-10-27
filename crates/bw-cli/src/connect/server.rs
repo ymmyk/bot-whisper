@@ -458,6 +458,7 @@ impl Connector {
     /// Save which rooms we hold and their titles / our seat (0600, atomic).
     fn persist_rooms(&self, st: &State) {
         if let Some(s) = &self.store {
+            let before = s.load_room_meta();
             let meta: std::collections::BTreeMap<String, RoomMeta> = st
                 .rooms
                 .iter()
@@ -468,6 +469,10 @@ impl Connector {
                             title: r.title.clone(),
                             me: r.me.clone(),
                             owner: r.owner,
+                            since: before
+                                .get(id)
+                                .and_then(|m| m.since)
+                                .or_else(|| Some(bw_relay::doorbell::now_unix())),
                         },
                     )
                 })
@@ -773,6 +778,11 @@ impl Connector {
         };
         let warnings = self.audit_keys(room_id, &r.group, &seats).await;
         let trust = self.trust.lock().await;
+        let own_since = self
+            .store
+            .as_ref()
+            .and_then(|s| s.load_room_meta().get(room_id).and_then(|m| m.since))
+            .unwrap_or_else(bw_relay::doorbell::now_unix);
         let mut members = Vec::new();
         let mut numbers = Vec::new();
         for mk in r.group.member_keys() {
@@ -787,7 +797,9 @@ impl Connector {
                 "fingerprint": super::trust::fingerprint_hex(&mk.public_key),
                 "you": me,
                 "verified": if me { Value::Null } else { json!(entry.is_some_and(|e| e.verified)) },
-                "first_seen": entry.map(|e| e.first_seen),
+                // Your own entry has no trust record: use when this
+                // connector first held the room.
+                "first_seen": if me { Some(own_since) } else { entry.map(|e| e.first_seen) },
             }));
         }
         Ok(json!({

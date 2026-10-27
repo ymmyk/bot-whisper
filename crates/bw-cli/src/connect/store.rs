@@ -38,6 +38,9 @@ pub struct RoomMeta {
     pub me: String,
     #[serde(default)]
     pub owner: bool,
+    /// Unix seconds when this connector first held the room.
+    #[serde(default)]
+    pub since: Option<u64>,
 }
 
 /// The host part of a relay URL, used as a directory name.

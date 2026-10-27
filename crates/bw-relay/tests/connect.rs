@@ -808,9 +808,31 @@ async fn restart_keeps_rooms_working_for_owner_and_member() {
         .await;
         assert_eq!(got["messages"][0]["content"], "before", "{got}");
 
+        // Every member entry, including your own, has a first_seen.
+        let sn = call(&alice, "safety_numbers", json!({ "room_id": room })).await;
+        for m in sn["members"].as_array().unwrap() {
+            assert!(m["first_seen"].as_u64().is_some_and(|t| t > 0), "{sn}");
+        }
+        let own_first = sn["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["you"] == true)
+            .unwrap()["first_seen"]
+            .clone();
+
         // ---- the owner restarts: restart-then-send, restart-then-receive ----
         stop(alice).await;
         let alice = start(TOKENS[0], "alice").await;
+        let sn = call(&alice, "safety_numbers", json!({ "room_id": room })).await;
+        let own_after = sn["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["you"] == true)
+            .unwrap()["first_seen"]
+            .clone();
+        assert_eq!(own_first, own_after, "first_seen is saved across restarts");
         let rooms = call(&alice, "list_rooms", json!({})).await;
         assert_eq!(rooms["rooms"][0]["e2e_state"], "active", "{rooms}");
         assert!(rooms["rooms"][0].get("readable").is_none(), "{rooms}");

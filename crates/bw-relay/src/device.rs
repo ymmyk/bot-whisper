@@ -4,7 +4,7 @@
 //! 1. The connector registers a public client with no redirect URI and
 //!    POSTs `/oauth/device_authorization`. It gets a long secret
 //!    `device_code` (kept by the connector) and a short `user_code`
-//!    (`XXXX-XXXX`) with a link, which its AI agent hands to its person.
+//!    (`XXXXXXXX`, one unbroken string) with a link, which its AI agent hands to its person.
 //! 2. The person opens `/device` (the link carries the code), signs in to
 //!    the web with the existing email code or link, checks the code and the
 //!    client, picks or creates the bot, and presses Approve (or Deny).
@@ -75,9 +75,12 @@ pub fn new_user_code() -> String {
         .collect()
 }
 
-/// `ABCD1234` -> `ABCD-1234`.
+/// The code as shown and sent everywhere (API, links, CLI): ONE unbroken
+/// string, e.g. `9GDPJK7J`, so a double-click copies all of it. Any 4+4
+/// grouping on a page is CSS only (see `code_token_html`). Inputs still
+/// accept spaces, dashes and lowercase.
 pub fn spaced_user_code(code: &str) -> String {
-    format!("{}-{}", &code[..4], &code[4..])
+    code.to_string()
 }
 
 /// What a person typed or a link carried -> the 8 canonical characters.
@@ -320,18 +323,18 @@ fn private(mut r: Response) -> Response {
     r
 }
 
-/// "Signed in as X. Not you? Switch account" (signs out, back to /device
+/// "Signed in as X. Not you? Sign out and use another email" (signs out, back to /device
 /// with the code still attached).
 fn signed_in_line(account: &AccountRow, csrf: &str, code: Option<&str>) -> String {
     format!(
-        r#"<p class="muted">Signed in as <strong>{email}</strong>. Not you? <form class="inline" method="post" action="/device/switch"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="code" value="{code}"><button type="submit" class="linklike">Switch account</button></form></p>"#,
+        r#"<p class="muted">Signed in as <strong>{email}</strong>. Not you? <form class="inline" method="post" action="/device/switch"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="code" value="{code}"><button type="submit" class="ghost small">Sign out and use another email</button></form></p>"#,
         email = esc(&account.email),
         csrf = esc(csrf),
         code = esc(code.unwrap_or("")),
     )
 }
 
-/// "After you sign in, we'll connect your bot “NAME” (code XXXX-XXXX)." for
+/// "After you sign in, we'll connect your bot “NAME” (code XXXXXXXX)." for
 /// a valid, pending code; nothing otherwise. Does not count against the
 /// code's lookup budget (the code was already shown to this person).
 pub(crate) fn context_html(st: &OauthState, code: &str) -> Option<String> {
@@ -478,10 +481,13 @@ fn done_page(title: &str, msg: &str) -> Response {
 }
 
 /// After Approve: tell the person what to do next.
-fn connected_page() -> Response {
+fn connected_page(bot_name: &str) -> Response {
     private(no_store(page(
-        "You're connected",
-        r#"<h1>You're connected</h1><p>Go back to your AI. It will pick this up in a few seconds.</p><p class="muted"><a href="/account">Manage your bots</a></p>"#,
+        "Connected",
+        &format!(
+            r#"<h1>{} is connected.</h1><p>Go back to your AI. It will pick this up in a few seconds.</p><p class="muted"><a href="/account">Manage your bots</a></p>"#,
+            esc(bot_name)
+        ),
     )))
 }
 
@@ -532,7 +538,7 @@ pub struct DeviceQuery {
     pub code: Option<String>,
 }
 
-/// `GET /device[?code=XXXX-XXXX]`.
+/// `GET /device[?code=XXXXXXXX]`.
 pub async fn device_get(
     State(st): State<OauthState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -770,7 +776,7 @@ pub async fn device_post(
             {
                 Ok(true) => {
                     tracing::info!("oauth: device authorization approved");
-                    connected_page()
+                    connected_page(&bot.name)
                 }
                 _ => done_page(
                     "Code expired",
@@ -807,9 +813,17 @@ mod tests {
         }
         let c = new_user_code();
         let s = spaced_user_code(&c);
-        assert_eq!(s.len(), 9);
-        assert_eq!(&s[4..5], "-");
-        assert_eq!(normalize_user_code(&s.to_lowercase()), Some(c));
+        assert_eq!(s, c, "one unbroken string, no hyphen");
+        assert_eq!(s.len(), 8);
+        assert!(s.chars().all(|ch| ch.is_ascii_alphanumeric()));
+        assert_eq!(normalize_user_code(&s.to_lowercase()), Some(c.clone()));
+        // Inputs keep accepting any grouping.
+        let grouped = format!("{}-{}", &c[..4], &c[4..]).to_lowercase();
+        assert_eq!(normalize_user_code(&grouped), Some(c.clone()));
+        assert_eq!(
+            normalize_user_code(&format!("{} {}", &c[..4], &c[4..])),
+            Some(c)
+        );
     }
 
     #[test]

@@ -182,6 +182,15 @@ async fn confirm_link_signs_in_once_and_expired_links_fail() {
         r##"<div class="nav"><a href="/account">Account</a><a href="#add-bot">Add a bot</a>"##
     ));
     assert!(page.contains(r#"action="/account/logout""#) && page.contains(">Sign out<"));
+    assert!(
+        page.contains(r#"class="ghost small">Sign out</button>"#),
+        "Sign out is a visible button, not a text link"
+    );
+    // Local times carry a timezone label.
+    assert!(
+        page.contains("timeZoneName:'short'"),
+        "timezone label script"
+    );
     // The account id is labelled, explained and copyable; times are local.
     let acct_id = relay
         .db
@@ -199,7 +208,15 @@ async fn confirm_link_signs_in_once_and_expired_links_fail() {
     );
     // "Add a bot": a ready-to-paste prompt for the person's AI with a Copy
     // button, pointing at /connect and carrying the stdio command.
-    assert!(page.contains(r#"<summary class="btn">Add a bot</summary>"#));
+    assert!(
+        page.contains(r#"<details class="addbot" open><summary class="btn">Add a bot</summary>"#),
+        "Add a bot is expanded by default"
+    );
+    // A bot name with quotes is escaped in the prompt, never dropped.
+    assert!(
+        page.contains(r#"replace(/[\\"$`]/g,'\\$&')"#),
+        "quotes escaped in the prompt"
+    );
     assert!(page.contains(r#"id="addbot-copy""#) && page.contains(r#"id="addbot-name""#));
     assert!(page.contains("https://botwhisper.si/connect"));
     assert!(page.contains(&format!(
@@ -376,6 +393,16 @@ async fn account_page_shows_only_own_data_and_disconnect_needs_csrf() {
     // Member ID: labelled, explained, copyable.
     assert!(page.contains("<span>Member ID</span>"));
     assert!(page.contains(&format!(r#"data-copy="{alice_id}:bwc_alice1""#)));
+    // The full value that Copy copies is what is shown (no truncation).
+    assert!(
+        page.contains(&format!(
+            r#"class="fullid" title="{alice_id}:bwc_alice1">{alice_id}:bwc_alice1</code>"#
+        )),
+        "member id shown in full"
+    );
+    // Disconnect (secondary) sits next to Delete in one row.
+    assert!(page.contains(r#"<div class="danger-zone actions"><form class="inline" method="post" action="/account/disconnect">"#));
+    assert!(!page.contains("Wake-ups off"), "plain wording instead");
     assert!(page.contains(&room_id));
     assert!(page.contains("you own it") && page.contains("for Sam") && page.contains("unused"));
     assert!(page.contains("Rename") && page.contains("Delete"));
@@ -548,11 +575,12 @@ async fn account_page_shows_only_own_data_and_disconnect_needs_csrf() {
     // Delete: always asks first (red button, apart from Rename); a bot in a
     // room says what leaving does, and its owned room closes.
     assert!(
-        page.contains(r#"<div class="danger-zone">"#)
+        page.contains(r#"<div class="danger-zone actions">"#)
             && page.contains(r#"class="danger small">Delete this bot"#)
     );
     assert!(
-        page.find("Rename</button>").unwrap() < page.find(r#"<div class="danger-zone">"#).unwrap(),
+        page.find("Rename</button>").unwrap()
+            < page.find(r#"<div class="danger-zone actions">"#).unwrap(),
         "Delete sits apart from Rename"
     );
     let delete = |bot: &str, confirm: bool| {

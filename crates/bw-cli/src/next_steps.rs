@@ -16,15 +16,25 @@ fn sh(w: &str) -> String {
     }
 }
 
-/// `home` is a custom `BOTWHISPER_HOME` (only when it is set).
-pub fn next_steps(relay: &str, bot_name: Option<&str>, home: Option<&str>) -> String {
+/// The absolute path of the running binary, so an AI app (which may not have
+/// the shell's PATH) starts exactly this build.
+pub fn current_exe_path() -> String {
+    std::env::current_exe()
+        .ok()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "botwhisper".to_string())
+}
+
+/// `exe` is the absolute path to the binary; `home` is a custom
+/// `BOTWHISPER_HOME` (only when it is set).
+pub fn next_steps(exe: &str, relay: &str, bot_name: Option<&str>, home: Option<&str>) -> String {
     let mut args = vec!["connect".to_string(), "--relay".into(), relay.to_string()];
     if let Some(n) = bot_name.filter(|n| !n.trim().is_empty()) {
         args.push("--bot-name".into());
         args.push(n.to_string());
     }
     let words: Vec<String> = args.iter().map(|a| sh(a)).collect();
-    let cmd = format!("botwhisper {}", words.join(" "));
+    let cmd = format!("{} {}", sh(exe), words.join(" "));
     let (claude_env, codex_env) = match home {
         Some(h) => (
             format!(" -e {}", sh(&format!("BOTWHISPER_HOME={h}"))),
@@ -32,7 +42,7 @@ pub fn next_steps(relay: &str, bot_name: Option<&str>, home: Option<&str>) -> St
         ),
         None => (String::new(), String::new()),
     };
-    let mut server = json!({ "command": "botwhisper", "args": args });
+    let mut server = json!({ "command": exe, "args": args });
     if let Some(h) = home {
         server["env"] = json!({ "BOTWHISPER_HOME": h });
     }
@@ -72,29 +82,31 @@ mod tests {
     #[test]
     fn keeps_the_bot_name_and_home_in_every_form() {
         let t = next_steps(
+            "/opt/bw/botwhisper",
             "https://relay.botwhisper.si",
             Some("Atlas Two"),
             Some("/tmp/my home"),
         );
         assert!(t.contains("\"mcpServers\""), "{t}");
+        assert!(t.contains("\"command\": \"/opt/bw/botwhisper\""), "{t}");
         assert!(t.contains("\"--bot-name\""));
         assert!(t.contains("\"Atlas Two\""));
         assert!(t.contains("\"BOTWHISPER_HOME\": \"/tmp/my home\""));
         assert!(t.contains(
-            "claude mcp add botwhisper -e 'BOTWHISPER_HOME=/tmp/my home' -- botwhisper connect --relay https://relay.botwhisper.si --bot-name 'Atlas Two'"
+            "claude mcp add botwhisper -e 'BOTWHISPER_HOME=/tmp/my home' -- /opt/bw/botwhisper connect --relay https://relay.botwhisper.si --bot-name 'Atlas Two'"
         ));
         assert!(t.contains(
-            "codex mcp add botwhisper --env 'BOTWHISPER_HOME=/tmp/my home' -- botwhisper connect"
+            "codex mcp add botwhisper --env 'BOTWHISPER_HOME=/tmp/my home' -- /opt/bw/botwhisper connect"
         ));
     }
 
     #[test]
     fn plain_setup_has_no_env() {
-        let t = next_steps("https://r.example", None, None);
+        let t = next_steps("/opt/bw/botwhisper", "https://r.example", None, None);
         assert!(!t.contains("BOTWHISPER_HOME"));
         assert!(!t.contains("--bot-name"));
-        assert!(
-            t.contains("claude mcp add botwhisper -- botwhisper connect --relay https://r.example")
-        );
+        assert!(t.contains(
+            "claude mcp add botwhisper -- /opt/bw/botwhisper connect --relay https://r.example"
+        ));
     }
 }

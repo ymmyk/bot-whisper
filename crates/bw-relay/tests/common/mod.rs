@@ -282,10 +282,9 @@ pub fn mail_code(body: &str) -> String {
     body.lines()
         .map(str::trim)
         .find(|l| {
-            l.len() == 9
-                && l.as_bytes()[4] == b' '
-                && l.chars().filter(char::is_ascii_digit).count() == 8
+            // One unbroken string of 8 digits, so a double-click copies it all.
+            l.len() == 8 && l.chars().all(|c| c.is_ascii_digit())
         })
         .unwrap_or_else(|| panic!("no code in mail"))
-        .replace(' ', "")
+        .to_string()
 }

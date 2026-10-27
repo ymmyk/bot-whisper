@@ -191,7 +191,7 @@ fn carried_device_code(st: &OauthState, ip: &str, raw: Option<&str>) -> Option<S
     crate::device::context_html(st, &code).map(|_| code)
 }
 
-/// `GET /signin[?code=XXXX-XXXX]`: the web sign-in form (signed-in browsers
+/// `GET /signin[?code=XXXXXXXX]`: the web sign-in form (signed-in browsers
 /// go to /account, or on to /device when a code is carried).
 pub async fn signin_get(
     State(st): State<OauthState>,
@@ -396,24 +396,13 @@ fn doorbell_html(
     html
 }
 
-/// A long id shortened for display (the copy button keeps the full value).
-fn trunc(s: &str) -> String {
-    let n = s.chars().count();
-    if n <= 18 {
-        return s.to_string();
-    }
-    let head: String = s.chars().take(9).collect();
-    let tail: String = s.chars().skip(n - 5).collect();
-    format!("{head}…{tail}")
-}
-
-/// A labelled id: truncated, with a Copy button and a one-line explanation.
+/// A labelled id: shown in full (what Copy copies), with a Copy button and a one-line explanation.
 fn id_row(label: &str, value: &str, what: &str) -> String {
     format!(
-        r#"<div class="idrow"><span>{label}</span> <code title="{full}">{short}</code> {copy}</div><p class="muted">{what}</p>"#,
+        r#"<div class="idrow"><span>{label}</span> <code class="fullid" title="{full}">{shown}</code> {copy}</div><p class="muted">{what}</p>"#,
         label = esc(label),
         full = esc(value),
-        short = esc(&trunc(value)),
+        shown = esc(value),
         copy = copy_button(value, "Copy"),
         what = esc(what),
     )
@@ -509,11 +498,11 @@ fn account_html(st: &OauthState, acct: &AccountRow, csrf: &str) -> String {
             }
         }
         if bells.is_empty() {
-            bells = r#"<p class="muted">Wake-ups off: your bot only sees messages when it checks in. <a href="https://botwhisper.si/#wakeups">What does this mean?</a></p>"#.into();
+            bells = r#"<p class="muted">Wake-ups are not set up, so your bot only sees new messages when it checks in. <a href="https://botwhisper.si/#wakeups">How to turn wake-ups on</a></p>"#.into();
         }
         let disconnect = if live.is_some() {
             format!(
-                r#" <form class="inline" method="post" action="/account/disconnect"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="bot_id" value="{id}"><button type="submit" class="ghost small">Disconnect</button></form>"#,
+                r#"<form class="inline" method="post" action="/account/disconnect"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="bot_id" value="{id}"><button type="submit" class="ghost small">Disconnect</button></form>"#,
                 csrf = esc(csrf),
                 id = esc(&b.id),
             )
@@ -522,7 +511,7 @@ fn account_html(st: &OauthState, acct: &AccountRow, csrf: &str) -> String {
         };
         let connect_cmd = format!(
             "botwhisper connect --relay {base} --bot-name \"{}\"",
-            b.name.replace('"', "")
+            dq_escape(&b.name)
         );
         let reconnect = if matches!(status, BotStatus::NotConnected) {
             format!(
@@ -540,8 +529,7 @@ fn account_html(st: &OauthState, acct: &AccountRow, csrf: &str) -> String {
 {id_row}
 {bells}{reconnect}
 <form method="post" action="/account/bots/rename"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="bot_id" value="{id}"><label for="name-{id}">Name</label><input id="name-{id}" name="name" type="text" maxlength="60" value="{name}"><button type="submit" class="ghost small">Rename</button></form>
-{disconnect}
-<div class="danger-zone"><form method="post" action="/account/bots/delete"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="bot_id" value="{id}"><button type="submit" class="danger small">Delete this bot…</button></form></div></div>"#,
+<div class="danger-zone actions">{disconnect}<form class="inline" method="post" action="/account/bots/delete"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="bot_id" value="{id}"><button type="submit" class="danger small">Delete this bot…</button></form></div></div>"#,
             name = esc(&b.name),
             pill = status_pill(&status),
             detail = detail,
@@ -641,7 +629,7 @@ Your bots here: {mine}</p></div>"#,
     };
 
     format!(
-        r##"<div class="nav"><a href="/account">Account</a><a href="#add-bot">Add a bot</a><form method="post" action="/account/logout"><input type="hidden" name="csrf" value="{csrf}"><button type="submit" class="linklike">Sign out</button></form></div>
+        r##"<div class="nav"><a href="/account">Account</a><a href="#add-bot">Add a bot</a><form method="post" action="/account/logout"><input type="hidden" name="csrf" value="{csrf}"><button type="submit" class="ghost small">Sign out</button></form></div>
 <h1>Your account</h1>
 <p>Signed in as <strong>{email}</strong>. Created {created}.</p>
 {account_id}
@@ -670,7 +658,7 @@ fn add_bot_html(base: &str) -> String {
     let default = "My AI";
     let prompt = add_bot_prompt(base, default);
     format!(
-        r#"<details class="addbot"><summary class="btn">Add a bot</summary>
+        r#"<details class="addbot" open><summary class="btn">Add a bot</summary>
 <p>Paste this to your AI app (Grok Bot, Claude Code, Codex, Cursor, ...). It installs the connector and gives you a link to approve.</p>
 <label for="addbot-name">Name for the new bot</label><input id="addbot-name" type="text" maxlength="60" value="{default}" autocomplete="off">
 <p><code id="addbot-prompt" class="prompt">{prompt_html}</code></p>
@@ -681,7 +669,7 @@ fn add_bot_html(base: &str) -> String {
 var n=document.getElementById('addbot-name'),p=document.getElementById('addbot-prompt'),b=document.getElementById('addbot-copy');
 if(!n||!p||!b)return;
 var base={base_js};
-n.addEventListener('input',function(){{var v=n.value.replace(/["\\\r\n]/g,'').trim()||'My AI';
+n.addEventListener('input',function(){{var v=n.value.replace(/[\r\n]+/g,' ').replace(/[\\"$`]/g,'\\$&').trim()||'My AI';
 var t='Connect to BotWhisper as "'+v+'": follow the instructions at https://botwhisper.si/connect to install botwhisper, add it as an MCP server (botwhisper connect --relay '+base+' --bot-name "'+v+'"), and sign in. Call login and send me the link and code.';
 p.textContent=t;b.setAttribute('data-copy',t)}});
 if(location.hash==='#add-bot'){{n.closest('details').open=true}}
@@ -695,8 +683,27 @@ if(location.hash==='#add-bot'){{n.closest('details').open=true}}
     )
 }
 
-/// The prompt text for a bot name (no quotes or newlines in the name).
+/// A name inside double quotes for a shell or for the prompt: `\`, `"`, `$`
+/// and backtick get a backslash, newlines become spaces. Quotes in a bot
+/// name are kept, never dropped.
+pub(crate) fn dq_escape(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for c in name.chars() {
+        match c {
+            '\\' | '"' | '$' | '`' => {
+                out.push('\\');
+                out.push(c);
+            }
+            '\r' | '\n' => out.push(' '),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// The prompt text for a bot name (escaped with `dq_escape`).
 pub(crate) fn add_bot_prompt(base: &str, name: &str) -> String {
+    let name = dq_escape(name);
     format!(
         "Connect to BotWhisper as \"{name}\": follow the instructions at https://botwhisper.si/connect to install botwhisper, add it as an MCP server (botwhisper connect --relay {base} --bot-name \"{name}\"), and sign in. Call login and send me the link and code."
     )
@@ -950,6 +957,17 @@ pub async fn logout_post(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bot_names_with_quotes_are_escaped_not_dropped() {
+        assert_eq!(
+            dq_escape(r#"Will "the bot" $HOME `x` a\b"#),
+            r#"Will \"the bot\" \$HOME \`x\` a\\b"#
+        );
+        assert_eq!(dq_escape("a\nb"), "a b");
+        let p = add_bot_prompt("https://r", r#"My "AI""#);
+        assert!(p.contains(r#"--bot-name "My \"AI\"""#), "{p}");
+    }
 
     #[test]
     fn utc_formatting() {

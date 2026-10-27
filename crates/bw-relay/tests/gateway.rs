@@ -246,7 +246,8 @@ async fn gated_inner() {
     assert_eq!(l["status"], "pending");
     let code = l["user_code"].as_str().unwrap().to_string();
     let url = l["verification_url"].as_str().unwrap().to_string();
-    assert_eq!(code.len(), 9);
+    assert_eq!(code.len(), 8, "one unbroken string");
+    assert!(!code.contains('-') && !code.contains(' '), "{code}");
     assert!(url.starts_with(&format!("{}/device?code=", relay.base())));
     assert!(url.contains(&code));
     assert!(l["expires_in_s"].as_u64().unwrap() > 800);

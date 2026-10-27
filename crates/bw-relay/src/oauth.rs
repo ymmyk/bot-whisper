@@ -214,6 +214,8 @@ button.small{{padding:6px 12px;font-size:.9rem}}
 details.about,details.ai{{margin-top:14px;font-size:.9rem;color:#5b5778}} details.about summary,details.ai summary{{cursor:pointer}}
 .status{{display:inline-block;padding:1px 10px;border-radius:999px;font-size:.85rem;font-weight:650}}
 .status.on{{background:#e3f6ea;color:#14532d}} .status.wait{{background:#fff3da;color:#6b4510}} .status.off{{background:#eee;color:#555}}
+.fullid{{word-break:break-all}}
+.actions{{display:flex;gap:8px;flex-wrap:wrap;align-items:center}}
 .idrow{{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:4px 0}}
 button.copy{{margin:0;padding:2px 10px;font-size:.82rem;font-weight:600;background:#fff;color:#1b1838;border:1px solid #c9c5e4}}
 .steps{{margin:10px 0;padding-left:1.2em}} .steps li{{margin:2px 0}}
@@ -224,7 +226,7 @@ button.copy{{margin:0;padding:2px 10px;font-size:.82rem;font-weight:600;backgrou
 document.addEventListener('click',function(e){{var b=e.target.closest&&e.target.closest('[data-copy]');if(!b)return;var t=b.getAttribute('data-copy'),o=b.getAttribute('data-label')||b.textContent;
 function ok(){{b.textContent='Copied';setTimeout(function(){{b.textContent=o}},1500)}}
 if(navigator.clipboard&&navigator.clipboard.writeText){{navigator.clipboard.writeText(t).then(ok,function(){{fb(t,b);ok()}})}}else{{fb(t,b);ok()}}}});
-document.querySelectorAll('time[datetime]').forEach(function(el){{var d=new Date(el.getAttribute('datetime'));if(isNaN(d))return;el.title=el.textContent;el.textContent=d.toLocaleString([],{{dateStyle:'medium',timeStyle:'short'}})}});}})();</script></body></html>"#,
+document.querySelectorAll('time[datetime]').forEach(function(el){{var d=new Date(el.getAttribute('datetime'));if(isNaN(d))return;el.title=el.textContent;el.textContent=d.toLocaleString([],{{year:'numeric',month:'short',day:'numeric',hour:'numeric',minute:'2-digit',timeZoneName:'short'}})}});}})();</script></body></html>"#,
         t = esc(title),
         b = body
     ))
@@ -1194,10 +1196,10 @@ pub(crate) fn code_token_email_html(code: &str) -> String {
     )
 }
 
-/// "1234 5678" for reading.
+/// The plain-text mail shows the code as one unbroken string so a
+/// double-click copies all of it (the HTML part groups it with CSS only).
 fn spaced_code(code: &str) -> String {
-    let (a, b) = code.split_at(code.len() / 2);
-    format!("{a} {b}")
+    code.to_string()
 }
 
 /// Validate, rate-limit, store the pending login and mail the single-use
