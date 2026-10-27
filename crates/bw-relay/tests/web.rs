@@ -177,13 +177,17 @@ async fn confirm_link_signs_in_once_and_expired_links_fail() {
     assert!(page.contains(&format!("botwhisper connect --relay {base} --bot-name")));
     assert!(page.contains("stays signed in for 30 days"));
     assert!(page.contains("Dismiss"));
-    // Small top nav: Account, Add a bot, Sign out.
+    // Top bar with Sign out, and a section nav down the side.
     assert!(page.contains(
-        r##"<div class="nav"><a href="/account">Account</a><a href="#add-bot">Add a bot</a>"##
-    ));
+        r##"<nav aria-label="Account sections"><a href="#bots">Bots</a><a href="#add-bot">Add a bot</a><a href="#support">Support</a></nav>"##
+    ), "no Rooms or Danger zone links with nothing in them");
+    assert!(page.contains(r##"<a class="skip" href="#main">Skip to content</a>"##));
+    assert!(page.contains(r#"<meta name="color-scheme" content="light dark">"#));
+    assert!(page.contains("prefers-color-scheme:dark"), "dark mode");
+    assert!(page.contains(":focus-visible"), "visible focus");
     assert!(page.contains(r#"action="/account/logout""#) && page.contains(">Sign out<"));
     assert!(
-        page.contains(r#"class="ghost small">Sign out</button>"#),
+        page.contains(r#"<button type="submit" class="small">Sign out</button>"#),
         "Sign out is a visible button, not a text link"
     );
     // Local times carry a timezone label.
@@ -198,8 +202,20 @@ async fn confirm_link_signs_in_once_and_expired_links_fail() {
         .unwrap()
         .unwrap()
         .id;
-    assert!(page.contains("<span>Account ID</span>"));
-    assert!(page.contains(&format!(r#"data-copy="{acct_id}""#)));
+    // The Account ID lives under Support, shown in full with Copy.
+    let support = page.split(r#"<h2 id="support">"#).nth(1).unwrap();
+    let support = support.split("</section>").next().unwrap();
+    assert!(support.contains("<dt>Account ID</dt>"));
+    assert!(support.contains(&format!(r#"<code class="mono fullid">{acct_id}</code>"#)));
+    assert!(support.contains(&format!(r#"data-copy="{acct_id}""#)));
+    assert_eq!(
+        page.matches(&format!(r#"data-copy="{acct_id}""#)).count(),
+        1
+    );
+    assert!(
+        page.find(r#"<h2 id="bots">"#).unwrap() < page.find(r#"<h2 id="support">"#).unwrap(),
+        "bots come first, support later"
+    );
     assert_eq!(page.matches("Not a password.").count(), 1, "said once");
     // Which ID to share, and what each is for, in one line.
     assert_eq!(page.matches("Which ID to share?").count(), 1);
@@ -221,8 +237,9 @@ async fn confirm_link_signs_in_once_and_expired_links_fail() {
     // "Add a bot": a ready-to-paste prompt for the person's AI with a Copy
     // button, pointing at /connect and carrying the stdio command.
     assert!(
-        page.contains(r#"<details class="addbot" open><summary class="btn">Add a bot</summary>"#),
-        "Add a bot is expanded by default"
+        page.contains(r#"<h2 id="add-bot">Add a bot</h2>"#)
+            && page.contains(r#"<label for="addbot-name">Name for the new bot</label>"#),
+        "Add a bot is always open, its input labelled"
     );
     // A bot name with quotes: shown plainly in the prose, single-quoted
     // (never backslash-escaped) in the command, in the page JS too.
@@ -235,6 +252,10 @@ async fn confirm_link_signs_in_once_and_expired_links_fail() {
         "no backslash-escaping of the name in the prose"
     );
     assert!(page.contains(r#"id="addbot-copy""#) && page.contains(r#"id="addbot-name""#));
+    assert!(
+        page.contains("Paste this to your AI app (Grok Bot, Claude Code, Codex, Cursor"),
+        "Grok Bot is listed first"
+    );
     assert!(page.contains("https://botwhisper.si/connect"));
     assert!(page.contains(&format!(
         "add it as an MCP server (botwhisper connect --relay {base} --bot-name &#39;My AI&#39;)"
@@ -405,35 +426,50 @@ async fn account_page_shows_only_own_data_and_disconnect_needs_csrf() {
         .await
         .unwrap();
     assert!(page.contains("alice@example.com") && page.contains("Alice Claude"));
-    assert!(page.contains(r#"<span class="status on">Connected</span>"#));
+    // Connected: "Last seen" relative, with the exact time for the tooltip.
+    assert!(page.contains(
+        r#"<span class="seen on"><span class="dot" aria-hidden="true"></span>Last seen <time datetime=""#
+    ));
+    assert!(page.contains(" data-rel title=\"") && page.contains(">just now</time>"));
+    assert!(
+        !page.contains(">Connected<"),
+        "says when, not just Connected"
+    );
     assert!(page.contains("Using Alice Claude"));
-    // Member ID: labelled, explained, copyable.
-    assert!(page.contains("<span>Member ID</span>"));
-    assert!(page.contains(&format!(r#"data-copy="{alice_id}:bwc_alice1""#)));
-    // The full value that Copy copies is what is shown (no truncation).
+    // Member ID: up front on the card, shortened on one line, and Copy
+    // copies the whole id as one unbroken string.
+    let member = format!("{alice_id}:bwc_alice1");
+    let shown = format!("{}…{}", &member[..4], &member[member.len() - 12..]);
+    assert!(page.contains(&format!(
+        r#"<dt>Member ID</dt><dd><span class="idchip"><code class="mono" title="{member}">{shown}</code><button type="button" class="copy" data-copy="{member}" data-label="Copy" aria-label="Copy Member ID for Alice Claude">Copy</button></span>"#
+    )), "member id chip");
+    assert!(
+        page.contains(".idchip code{background:none;padding:5px 10px;white-space:nowrap"),
+        "never wraps"
+    );
     assert!(
         page.contains(&format!(
-            r#"class="fullid" title="{alice_id}:bwc_alice1">{alice_id}:bwc_alice1</code>"#
+            r#"<noscript><code class="mono fullid">{member}</code></noscript>"#
         )),
-        "member id shown in full"
+        "full id without JS"
     );
-    // Rename and Disconnect share one row; Delete sits apart in its own
-    // danger zone.
-    assert!(page.contains(
-        r#"Rename</button></form><form class="inline" method="post" action="/account/disconnect">"#
-    ));
-    assert!(page.contains(r#"<div class="danger-zone"><form class="inline" method="post" action="/account/bots/delete">"#));
+    // Rename and Disconnect share the card's footer; Delete sits apart in
+    // the page's danger zone.
+    assert!(
+        page.contains(r#"Rename</button></form><form method="post" action="/account/disconnect">"#)
+    );
+    assert!(page.contains(r#"<div class="card list danger-zone"><div class="row"><div class="row-main"><p class="row-title">Delete Alice Claude</p>"#));
     // Shared explanations once, not per bot.
     assert_eq!(page.matches("Not a password.").count(), 1);
-    assert_eq!(
-        page.matches(r##"<a href="#wakeups">What are wake-ups?</a>"##)
-            .count(),
-        1
-    );
+    assert_eq!(page.matches("What are wake-ups?").count(), 1);
     assert_eq!(page.matches("identity in every room it joins").count(), 1);
     assert!(!page.contains("Wake-ups off"), "plain wording instead");
     assert!(page.contains(&room_id));
-    assert!(page.contains("you own it") && page.contains("for Sam") && page.contains("unused"));
+    assert!(
+        page.contains(r#"<span class="badge">Owner</span>"#)
+            && page.contains("for Sam")
+            && page.contains("unused")
+    );
     assert!(page.contains("Rename") && page.contains("Delete"));
     for other in [
         "bob@example.com",
@@ -455,15 +491,15 @@ async fn account_page_shows_only_own_data_and_disconnect_needs_csrf() {
             && page.contains("An access token is saved for it.")
     );
     assert!(
-        page.contains(r##"<a href="#wakeups">What are wake-ups?</a>"##)
-            && page.contains(r#"<h2 id="wakeups">"#)
-            && !page.contains("botwhisper.si/#wakeups"),
-        "the wake-ups link is a relay-hosted section"
+        page.contains(
+            r#"<details class="help" id="wakeups"><summary>What are wake-ups?</summary>"#
+        ) && !page.contains("botwhisper.si/#wakeups"),
+        "the wake-ups help is one relay-hosted fold"
     );
     // Plain words up front: no protocol names, status words or event names
     // outside the collapsed reveal.
     let visible = page
-        .split("<details>")
+        .split("<details")
         .map(|c| c.split_once("</details>").map_or(c, |(_, rest)| rest))
         .collect::<String>();
     for jargon in ["ntfy", "status <strong>", "events ", "message.new", "topic"] {
@@ -473,9 +509,15 @@ async fn account_page_shows_only_own_data_and_disconnect_needs_csrf() {
         );
     }
     assert!(
-        page.contains("<details><summary>Show the secret address")
+        page.contains(r#"<span class="pill on">On</span>"#)
+            && page.contains(r#"<details class="setup"><summary>Set up</summary>"#)
             && page.contains(&format!("--topic {topic}")),
-        "full topic only inside the reveal toggle"
+        "On pill; full topic only inside the Set up toggle"
+    );
+    // One Set up per bot with wake-ups on, never one per command.
+    assert_eq!(
+        page.matches("<summary>Set up</summary>").count(),
+        page.matches(r#"<span class="pill on">On</span>"#).count()
     );
     assert!(page.contains("BOTWHISPER_NTFY_TOKEN=&lt;your ntfy token&gt;"));
     assert!(page.contains("sent to a web address you set up"));
@@ -532,7 +574,12 @@ async fn account_page_shows_only_own_data_and_disconnect_needs_csrf() {
         .await
         .unwrap();
     assert_eq!(r.status(), StatusCode::OK);
-    assert!(r.text().await.unwrap().contains("Disconnect Alice Claude?"));
+    let confirm = r.text().await.unwrap();
+    assert!(confirm.contains("Disconnect Alice Claude?"));
+    assert!(
+        confirm.contains(r#"<main id="main" class="narrow">"#),
+        "a focused confirm card"
+    );
     assert!(relay
         .db
         .get_token(&sha256_hex(&a_tok), "access", now_unix())
@@ -572,7 +619,9 @@ async fn account_page_shows_only_own_data_and_disconnect_needs_csrf() {
         .text()
         .await
         .unwrap();
-    assert!(page.contains(r#"<span class="status off">Not connected</span>"#));
+    assert!(page.contains(
+        r#"<span class="seen off"><span class="dot" aria-hidden="true"></span>Not connected</span>"#
+    ));
     assert!(page.contains("Reconnect this bot"));
     assert!(page.contains(r#"data-copy="botwhisper connect --relay"#));
     assert!(
@@ -618,12 +667,15 @@ async fn account_page_shows_only_own_data_and_disconnect_needs_csrf() {
     // Delete: always asks first (red button, apart from Rename); a bot in a
     // room says what leaving does, and its owned room closes.
     assert!(
-        page.contains(r#"<div class="danger-zone">"#)
-            && page.contains(r#"class="danger small">Delete this bot"#)
+        page.contains(r#"<h2 id="danger" class="danger-h">Danger zone</h2>"#)
+            && page.contains(
+                r#"class="danger small" aria-label="Delete Alice Claude…">Delete…</button>"#
+            )
     );
     assert!(
-        page.find("Rename</button>").unwrap() < page.find(r#"<div class="danger-zone">"#).unwrap(),
-        "Delete sits apart from Rename"
+        page.rfind("Rename</button>").unwrap()
+            < page.find(r#"<div class="card list danger-zone">"#).unwrap(),
+        "Delete sits apart from Rename, after every bot card"
     );
     let delete = |bot: &str, confirm: bool| {
         let mut f = vec![("csrf", csrf.clone()), ("bot_id", bot.to_string())];
@@ -1220,9 +1272,7 @@ async fn wakeups_state_reflects_a_real_doorbell() {
     let bot_id = format!("{alice_id}:bwc_wake1");
     let (cfg, _) = relay.db.bot_doorbell(&bot_id).unwrap().unwrap();
     assert!(cfg.auto && !cfg.manual && cfg.is_automatic());
-    assert!(
-        p.contains(r##"<a href="#bots">Back to your bots</a>"##) && p.contains(r#"<h2 id="bots">"#)
-    );
+    assert!(p.contains(r#"<span class="pill off">Off</span>"#) && p.contains(r#"<h2 id="bots">"#));
     bot.ok("set_doorbell", json!({ "type": "ntfy" })).await;
     let p = page(alice.clone()).await;
     assert!(
@@ -1230,6 +1280,10 @@ async fn wakeups_state_reflects_a_real_doorbell() {
         "set up on purpose"
     );
     assert!(!p.contains("Wake-ups are off"));
+    assert!(
+        p.contains(r#"<span class="pill on">On</span>"#)
+            && !p.contains(r#"<span class="pill off">"#)
+    );
     let g = bot.ok("get_doorbell", json!({})).await;
     assert_eq!(g["state"], "on", "{g}");
     assert_eq!(g["origin"], "manual");
@@ -1251,5 +1305,53 @@ async fn wakeups_state_reflects_a_real_doorbell() {
     // Provenance: a doorbell set through the tool is explicitly manual.
     let (cfg, _) = relay.db.bot_doorbell(&bot_id).unwrap().unwrap();
     assert!(cfg.manual && !cfg.auto && !cfg.is_automatic());
+    relay.shutdown().await;
+}
+
+/// Not a check: renders `/account` for a seeded account into
+/// `$BW_SNAPSHOT_OUT` (an HTML file) for design screenshots. Run with
+/// `BW_SNAPSHOT_OUT=/tmp/account.html cargo test -p bw-relay --test web
+/// account_page_snapshot -- --ignored`.
+#[tokio::test]
+#[ignore]
+async fn account_page_snapshot() {
+    let Ok(out) = std::env::var("BW_SNAPSHOT_OUT") else {
+        return;
+    };
+    let mut cfg = test_config();
+    cfg.bind = (9150..=9199)
+        .map(|p| std::net::SocketAddr::from(([127, 0, 0, 1], p)))
+        .find(|a| std::net::TcpListener::bind(a).is_ok())
+        .expect("a free port in 9150-9199");
+    let relay = TestRelay::start_with(cfg).await;
+    let base = relay.base();
+    let will = browser();
+    let acct = web_sign_up(&relay, &will, "will@example.com").await;
+    let grok = connect_bot(&relay, &acct, "bwc_grok", "Grok Bot");
+    let claude = connect_bot(&relay, &acct, "bwc_claude", "Claude Code");
+    let atlas = connect_bot(&relay, &acct, "bwc_atlas", "Atlas");
+    let g = relay.bot(&grok).await;
+    let room = g.ok("create_room", json!({ "title": "Product" })).await;
+    let room_id = room["room_id"].as_str().unwrap().to_string();
+    g.ok(
+        "create_invite",
+        json!({ "room_id": room_id, "label": "for QA Bot" }),
+    )
+    .await;
+    g.ok("set_doorbell", json!({ "type": "ntfy" })).await;
+    let a = relay.bot(&atlas).await;
+    a.ok("set_doorbell", json!({ "auto": true })).await;
+    let c = relay.bot(&claude).await;
+    c.ok("list_rooms", json!({})).await;
+    relay.db.revoke_bot_grants("bot_bwc_claude").unwrap();
+    let page = will
+        .get(format!("{base}/account"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    std::fs::write(&out, page).unwrap();
     relay.shutdown().await;
 }

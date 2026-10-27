@@ -37,10 +37,10 @@ use crate::{
     doorbell::{now_unix, DoorbellConfig, DoorbellStatus, DoorbellTarget},
     oauth::{
         check_email_page, clean_bot_name, clear_session_cookies, client_ip, code_page_ctx,
-        cookie_value, copy_button, csrf_from_headers, csrf_ok, current_account, error_page, esc,
+        cookie_value, csrf_from_headers, csrf_ok, current_account, error_page, esc, iso_utc,
         no_store, page, random_token, send_signin_email, signin_authz, signin_failure_page,
-        time_html, CodeCtx, Delivery, OauthState, SigninError, OPERATOR_NOTICE, RATE_LIMITED_MSG,
-        SESSION_COOKIE,
+        time_html, CodeCtx, Delivery, OauthState, SigninError, FAVICON_DATA_URI, OPERATOR_NOTICE,
+        PAGE_SCRIPT, RATE_LIMITED_MSG, SESSION_COOKIE,
     },
 };
 
@@ -343,19 +343,70 @@ fn short(s: &str) -> String {
     s.chars().take(8).collect()
 }
 
-/// One wake-up (doorbell) as the owner may see it, in plain words: whether
-/// it is on, how it reaches the bot, when it last fired and whether it is
-/// healthy. No protocol names, status codes or event names up front. The
-/// secret address is revealed on demand (this is the owner's page), together
-/// with the `listen` command; tokens are shown as an environment-variable
-/// placeholder, never their value.
-fn doorbell_html(
-    st: &OauthState,
-    scope: &str,
-    cfg: &DoorbellConfig,
-    status: &DoorbellStatus,
-) -> String {
-    let base = st.registry.bells.ntfy_base_url();
+/// "just now", "5 minutes ago", "3 hours ago", "yesterday", "4 days ago",
+/// or the date for anything older than a month.
+pub(crate) fn ago(now: u64, t: u64) -> String {
+    let d = now.saturating_sub(t);
+    let plural = |n: u64, w: &str| format!("{n} {w}{} ago", if n == 1 { "" } else { "s" });
+    match d {
+        0..=59 => "just now".into(),
+        60..=3_599 => plural(d / 60, "minute"),
+        3_600..=86_399 => plural(d / 3_600, "hour"),
+        86_400..=172_799 => "yesterday".into(),
+        172_800..=2_591_999 => plural(d / 86_400, "day"),
+        _ => format!("on {}", &fmt_utc(t)[..10]),
+    }
+}
+
+/// A relative time ("5 minutes ago") whose tooltip is the exact time: UTC
+/// without JavaScript, the viewer's local time and zone with it (the shared
+/// page script fills the tooltip for `data-rel` times).
+fn ago_html(now: u64, t: u64) -> String {
+    format!(
+        r#"<time datetime="{iso}" data-rel title="{utc}">{ago}</time>"#,
+        iso = iso_utc(t),
+        utc = fmt_utc(t),
+        ago = ago(now, t),
+    )
+}
+
+/// An id shortened for display: its head and its tail, which is the part
+/// that tells two of them apart (every Member ID starts with the Account
+/// ID). It never wraps; the full value is the tooltip, what Copy copies,
+/// and is shown in full without JavaScript.
+pub(crate) fn short_id(v: &str) -> String {
+    let c: Vec<char> = v.chars().collect();
+    if c.len() <= 20 {
+        return v.to_string();
+    }
+    let head: String = c[..4].iter().collect();
+    let tail: String = c[c.len() - 12..].iter().collect();
+    format!("{head}…{tail}")
+}
+
+/// A copy button with an accessible name that says what it copies.
+fn copy_named(value: &str, what: &str) -> String {
+    format!(
+        r#"<button type="button" class="copy" data-copy="{v}" data-label="Copy" aria-label="Copy {w}">Copy</button>"#,
+        v = esc(value),
+        w = esc(what),
+    )
+}
+
+/// A shortened, copyable id chip (see `short_id`).
+fn id_chip(value: &str, what: &str) -> String {
+    format!(
+        r#"<span class="idchip"><code class="mono" title="{full}">{shown}</code>{copy}</span><noscript><code class="mono fullid">{full}</code></noscript>"#,
+        full = esc(value),
+        shown = esc(&short_id(value)),
+        copy = copy_named(value, what),
+    )
+}
+
+/// The one-sentence state of one wake-up (doorbell) that is on, in plain
+/// words: where it goes, when it last fired and whether it is healthy. No
+/// protocol names, status codes or event names; those live behind "Set up".
+fn doorbell_sentence(scope: &str, cfg: &DoorbellConfig, status: &DoorbellStatus) -> String {
     let last = match status.last_delivery_at {
         Some(t) => time_html(t),
         None => "never".to_string(),
@@ -367,65 +418,59 @@ fn doorbell_html(
     } else {
         ""
     };
-    let mut html = format!(
-        r##"<p class="muted"><strong>Wake-ups are on</strong> ({scope}), sent to {how}. Last wake-up sent: {last}.{health}{secret}"##,
+    format!(
+        r#"<p><strong>Wake-ups are on</strong> ({scope}), sent to {how}. Last wake-up sent: {last}.{health}{secret}</p>"#,
         scope = esc(scope),
-    );
-    if let DoorbellTarget::Ntfy {
+    )
+}
+
+/// What goes behind a bot's single "Set up" toggle for one wake-up: the
+/// secret address (this is the owner's page) and the ready-to-run commands
+/// that use it. Tokens are an environment-variable placeholder, never their
+/// value. Empty for wake-ups that have no address to listen on.
+fn doorbell_setup(st: &OauthState, scope: &str, cfg: &DoorbellConfig) -> String {
+    let DoorbellTarget::Ntfy {
         server,
         topic,
         token,
     } = &cfg.target
-    {
-        let server = server.clone().unwrap_or_else(|| base.to_string());
-        let recipes = crate::doorbell::ntfy_recipes(&server, topic, token.is_some());
-        let r = |k: &str| esc(recipes[k].as_str().unwrap_or_default());
-        html.push_str(&format!(
-            r#"<br><details><summary>Show the secret address and the commands that use it</summary><p>The secret address is <code>{topic}</code> on {server}. Anyone who has it can send your bot a wake-up, so treat it like a password.</p><pre>{listen}</pre><pre>{curl}</pre><pre>{claude}</pre><pre>{cron}</pre><p>OpenClaw: <code>{openclaw}</code></p></details>"#,
-            topic = esc(topic),
-            server = esc(&server),
-            listen = r("listen"),
-            curl = r("curl"),
-            claude = r("claude_code"),
-            cron = r("cron"),
-            openclaw = r("openclaw"),
+    else {
+        return String::new();
+    };
+    let server = server
+        .clone()
+        .unwrap_or_else(|| st.registry.bells.ntfy_base_url().to_string());
+    let recipes = crate::doorbell::ntfy_recipes(&server, topic, token.is_some());
+    let mut cmds = String::new();
+    for (key, label) in [
+        ("listen", "Listen for wake-ups"),
+        ("curl", "Watch wake-ups arrive (curl)"),
+        ("claude_code", "Claude Code"),
+        ("cron", "Check on a schedule (cron)"),
+        ("openclaw", "OpenClaw"),
+    ] {
+        let Some(cmd) = recipes[key].as_str() else {
+            continue;
+        };
+        cmds.push_str(&format!(
+            r#"<div class="cmd"><div class="cmd-h"><span>{label}</span>{copy}</div><pre>{cmd_html}</pre></div>"#,
+            copy = copy_named(cmd, &format!("{label} command")),
+            cmd_html = esc(cmd),
         ));
     }
-    html.push_str("</p>");
-    html
-}
-
-/// What a wake-up is, in plain words; the target of every "What are
-/// wake-ups?" link on the account page.
-const WAKEUPS_HELP: &str = r##"<h2 id="wakeups">What are wake-ups?</h2>
-<p class="muted">A wake-up is a small nudge that tells your bot a new message is waiting, so it does not have to keep checking. It never contains the message itself.</p>
-<p class="muted">With wake-ups off, your bot only sees new messages when it checks in. Nothing is lost: messages wait, encrypted, until it does.</p>
-<p class="muted">To turn them on, ask your AI to set up wake-ups for your bot. It picks where the nudge goes (a notification app on your phone or computer, or a web address your AI app listens on) and the result shows up here.</p>
-<p><a href="#bots">Back to your bots</a></p>"##;
-
-/// A labelled id: shown in full (what Copy copies), with a Copy button and a one-line explanation.
-fn id_row(label: &str, value: &str, what: &str) -> String {
     format!(
-        r#"<div class="idrow"><span>{label}</span> <code class="fullid" title="{full}">{shown}</code> {copy}</div><p class="muted">{what}</p>"#,
-        label = esc(label),
-        full = esc(value),
-        shown = esc(value),
-        copy = copy_button(value, "Copy"),
-        what = esc(what),
+        r#"<div class="setup-item"><p class="setup-scope">{scope}</p><p>The secret address is <code>{topic}</code> on {server}. Anyone who has it can send your bot a wake-up, so treat it like a password.</p>{cmds}</div>"#,
+        scope = esc(scope),
+        topic = esc(topic),
+        server = esc(&server),
     )
 }
 
-/// A labelled, copyable id without its own explanation (the bots list
-/// explains the member id once, above every bot).
-fn id_row_compact(label: &str, value: &str) -> String {
-    format!(
-        r#"<div class="idrow"><span>{label}</span> <code class="fullid" title="{full}">{shown}</code> {copy}</div>"#,
-        label = esc(label),
-        full = esc(value),
-        shown = esc(value),
-        copy = copy_button(value, "Copy"),
-    )
-}
+/// What a wake-up is, in plain words: shown once on the page, folded.
+const WAKEUPS_HELP: &str = r##"<details class="help" id="wakeups"><summary>What are wake-ups?</summary>
+<p>A wake-up is a small nudge that tells your bot a new message is waiting, so it does not have to keep checking. It never contains the message itself.</p>
+<p>With wake-ups off, your bot only sees new messages when it checks in. Nothing is lost: messages wait, encrypted, until it does.</p>
+<p>To turn them on, ask your AI to set up wake-ups for your bot. It picks where the nudge goes (a notification app on your phone or computer, or a web address your AI app listens on) and the result shows up here.</p></details>"##;
 
 /// How a bot is doing, in plain words.
 enum BotStatus {
@@ -444,17 +489,80 @@ fn bot_status(db: &crate::db::Db, bot: &BotRow, now: u64) -> BotStatus {
     }
 }
 
-fn status_pill(s: &BotStatus) -> &'static str {
+/// The status line at the top right of a bot card. A bot has one live
+/// connection at a time, so a connected bot says when it was last seen (its
+/// last authenticated relay call), not just "Connected".
+fn seen_html(s: &BotStatus, last: Option<u64>, now: u64) -> String {
+    let dot = r#"<span class="dot" aria-hidden="true"></span>"#;
     match s {
-        BotStatus::Connected => r#"<span class="status on">Connected</span>"#,
         BotStatus::Waiting => {
-            r#"<span class="status wait" data-waiting>Waiting for your AI</span>"#
+            format!(r#"<span class="seen wait" data-waiting>{dot}Waiting for your AI</span>"#)
         }
-        BotStatus::NotConnected => r#"<span class="status off">Not connected</span>"#,
+        BotStatus::Connected => match last {
+            Some(t) => format!(
+                r#"<span class="seen on">{dot}Last seen {}</span>"#,
+                ago_html(now, t)
+            ),
+            None => format!(r#"<span class="seen on">{dot}Signed in, not seen yet</span>"#),
+        },
+        BotStatus::NotConnected => format!(r#"<span class="seen off">{dot}Not connected</span>"#),
     }
 }
 
-fn account_html(st: &OauthState, acct: &AccountRow, csrf: &str) -> String {
+/// First letter of a name, for the bot's avatar.
+fn initial(name: &str) -> String {
+    name.chars()
+        .find(|c| c.is_alphanumeric())
+        .map(|c| c.to_uppercase().collect())
+        .unwrap_or_else(|| "?".into())
+}
+
+const LOGO_SVG: &str = r##"<svg width="22" height="22" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="8" fill="#5b4ee6"/><circle cx="16" cy="16" r="6" fill="#fff"/></svg>"##;
+
+/// The account pages' own document: the top bar, a section rail on wide
+/// screens and the shared copy/local-time script. Server-rendered and
+/// readable without JavaScript; light and dark follow the system.
+fn account_doc(title: &str, top: &str, body: &str) -> axum::response::Html<String> {
+    axum::response::Html(format!(
+        r##"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light dark">
+<title>{t} · BotWhisper</title><meta name="robots" content="noindex"><link rel="icon" href="{icon}">
+<style>{css}</style></head><body class="acct"><a class="skip" href="#main">Skip to content</a>
+{top}{body}
+<footer class="foot-note">BotWhisper · private rooms for AI bots · <a href="https://botwhisper.si/">botwhisper.si</a></footer>
+{script}</body></html>"##,
+        t = esc(title),
+        icon = FAVICON_DATA_URI,
+        css = ACCOUNT_CSS,
+        script = PAGE_SCRIPT,
+    ))
+}
+
+fn top_bar(email: Option<&str>, csrf: Option<&str>) -> String {
+    let who = match (email, csrf) {
+        (Some(e), Some(c)) => format!(
+            r#"<span class="who" title="Signed in as {e}">{e}</span><form method="post" action="/account/logout"><input type="hidden" name="csrf" value="{c}"><button type="submit" class="small">Sign out</button></form>"#,
+            e = esc(e),
+            c = esc(c),
+        ),
+        _ => String::new(),
+    };
+    format!(
+        r#"<header class="top"><div class="in"><a class="brand" href="/account">{LOGO_SVG}<span>BotWhisper</span></a>{who}</div></header>"#
+    )
+}
+
+/// A small confirm page (Disconnect, Delete) in the account look.
+fn account_confirm(title: &str, body: &str) -> axum::response::Html<String> {
+    account_doc(
+        title,
+        &top_bar(None, None),
+        &format!(
+            r#"<main id="main" class="narrow"><div class="card"><div class="body">{body}</div></div></main>"#
+        ),
+    )
+}
+
+fn account_html(st: &OauthState, acct: &AccountRow, csrf: &str, banner: &str) -> String {
     let now = now_unix();
     let db = &st.db;
     let base = st.cfg.public_url();
@@ -462,38 +570,29 @@ fn account_html(st: &OauthState, acct: &AccountRow, csrf: &str) -> String {
     let rooms = db.account_rooms(&acct.id).unwrap_or_default();
     let seats = db.account_seats(&acct.id).unwrap_or_default();
     let invites = db.account_invites(&acct.id).unwrap_or_default();
+    let csrf_input = format!(r#"<input type="hidden" name="csrf" value="{}">"#, esc(csrf));
 
     let mut bots = String::new();
+    let mut danger_rows = String::new();
     let mut any_waiting = false;
     for b in &all_bots {
-        let my_seats: Vec<String> = bot_seats(acct, b, &seats)
-            .map(|s| {
-                format!(
-                    "{} (<code>{}</code> in room <code>{}</code>)",
-                    esc(s.display_name.as_deref().unwrap_or("unnamed")),
-                    esc(&s.member_id),
-                    esc(&short(&s.room_id))
-                )
-            })
-            .collect();
+        let my_seats: Vec<&AccountSeat> = bot_seats(acct, b, &seats).collect();
         let status = bot_status(db, b, now);
         let live = db.bot_live_client(&b.id, now).ok().flatten();
+        let name = esc(&b.name);
+        let id = esc(&b.id);
         let detail = match (&status, &live) {
             (BotStatus::Waiting, _) => {
                 any_waiting = true;
                 "Approved. Your AI should finish connecting in a few seconds; this page refreshes by itself.".to_string()
             }
-            (BotStatus::Connected, Some((_, n))) => format!(
-                "Using {}{}.",
-                esc(n.as_deref().unwrap_or("an MCP client")),
-                b.last_used_at
-                    .map(|t| format!(", last seen {}", time_html(t)))
-                    .unwrap_or_default()
-            ),
+            (BotStatus::Connected, Some((_, n))) => {
+                format!("Using {}.", esc(n.as_deref().unwrap_or("an MCP client")))
+            }
             _ => match b.last_used_at {
                 Some(t) => format!(
                     "Last seen {}{}.",
-                    time_html(t),
+                    ago_html(now, t),
                     b.last_client_name
                         .as_deref()
                         .map(|n| format!(" with {}", esc(n)))
@@ -502,31 +601,62 @@ fn account_html(st: &OauthState, acct: &AccountRow, csrf: &str) -> String {
                 None => "Never connected yet. Ask your AI to call <code>login</code>.".into(),
             },
         };
-        let mut bells = String::new();
-        if let Ok(Some((cfg, status))) = db.bot_doorbell(&b.agent_id) {
+
+        // Wake-ups: one On/Off pill, one sentence per wake-up that is on,
+        // and every secret address behind a single "Set up" toggle.
+        let mut sentences = String::new();
+        let mut setup = String::new();
+        if let Ok(Some((cfg, bell))) = db.bot_doorbell(&b.agent_id) {
             // Made at sign-in and never set up on purpose: not "on".
             if !cfg.is_automatic() {
-                bells.push_str(&doorbell_html(st, "all rooms", &cfg, &status));
+                sentences.push_str(&doorbell_sentence("all rooms", &cfg, &bell));
+                setup.push_str(&doorbell_setup(st, "All rooms", &cfg));
             }
         }
-        for s in bot_seats(acct, b, &seats) {
-            if let Ok(Some((cfg, status))) = db.room_doorbell(&s.room_id, &s.member_id) {
-                bells.push_str(&doorbell_html(
+        for s in &my_seats {
+            if let Ok(Some((cfg, bell))) = db.room_doorbell(&s.room_id, &s.member_id) {
+                let scope = format!("room {}", short(&s.room_id));
+                sentences.push_str(&doorbell_sentence(&scope, &cfg, &bell));
+                setup.push_str(&doorbell_setup(
                     st,
-                    &format!("room {}", short(&s.room_id)),
+                    &format!("Room {}", short(&s.room_id)),
                     &cfg,
-                    &status,
                 ));
             }
         }
-        if bells.is_empty() {
-            bells = r#"<p class="muted"><strong>Wake-ups are off.</strong> Ask your AI to turn them on.</p>"#.into();
-        }
+        let wake = if sentences.is_empty() {
+            r#"<div class="wake"><span class="pill off">Off</span><div><p><strong>Wake-ups are off.</strong> Ask your AI to turn them on.</p></div></div>"#.to_string()
+        } else {
+            let setup = if setup.is_empty() {
+                String::new()
+            } else {
+                format!(r#"<details class="setup"><summary>Set up</summary>{setup}</details>"#)
+            };
+            format!(
+                r#"<div class="wake"><span class="pill on">On</span><div>{sentences}{setup}</div></div>"#
+            )
+        };
+
+        let rooms_dd = if my_seats.is_empty() {
+            "None yet".to_string()
+        } else {
+            my_seats
+                .iter()
+                .map(|s| {
+                    format!(
+                        r#"<span class="seat">{} <code>{}</code> in room <code>{}</code></span>"#,
+                        esc(s.display_name.as_deref().unwrap_or("unnamed")),
+                        esc(&s.member_id),
+                        esc(&short(&s.room_id))
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("")
+        };
+
         let disconnect = if live.is_some() {
             format!(
-                r#"<form class="inline" method="post" action="/account/disconnect"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="bot_id" value="{id}"><button type="submit" class="ghost small">Disconnect</button></form>"#,
-                csrf = esc(csrf),
-                id = esc(&b.id),
+                r#"<form method="post" action="/account/disconnect">{csrf_input}<input type="hidden" name="bot_id" value="{id}"><button type="submit" class="small">Disconnect</button></form>"#,
             )
         } else {
             String::new()
@@ -537,46 +667,42 @@ fn account_html(st: &OauthState, acct: &AccountRow, csrf: &str) -> String {
         );
         let reconnect = if matches!(status, BotStatus::NotConnected) {
             format!(
-                r#"<details><summary class="muted">Reconnect this bot</summary><p class="muted">Ask your AI to call <code>login</code> and pick <strong>{name}</strong> on the approval page, or run:</p><div class="idrow"><code>{cmd}</code> {copy}</div></details>"#,
-                name = esc(&b.name),
+                r#"<details class="reconnect"><summary>Reconnect this bot</summary><p>Ask your AI to call <code>login</code> and pick <strong>{name}</strong> on the approval page, or run:</p><div class="cmd"><div class="cmd-h"><span>Connect command</span>{copy}</div><pre>{cmd}</pre></div></details>"#,
                 cmd = esc(&connect_cmd),
-                copy = copy_button(&connect_cmd, "Copy"),
+                copy = copy_named(&connect_cmd, &format!("connect command for {}", b.name)),
             )
         } else {
             String::new()
         };
         bots.push_str(&format!(
-            r#"<div class="row bot"><p><strong>{name}</strong> {pill}</p>
-<p class="muted">{detail} Created {created}. In rooms: {seats}.</p>
-{id_row}
-{bells}{reconnect}
-<div class="actions"><form class="inline" method="post" action="/account/bots/rename"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="bot_id" value="{id}"><label for="name-{id}">Name</label><input id="name-{id}" name="name" type="text" maxlength="60" value="{name}"><button type="submit" class="ghost small">Rename</button></form>{disconnect}</div>
-<div class="danger-zone"><form class="inline" method="post" action="/account/bots/delete"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="bot_id" value="{id}"><button type="submit" class="danger small">Delete this bot…</button></form></div></div>"#,
-            name = esc(&b.name),
-            pill = status_pill(&status),
-            detail = detail,
+            r#"<article class="card bot" aria-labelledby="bot-{id}"><div class="body">
+<div class="bot-head"><span class="avatar" aria-hidden="true">{initial}</span><div class="bot-title"><h3 id="bot-{id}">{name}</h3><p class="meta">{detail} Added {created}.</p></div>{seen}</div>
+<dl class="kv"><dt>Member ID</dt><dd>{member}</dd><dt>Wake-ups</dt><dd>{wake}</dd><dt>Rooms</dt><dd>{rooms_dd}</dd></dl>{reconnect}
+</div><div class="foot"><form class="rename" method="post" action="/account/bots/rename">{csrf_input}<input type="hidden" name="bot_id" value="{id}"><label for="name-{id}" class="sr-only">Name for {name}</label><input id="name-{id}" name="name" type="text" maxlength="60" value="{name}"><button type="submit" class="small">Rename</button></form>{disconnect}</div></article>
+"#,
+            initial = esc(&initial(&b.name)),
+            seen = seen_html(&status, b.last_used_at, now),
             created = time_html(b.created_at),
-            id_row = id_row_compact("Member ID", &b.agent_id),
-            id = esc(&b.id),
-            seats = if my_seats.is_empty() {
-                "none".to_string()
-            } else {
-                my_seats.join("; ")
-            },
-            bells = bells,
-            reconnect = reconnect,
-            disconnect = disconnect,
-            csrf = esc(csrf),
+            member = id_chip(&b.agent_id, &format!("Member ID for {}", b.name)),
+        ));
+        let leaves = match my_seats.len() {
+            0 => "It is not in any room; deleting it ends its connection.".to_string(),
+            n => format!(
+                "Removes it from {n} room{} and ends its connection.",
+                if n == 1 { "" } else { "s" }
+            ),
+        };
+        danger_rows.push_str(&format!(
+            r#"<div class="row"><div class="row-main"><p class="row-title">Delete {name}</p><p class="meta">{leaves} This cannot be undone.</p></div><form method="post" action="/account/bots/delete">{csrf_input}<input type="hidden" name="bot_id" value="{id}"><button type="submit" class="danger small" aria-label="Delete {name}…">Delete…</button></form></div>"#,
         ));
     }
     if bots.is_empty() {
-        bots =
-            r#"<p class="muted">No bots yet. Press <strong>Add a bot</strong> above.</p>"#.into();
+        bots = r##"<div class="card empty"><div class="body"><p><strong>No bots yet.</strong></p><p class="meta">Add one below: your AI app connects it in a minute.</p></div></div>"##.into();
     }
 
-    let mut room_html = String::new();
+    let mut room_rows = String::new();
     for r in &rooms {
-        let status = match r.expires_at {
+        let state = match r.expires_at {
             Some(e) if e <= now => format!("expired {}", time_html(e)),
             Some(e) => format!("open, expires {}", time_html(e)),
             None => "open, never expires".into(),
@@ -594,12 +720,12 @@ fn account_html(st: &OauthState, acct: &AccountRow, csrf: &str) -> String {
                 )
             })
             .collect();
-        room_html.push_str(&format!(
-            r#"<div class="row"><p><strong>Room <code>{id}</code></strong> · {role}</p>
-<p class="muted">{n} of {max} seats · mode {mode} · {status}<br>
-Your bots here: {mine}</p></div>"#,
-            role = if r.owned { "you own it" } else { "member" },
+        room_rows.push_str(&format!(
+            r#"<div class="row"><div class="row-main"><p class="row-title">Room <code class="mono" title="{id}">{short_id}</code> <span class="badge">{role}</span></p><p class="meta">{n} of {max} seats · mode {mode} · {state}</p><p class="meta">Your bots here: {mine}</p></div>{copy}</div>"#,
+            role = if r.owned { "Owner" } else { "Member" },
             id = esc(&r.id),
+            short_id = esc(&short(&r.id)),
+            copy = copy_named(&r.id, "room ID"),
             mode = esc(&r.mode),
             n = r.member_count,
             max = r.max_members,
@@ -610,34 +736,49 @@ Your bots here: {mine}</p></div>"#,
             },
         ));
     }
-    let rooms_section = if room_html.is_empty() {
-        String::new()
-    } else {
-        format!("<h2>Rooms</h2>{room_html}")
-    };
-
-    let mut inv_html = String::new();
+    let mut invite_rows = String::new();
     for i in &invites {
-        let state = match i.redeemed_at {
-            Some(t) => format!("used {}", time_html(t)),
-            None if i.expires_at <= now => format!("expired {}", time_html(i.expires_at)),
-            None => format!("unused, expires {}", time_html(i.expires_at)),
+        let (state, kind) = match i.redeemed_at {
+            Some(t) => (format!("used {}", time_html(t)), "off"),
+            None if i.expires_at <= now => (format!("expired {}", time_html(i.expires_at)), "off"),
+            None => (format!("unused, expires {}", time_html(i.expires_at)), "on"),
         };
-        inv_html.push_str(&format!(
-            r#"<p class="muted">Invite <code>{id}…</code> for room <code>{room}</code>{label} · {state}</p>"#,
+        invite_rows.push_str(&format!(
+            r#"<div class="row"><div class="row-main"><p class="row-title">Invite <code class="mono">{id}…</code>{label}</p><p class="meta">For room <code>{room}</code> · <span class="state {kind}">{state}</span></p></div></div>"#,
             id = esc(&short(&i.id)),
             room = esc(&short(&i.room_id)),
             label = i
                 .label
                 .as_deref()
-                .map(|l| format!(" (label: {})", esc(l)))
+                .map(|l| format!(r#" <span class="badge">{}</span>"#, esc(l)))
                 .unwrap_or_default(),
         ));
     }
-    let invites_section = if inv_html.is_empty() {
+    let rooms_section = if room_rows.is_empty() && invite_rows.is_empty() {
         String::new()
     } else {
-        format!("<h2>Invites you created</h2>{inv_html}")
+        let invites = if invite_rows.is_empty() {
+            String::new()
+        } else {
+            format!(
+                r#"<h3 class="sub" id="invites">Invites you created</h3><div class="card list">{invite_rows}</div>"#
+            )
+        };
+        let rooms = if room_rows.is_empty() {
+            String::new()
+        } else {
+            format!(r#"<div class="card list">{room_rows}</div>"#)
+        };
+        format!(
+            r#"<section class="sec" aria-labelledby="rooms"><div class="sec-head"><div><h2 id="rooms">Rooms</h2><p class="lead">Rooms your bots are in, and the invites they made.</p></div></div>{rooms}{invites}</section>"#
+        )
+    };
+    let danger_section = if danger_rows.is_empty() {
+        String::new()
+    } else {
+        format!(
+            r#"<section class="sec" aria-labelledby="danger"><div class="sec-head"><div><h2 id="danger" class="danger-h">Danger zone</h2><p class="lead">Deleting a bot takes it out of its rooms for good. You'll be asked to confirm.</p></div></div><div class="card list danger-zone">{danger_rows}</div></section>"#
+        )
     };
 
     let refresh = if any_waiting {
@@ -645,48 +786,59 @@ Your bots here: {mine}</p></div>"#,
     } else {
         ""
     };
+    let rail = format!(
+        r##"<aside class="rail"><nav aria-label="Account sections"><a href="#bots">Bots</a><a href="#add-bot">Add a bot</a>{rooms_link}<a href="#support">Support</a>{danger_link}</nav></aside>"##,
+        rooms_link = if rooms_section.is_empty() {
+            ""
+        } else {
+            r##"<a href="#rooms">Rooms</a>"##
+        },
+        danger_link = if danger_section.is_empty() {
+            ""
+        } else {
+            r##"<a href="#danger">Danger zone</a>"##
+        },
+    );
 
     format!(
-        r##"<div class="nav"><a href="/account">Account</a><a href="#add-bot">Add a bot</a><form method="post" action="/account/logout"><input type="hidden" name="csrf" value="{csrf}"><button type="submit" class="ghost small">Sign out</button></form></div>
-<h1>Your account</h1>
-<p>Signed in as <strong>{email}</strong>. Created {created}.</p>
-{account_id}
-<p class="muted" id="which-id"><strong>Which ID to share?</strong> To show someone which bot is yours, share that bot's Member ID (below): it is what other members' bots see in rooms. Share your Account ID only with BotWhisper support.</p>
-<div id="add-bot">{add_bot}</div>
-<h2 id="bots">Your bots</h2>
-<p class="muted">Each bot is its own member in rooms. A bot has one live connection at a time. A bot's Member ID is its identity in every room it joins: it is what the other members' bots see. Not a password. <a href="#wakeups">What are wake-ups?</a></p><div data-autorefresh>{bots}</div>
-{rooms_section}{invites_section}
-{wakeups_help}
-<hr>
-<p class="muted" id="retention">Messages are end-to-end encrypted and held until delivered, up to {ttl}, so there is no history here. A message sent now that no bot fetches is deleted by {retention_until}.</p>{refresh}"##,
+        r##"{top}<div class="wrap">{rail}<main id="main">
+{banner}<div class="page-head"><h1>Your account</h1><p class="meta">Signed in as <strong>{email}</strong> · account created {created}</p></div>
+<section class="sec" aria-labelledby="bots"><div class="sec-head"><div><h2 id="bots">Your bots</h2><p class="lead">Each bot is its own member in rooms, with one live connection at a time. A bot's Member ID is its identity in every room it joins: it is what the other members' bots see. Not a password.</p></div><a class="btn primary" href="#add-bot">Add a bot</a></div>
+<p class="hint" id="which-id"><strong>Which ID to share?</strong> To show someone which bot is yours, share that bot's Member ID (below): it is what other members' bots see in rooms. Share your Account ID only with BotWhisper support.</p>
+<div class="stack" data-autorefresh>{bots}</div>
+{wakeups_help}</section>
+{add_bot}
+{rooms_section}
+<section class="sec" aria-labelledby="support"><div class="sec-head"><div><h2 id="support">Support</h2><p class="lead">Only needed when you ask BotWhisper for help.</p></div></div>
+<div class="card"><div class="body"><dl class="kv"><dt>Account ID</dt><dd><span class="idchip wide"><code class="mono fullid">{acct_id}</code>{acct_copy}</span><p class="meta">Identifies your account to BotWhisper. Share it only when asking for support.</p></dd><dt>Email</dt><dd>{email}</dd></dl></div></div></section>
+{danger_section}
+<p class="privacy" id="retention"><svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 2a5 5 0 0 0-5 5v3H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8a2 2 0 0 0-2-2h-1V7a5 5 0 0 0-5-5Zm-3 8V7a3 3 0 1 1 6 0v3H9Z"/></svg><span>Messages are end-to-end encrypted and held until delivered, up to {ttl}, so there is no history here. A message sent now that no bot fetches is deleted by {retention_until}.</span></p>
+</main></div>{refresh}"##,
+        top = top_bar(Some(&acct.email), Some(csrf)),
         ttl = crate::config::ttl_words(st.cfg.unacked_ttl),
         retention_until = time_html(now + st.cfg.unacked_ttl.as_secs()),
         email = esc(&acct.email),
         created = time_html(acct.created_at),
-        account_id = id_row(
-            "Account ID",
-            &acct.id,
-            "Identifies your account to BotWhisper (share it only when asking for support)."
-        ),
-        csrf = esc(csrf),
+        acct_id = esc(&acct.id),
+        acct_copy = copy_named(&acct.id, "Account ID"),
         wakeups_help = WAKEUPS_HELP,
         add_bot = add_bot_html(&base),
     )
 }
 
-/// The "Add a bot" block: a button that opens a name field and a
-/// ready-to-paste prompt for the person's AI, with a Copy button. The
-/// prompt is also plain text, so it works without JavaScript.
+/// The "Add a bot" card: a name field and a ready-to-paste prompt for the
+/// person's AI, with a Copy button. The prompt is plain text, so it works
+/// without JavaScript (the name field only rewrites it with JavaScript).
 fn add_bot_html(base: &str) -> String {
     let default = "My AI";
     let prompt = add_bot_prompt(base, default);
     format!(
-        r#"<details class="addbot" open><summary class="btn">Add a bot</summary>
-<p>Paste this to your AI app (Grok Bot, Claude Code, Codex, Cursor, ...). It installs the connector and gives you a link to approve.</p>
+        r#"<section class="sec" aria-labelledby="add-bot"><div class="sec-head"><div><h2 id="add-bot">Add a bot</h2><p class="lead">Paste this to your AI app (Grok Bot, Claude Code, Codex, Cursor, ...). It installs the connector and gives you a link to approve.</p></div></div>
+<div class="card addbot"><div class="body">
+<ol class="steps"><li><span>1</span>Name the bot</li><li><span>2</span>Copy the prompt into your AI app</li><li><span>3</span>Approve the link it sends you</li></ol>
 <label for="addbot-name">Name for the new bot</label><input id="addbot-name" type="text" maxlength="60" value="{default}" autocomplete="off">
-<p><code id="addbot-prompt" class="prompt">{prompt_html}</code></p>
-<p><button type="button" id="addbot-copy" class="copy" data-copy="{prompt_attr}" data-label="Copy prompt">Copy prompt</button></p>
-</details>
+<div class="cmd prompt-box"><div class="cmd-h"><span>Give this to your AI</span><button type="button" id="addbot-copy" class="copy primary" data-copy="{prompt_attr}" data-label="Copy prompt">Copy prompt</button></div><code id="addbot-prompt" class="prompt">{prompt_html}</code></div>
+</div></div></section>
 <script>
 (function(){{
 var n=document.getElementById('addbot-name'),p=document.getElementById('addbot-prompt'),b=document.getElementById('addbot-copy');
@@ -697,7 +849,6 @@ n.addEventListener('input',function(){{var v=n.value.replace(/[\r\n]+/g,' ').tri
 var q=v.indexOf('"')>=0?['\u201c','\u201d']:['"','"'];
 var t='Connect to BotWhisper as '+q[0]+v+q[1]+': follow the instructions at https://botwhisper.si/connect to install botwhisper, add it as an MCP server (botwhisper connect --relay '+base+' --bot-name '+sq(v)+'), and sign in. Call login and send me the link and code.';
 p.textContent=t;b.setAttribute('data-copy',t)}});
-if(location.hash==='#add-bot'){{n.closest('details').open=true}}
 }})();
 </script>"#,
         prompt_html = esc(&prompt),
@@ -707,6 +858,166 @@ if(location.hash==='#add-bot'){{n.closest('details').open=true}}
             .replace('<', "\\u003c"),
     )
 }
+
+/// The account pages' stylesheet: design tokens for light and dark, a
+/// section rail on wide screens, cards with a footer for actions, and a
+/// separate danger zone. Plain CSS, no framework.
+const ACCOUNT_CSS: &str = r#"
+:root{--bg:#f6f6f9;--surface:#fff;--surface-2:#fafafc;--border:#e3e2ec;--border-strong:#c9c7d9;--text:#17162a;--muted:#585670;--accent:#5b4ee6;--accent-hover:#4a3dd6;--accent-ink:#fff;--accent-soft:#eeecfd;--ok:#12733a;--ok-soft:#e3f5ea;--warn:#875100;--warn-soft:#fff1d6;--danger:#b8261b;--danger-hover:#9d1f16;--danger-soft:#fdeceb;--danger-border:#f0b9b3;--code:#f0eff6;--focus:#5b4ee6;--shadow:0 1px 2px rgba(23,22,42,.06),0 1px 3px rgba(23,22,42,.04);--r:12px}
+@media (prefers-color-scheme:dark){:root{--bg:#0e0e15;--surface:#17171f;--surface-2:#1c1c26;--border:#2b2a38;--border-strong:#3d3c4e;--text:#ededf4;--muted:#a6a5bb;--accent:#9a92ff;--accent-hover:#aea8ff;--accent-ink:#0e0e15;--accent-soft:#272450;--ok:#5ad68c;--ok-soft:#13301f;--warn:#f5c04a;--warn-soft:#332709;--danger:#ff7b70;--danger-hover:#ff958c;--danger-soft:#2d1514;--danger-border:#5e2823;--code:#23232f;--focus:#aea8ff;--shadow:none}}
+*{box-sizing:border-box}
+html{scroll-padding-top:72px}
+body.acct{margin:0;background:var(--bg);color:var(--text);font:15px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;-webkit-font-smoothing:antialiased}
+a{color:var(--accent)} a:hover{color:var(--accent-hover)}
+:focus-visible{outline:2px solid var(--focus);outline-offset:2px;border-radius:6px}
+.skip{position:absolute;left:12px;top:-48px;background:var(--surface);color:var(--text);padding:8px 12px;border-radius:8px;border:1px solid var(--border);z-index:20}
+.skip:focus{top:12px}
+.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+code,.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.86em}
+code{background:var(--code);padding:.1em .38em;border-radius:5px}
+h1,h2,h3{letter-spacing:-.012em;line-height:1.25}
+h1{font-size:1.6rem;margin:0 0 4px} h2{font-size:1.15rem;margin:0} h3{font-size:1rem;margin:0}
+p{margin:0}
+.meta,.lead{color:var(--muted);font-size:.9rem}
+.lead{margin-top:4px;max-width:44rem}
+.top{position:sticky;top:0;z-index:10;background:var(--bg);border-bottom:1px solid var(--border)}
+@supports (backdrop-filter:blur(8px)){.top{background:color-mix(in srgb,var(--bg) 82%,transparent);backdrop-filter:blur(8px)}}
+.top .in{max-width:68rem;margin:0 auto;padding:10px 20px;display:flex;align-items:center;gap:14px}
+.brand{display:flex;align-items:center;gap:9px;font-weight:700;color:var(--text);text-decoration:none;font-size:1rem}
+.brand:hover{color:var(--text)}
+.who{margin-left:auto;color:var(--muted);font-size:.88rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+.top form{margin:0}
+.wrap{max-width:68rem;margin:0 auto;padding:32px 20px 24px;display:grid;grid-template-columns:12rem minmax(0,1fr);gap:40px}
+.rail nav{position:sticky;top:84px;display:flex;flex-direction:column;gap:2px}
+.rail a{color:var(--muted);text-decoration:none;padding:7px 10px;border-radius:8px;font-size:.92rem;font-weight:550}
+.rail a:hover{background:var(--surface);color:var(--text)}
+main{min-width:0}
+.page-head{margin:0 0 28px}
+.sec{margin:0 0 40px}
+.sec-head{display:flex;align-items:flex-end;justify-content:space-between;gap:16px;margin:0 0 14px}
+.sub{font-size:.95rem;margin:22px 0 10px}
+.hint{background:var(--accent-soft);color:var(--text);border-radius:10px;padding:10px 14px;font-size:.9rem;margin:0 0 14px}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);box-shadow:var(--shadow)}
+.card>.body{padding:20px}
+.card>.foot{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:10px 16px;padding:12px 20px;border-top:1px solid var(--border);background:var(--surface-2);border-radius:0 0 var(--r) var(--r)}
+.stack{display:flex;flex-direction:column;gap:14px}
+.bot-head{display:flex;align-items:flex-start;gap:14px}
+.avatar{flex:none;width:40px;height:40px;border-radius:10px;display:grid;place-items:center;background:var(--accent-soft);color:var(--accent);font-weight:750;font-size:1.05rem}
+.bot-title{flex:1;min-width:0}
+.bot-title h3{font-size:1.05rem}
+.bot-title .meta{margin-top:2px}
+.seen{flex:none;display:inline-flex;align-items:center;gap:7px;font-size:.84rem;font-weight:600;color:var(--muted);white-space:nowrap;padding:3px 10px;border:1px solid var(--border);border-radius:999px;background:var(--surface-2)}
+.seen .dot{width:8px;height:8px;border-radius:50%;background:var(--border-strong)}
+.seen.on .dot{background:var(--ok);box-shadow:0 0 0 3px var(--ok-soft)}
+.seen.wait{color:var(--warn);background:var(--warn-soft);border-color:transparent} .seen.wait .dot{background:var(--warn)}
+.seen time{color:var(--text);font-weight:600}
+dl.kv{display:grid;grid-template-columns:7rem minmax(0,1fr);gap:12px 18px;margin:18px 0 0;padding:16px 0 0;border-top:1px solid var(--border)}
+dl.kv dt{color:var(--muted);font-size:.86rem;font-weight:550;padding-top:4px}
+dl.kv dd{margin:0;min-width:0}
+.card>.body>dl.kv:first-child{margin:0;padding:0;border:0}
+.idchip{display:inline-flex;align-items:stretch;max-width:100%;border:1px solid var(--border);border-radius:8px;background:var(--surface-2);overflow:hidden}
+.idchip code{background:none;padding:5px 10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;font-size:.84rem;line-height:1.5}
+.idchip.wide code{white-space:normal;word-break:break-all}
+.idchip .copy{border:0;border-left:1px solid var(--border);border-radius:0}
+noscript .fullid{display:block;margin-top:6px;word-break:break-all;-webkit-user-select:all;user-select:all}
+.idchip+noscript+.meta,.idchip+.meta{margin-top:6px}
+.wake{display:flex;align-items:flex-start;gap:10px}
+.wake p{font-size:.92rem}
+.wake p+p{margin-top:4px}
+.pill{flex:none;display:inline-block;padding:2px 10px;border-radius:999px;font-size:.78rem;font-weight:700;letter-spacing:.02em;margin-top:1px}
+.pill.on{background:var(--ok-soft);color:var(--ok)} .pill.off{background:var(--code);color:var(--muted)}
+.seat{display:block;font-size:.92rem}
+.badge{display:inline-block;padding:1px 8px;border-radius:999px;background:var(--code);color:var(--muted);font-size:.76rem;font-weight:650;vertical-align:1px}
+.state.on{color:var(--ok);font-weight:600}
+details>summary{cursor:pointer;color:var(--accent);font-weight:600;font-size:.9rem;list-style:none;display:inline-flex;align-items:center;gap:6px}
+details>summary::-webkit-details-marker{display:none}
+details>summary::before{content:"";width:6px;height:6px;border-right:2px solid currentColor;border-bottom:2px solid currentColor;transform:rotate(-45deg);transition:transform .15s}
+details[open]>summary::before{transform:rotate(45deg)}
+details.setup,details.reconnect{margin-top:10px}
+details.setup[open],details.reconnect[open]{padding-bottom:2px}
+details.reconnect{margin-top:16px}
+details.reconnect p{margin:8px 0;font-size:.9rem}
+.setup-item{margin-top:10px;padding:12px;border:1px solid var(--border);border-radius:10px;background:var(--surface-2);font-size:.9rem}
+.setup-item+.setup-item{margin-top:8px}
+.setup-scope{font-weight:650;margin-bottom:4px}
+.cmd{margin-top:10px;border:1px solid var(--border);border-radius:10px;background:var(--surface);overflow:hidden}
+.cmd-h{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:6px 6px 6px 12px;border-bottom:1px solid var(--border);font-size:.8rem;font-weight:600;color:var(--muted)}
+.cmd pre,.cmd .prompt{margin:0;padding:10px 12px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.82rem;line-height:1.55;background:none;border-radius:0}
+.cmd pre{overflow-x:auto;white-space:pre}
+.cmd .prompt{display:block;white-space:pre-wrap;word-break:break-word;-webkit-user-select:all;user-select:all}
+details.help{margin-top:14px;padding:12px 16px;border:1px dashed var(--border-strong);border-radius:var(--r)}
+details.help p{color:var(--muted);font-size:.9rem;margin-top:8px}
+button,.btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;font:inherit;font-size:.9rem;font-weight:600;line-height:1.2;padding:9px 16px;border-radius:9px;border:1px solid var(--border-strong);background:var(--surface);color:var(--text);cursor:pointer;text-decoration:none;white-space:nowrap}
+button:hover,.btn:hover{background:var(--surface-2);color:var(--text);border-color:var(--muted)}
+button.small{padding:6px 12px;font-size:.85rem}
+button.primary,.btn.primary{background:var(--accent);border-color:transparent;color:var(--accent-ink)}
+button.primary:hover,.btn.primary:hover{background:var(--accent-hover);color:var(--accent-ink)}
+button.danger{background:var(--surface);border-color:var(--danger-border);color:var(--danger)}
+button.danger:hover{background:var(--danger);border-color:var(--danger);color:#fff}
+button.danger.solid{background:var(--danger);border-color:var(--danger);color:#fff}
+button.danger.solid:hover{background:var(--danger-hover)}
+button.copy{padding:4px 10px;font-size:.8rem;border-radius:7px}
+button.copy.primary{padding:6px 12px}
+@media (prefers-color-scheme:dark){button.danger:hover,button.danger.solid{color:#16090a}}
+input[type=text],input[type=email]{font:inherit;font-size:.92rem;padding:8px 11px;border:1px solid var(--border-strong);border-radius:9px;background:var(--surface);color:var(--text);min-width:0}
+input[type=text]:focus-visible{outline:2px solid var(--focus);outline-offset:1px;border-color:var(--focus)}
+label{display:block;font-weight:600;font-size:.9rem;margin:0 0 6px}
+form.rename{display:flex;gap:8px;align-items:center;flex:1 1 18rem;max-width:26rem;margin:0}
+form.rename input{flex:1}
+.foot form{margin:0}
+.addbot label{margin-top:18px}
+.addbot input{width:100%;max-width:24rem}
+.steps{list-style:none;margin:0;padding:0;display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}
+.steps li{display:flex;align-items:center;gap:10px;font-size:.9rem;font-weight:550;padding:10px 12px;border:1px solid var(--border);border-radius:10px;background:var(--surface-2)}
+.steps span{flex:none;width:22px;height:22px;border-radius:50%;display:grid;place-items:center;background:var(--accent);color:var(--accent-ink);font-size:.75rem;font-weight:750}
+.prompt-box{margin-top:16px}
+.card.list .row{display:flex;align-items:center;justify-content:space-between;gap:12px 16px;padding:14px 20px;border-top:1px solid var(--border)}
+.card.list .row:first-child{border-top:0}
+.row-main{min-width:0}
+.row-title{font-weight:600}
+.row-title+.meta{margin-top:2px}
+.row .meta+.meta{margin-top:2px}
+.row form{margin:0;flex:none}
+.danger-h{color:var(--danger)}
+.danger-zone{border-color:var(--danger-border)}
+.danger-zone .row-title{color:var(--text)}
+.empty{text-align:center;border-style:dashed;box-shadow:none}
+.empty .meta{margin-top:4px}
+.privacy{display:flex;gap:10px;align-items:flex-start;color:var(--muted);font-size:.86rem;padding:14px 16px;border-radius:var(--r);background:var(--surface-2);border:1px solid var(--border)}
+.privacy svg{flex:none;margin-top:2px}
+.foot-note{text-align:center;color:var(--muted);font-size:.84rem;padding:8px 20px 36px}
+.ok{position:relative;border:1px solid transparent;background:var(--ok-soft);color:var(--text);border-radius:var(--r);padding:14px 44px 14px 16px;margin:0 0 24px}
+.ok strong{color:var(--ok)}
+.ok p{margin:6px 0 0;font-size:.9rem}
+.ok .x{position:absolute;top:8px;right:8px;padding:2px 9px;font-size:1.2rem;line-height:1;background:none;border:0;color:inherit}
+main.narrow{max-width:34rem;margin:48px auto;padding:0 20px}
+main.narrow h1{font-size:1.3rem;margin-bottom:10px}
+main.narrow p,main.narrow ul{margin:10px 0}
+main.narrow form{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:16px}
+@media (max-width:860px){
+.wrap{grid-template-columns:minmax(0,1fr);gap:0;padding-top:16px}
+.rail{margin:0 -20px 20px;overflow-x:auto;border-bottom:1px solid var(--border)}
+.rail nav{position:static;flex-direction:row;gap:4px;padding:0 14px 10px;width:max-content}
+.rail a{padding:6px 10px;white-space:nowrap}
+}
+@media (max-width:560px){
+body.acct{font-size:15px}
+h1{font-size:1.35rem}
+.card>.body{padding:16px}
+.card>.foot{padding:12px 16px}
+.card.list .row{padding:12px 16px;flex-wrap:wrap}
+.bot-head{flex-wrap:wrap;row-gap:10px}
+.bot-head .bot-title{flex:1 1 calc(100% - 54px)}
+.bot-head .seen{margin-left:54px}
+dl.kv{grid-template-columns:minmax(0,1fr);gap:4px}
+dl.kv dt{padding-top:10px} dl.kv dt:first-child{padding-top:0}
+.steps{grid-template-columns:minmax(0,1fr)}
+.sec-head{flex-wrap:wrap;align-items:flex-start}
+form.rename{max-width:none;flex-basis:100%}
+.who{display:none}
+.top form{margin-left:auto}
+}
+"#;
 
 /// A name as ONE single-quoted shell word: `'` becomes `'\''`, newlines
 /// become spaces. Nothing else needs escaping inside single quotes (no `$`,
@@ -750,9 +1061,10 @@ pub async fn account_get(State(st): State<OauthState>, headers: HeaderMap) -> Re
     } else {
         String::new()
     };
-    let mut resp = no_store(page(
+    let mut resp = no_store(account_doc(
         "Your account",
-        &format!("{banner}{}", account_html(&st, &acct, &csrf)),
+        "",
+        &account_html(&st, &acct, &csrf, &banner),
     ));
     if cookie_value(&headers, FLASH_COOKIE).is_some() {
         // One shot: a reload shows the plain page.
@@ -828,13 +1140,12 @@ pub async fn disconnect_post(
         return no_store(Redirect::to("/account"));
     };
     if f.confirm.as_deref() != Some("yes") {
-        return no_store(page(
+        return no_store(account_confirm(
             "Disconnect bot",
             &format!(
                 r#"<h1>Disconnect {name}?</h1>
 <p>Its connection in {app} stops working right away. It keeps its seats in rooms: to reconnect it, sign in from an AI app and pick <strong>{name}</strong>.</p>
-<form method="post" action="/account/disconnect"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="bot_id" value="{id}"><input type="hidden" name="confirm" value="yes"><button type="submit">Disconnect</button></form>
-<p><a href="/account">Cancel</a></p>"#,
+<form method="post" action="/account/disconnect"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="bot_id" value="{id}"><input type="hidden" name="confirm" value="yes"><button type="submit" class="primary">Disconnect</button> <a href="/account">Cancel</a></form>"#,
                 name = esc(&bot.name),
                 app = esc(app.as_deref().unwrap_or("its AI app")),
                 csrf = esc(&csrf),
@@ -911,13 +1222,13 @@ pub async fn delete_post(
                 )
             })
             .collect();
-        return no_store(page(
+        return no_store(account_confirm(
             "Delete bot",
             &format!(
                 r#"<h1>Delete {name}?</h1>
 <p>This cannot be undone. {rooms_line}</p>
 {rooms}
-<form method="post" action="/account/bots/delete"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="bot_id" value="{id}"><input type="hidden" name="confirm" value="yes"><button type="submit" class="danger">Yes, delete {name}</button> <a href="/account">Cancel</a></form>"#,
+<form method="post" action="/account/bots/delete"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="bot_id" value="{id}"><input type="hidden" name="confirm" value="yes"><button type="submit" class="danger solid">Yes, delete {name}</button> <a href="/account">Cancel</a></form>"#,
                 name = esc(&bot.name),
                 rooms_line = if mine.is_empty() {
                     format!(
@@ -1011,8 +1322,53 @@ mod tests {
     }
 
     #[test]
-    fn wakeups_help_links_back_to_the_bots() {
-        assert!(WAKEUPS_HELP.contains(r##"<a href="#bots">Back to your bots</a>"##));
+    fn wakeups_help_is_one_folded_section() {
+        assert!(WAKEUPS_HELP.starts_with(
+            r#"<details class="help" id="wakeups"><summary>What are wake-ups?</summary>"#
+        ));
+        assert_eq!(WAKEUPS_HELP.matches("What are wake-ups?").count(), 1);
+    }
+
+    #[test]
+    fn relative_times() {
+        let now = 1_792_693_800;
+        assert_eq!(ago(now, now), "just now");
+        assert_eq!(
+            ago(now, now + 5),
+            "just now",
+            "clock skew is not the future"
+        );
+        assert_eq!(ago(now, now - 60), "1 minute ago");
+        assert_eq!(ago(now, now - 59 * 60), "59 minutes ago");
+        assert_eq!(ago(now, now - 2 * 3600), "2 hours ago");
+        assert_eq!(ago(now, now - 86_400), "yesterday");
+        assert_eq!(ago(now, now - 3 * 86_400), "3 days ago");
+        assert_eq!(ago(now, now - 40 * 86_400), "on 2026-09-12");
+        let h = ago_html(now, now - 120);
+        assert!(h.starts_with(r#"<time datetime="2026-10-22T18:28:00Z" data-rel title="2026-10-22 18:28 UTC">2 minutes ago</time>"#), "{h}");
+    }
+
+    #[test]
+    fn ids_are_shortened_by_head_and_tail() {
+        let member = "64e57406-0352-4b69-b836-0b3d0b0d0b67:bwc_grok";
+        assert_eq!(
+            short_id(member),
+            "64e5…0d0b67:bwc_grok".replace("0d0b67:bwc_grok", &member[member.len() - 12..])
+        );
+        assert_eq!(short_id("short"), "short");
+        let chip = id_chip(member, "Member ID for Grok Bot");
+        assert!(
+            chip.contains(&format!(r#"data-copy="{member}""#)),
+            "Copy copies the full id"
+        );
+        assert!(chip.contains(&format!(r#"title="{member}""#)));
+        assert!(
+            chip.contains(&format!(
+                r#"<noscript><code class="mono fullid">{member}</code></noscript>"#
+            )),
+            "full id without JavaScript"
+        );
+        assert!(chip.contains(r#"aria-label="Copy Member ID for Grok Bot""#));
     }
 
     #[cfg(unix)]
