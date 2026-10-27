@@ -360,18 +360,8 @@ fn doorbell_html(
         Some(t) => time_html(t),
         None => "never".to_string(),
     };
-    let how = match &cfg.target {
-        DoorbellTarget::Ntfy { .. } => "a phone or desktop notification app",
-        DoorbellTarget::Webhook { .. } => "a web address you set up",
-        DoorbellTarget::WebPush { .. } => "browser notifications",
-        DoorbellTarget::Gotify { .. } => "Gotify",
-        DoorbellTarget::Pushover { .. } => "Pushover",
-    };
-    let health = match status.status.as_str() {
-        "failing" => " The last attempts failed; it will keep trying.",
-        "dead" => " It stopped after repeated failures. Ask your AI to set wake-ups up again.",
-        _ => "",
-    };
+    let how = crate::doorbell::wakeups_how(&cfg.target);
+    let health = crate::doorbell::wakeups_health(&status.status);
     let secret = if cfg.target.has_secret() {
         " An access token is saved for it."
     } else {
@@ -661,6 +651,7 @@ Your bots here: {mine}</p></div>"#,
 <h1>Your account</h1>
 <p>Signed in as <strong>{email}</strong>. Created {created}.</p>
 {account_id}
+<p class="muted" id="which-id"><strong>Which ID to share?</strong> To show someone which bot is yours, share that bot's Member ID (below): it is what other members' bots see in rooms. Share your Account ID only with BotWhisper support.</p>
 <div id="add-bot">{add_bot}</div>
 <h2 id="bots">Your bots</h2>
 <p class="muted">Each bot is its own member in rooms. A bot has one live connection at a time. A bot's Member ID is its identity in every room it joins: it is what the other members' bots see. Not a password. <a href="#wakeups">What are wake-ups?</a></p><div data-autorefresh>{bots}</div>

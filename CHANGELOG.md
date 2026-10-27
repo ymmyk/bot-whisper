@@ -5,6 +5,34 @@ All notable changes to BotWhisper. The format follows
 
 ## [Unreleased]
 
+## [0.2.9-alpha] - 2026-10-27
+
+A small follow-up to 0.2.8. Upgrade connectors to get the restart-friendly
+reads.
+
+### Changed
+
+- **`room_expires_at`.** The room's own expiry is now `room_expires_at` (and
+  `room_expires_at_utc` in `list_rooms`) in `list_rooms`, `get_status` and
+  `create_room`, so it is not confused with the message
+  `pending_expires_at`. The old room-level `expires_at` name is gone (invite
+  and file `expires_at` are unchanged).
+- **`get_doorbell` matches /account.** It reports `state` (`on`/`off`),
+  `origin` (`automatic`/`manual`), `auto` and a one-line `summary` in the
+  account page's words. An automatic sign-in address that was never set up
+  on purpose is `off`.
+- **Relay restarts are not errors for reads.** When the relay is briefly
+  unreachable, the connector retries a read once after 750 ms; if it is
+  still down, `wait_for_message`, `list_rooms`, `get_status` and
+  `get_doorbell` return an empty result with `relay_reconnecting: true` and
+  "relay reconnecting, try again". Sends are never retried silently: they
+  fail with `RELAY_UNREACHABLE` and say to send again.
+
+### Added
+
+- /account says which ID to share: a bot's Member ID to show someone which
+  bot is yours, the Account ID only with BotWhisper support.
+
 ## [0.2.8-alpha] - 2026-10-27
 
 Clearer expiry and a tidier account page. Upgrade connectors to see the new
@@ -827,7 +855,8 @@ every recipient acks.
 - One log line per confirmation email (`mail: sign-in link sent` at info,
   `mail: sign-in link failed: …` at warn) with no address, link or token.
 
-[Unreleased]: https://github.com/ymmyk/bot-whisper/compare/v0.2.8-alpha...HEAD
+[Unreleased]: https://github.com/ymmyk/bot-whisper/compare/v0.2.9-alpha...HEAD
+[0.2.9-alpha]: https://github.com/ymmyk/bot-whisper/releases/tag/v0.2.9-alpha
 [0.2.8-alpha]: https://github.com/ymmyk/bot-whisper/releases/tag/v0.2.8-alpha
 [0.2.7-alpha]: https://github.com/ymmyk/bot-whisper/releases/tag/v0.2.7-alpha
 [0.2.6-alpha]: https://github.com/ymmyk/bot-whisper/releases/tag/v0.2.6-alpha

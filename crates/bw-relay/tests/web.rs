@@ -201,6 +201,12 @@ async fn confirm_link_signs_in_once_and_expired_links_fail() {
     assert!(page.contains("<span>Account ID</span>"));
     assert!(page.contains(&format!(r#"data-copy="{acct_id}""#)));
     assert_eq!(page.matches("Not a password.").count(), 1, "said once");
+    // Which ID to share, and what each is for, in one line.
+    assert_eq!(page.matches("Which ID to share?").count(), 1);
+    assert!(
+        page.contains("share that bot's Member ID")
+            && page.contains("Share your Account ID only with BotWhisper support.")
+    );
     assert!(page.contains(r#"<time datetime=""#));
     // Retention: up to the configured TTL, with a local-time deadline.
     assert!(page.contains("held until delivered, up to 7 days"));
@@ -1168,9 +1174,28 @@ async fn wakeups_state_reflects_a_real_doorbell() {
     let off = "<strong>Wake-ups are off.</strong> Ask your AI to turn them on.";
     let p = page(alice.clone()).await;
     assert!(p.contains(off), "none yet");
-    assert!(!p.contains("Wake-ups are on"));
     let bot = relay.bot(&tok).await;
+    // get_doorbell says what /account says.
+    let g = bot.ok("get_doorbell", json!({})).await;
+    assert_eq!(g["state"], "off", "{g}");
+    assert_eq!(g["auto"], false);
+    assert!(g["origin"].is_null());
+    assert_eq!(
+        g["summary"],
+        "Wake-ups are off. Ask your AI to turn them on."
+    );
+    assert!(!p.contains("Wake-ups are on"));
     bot.ok("set_doorbell", json!({ "auto": true })).await;
+    // Automatic, never set up on purpose (like QA Test 5): off.
+    let g = bot.ok("get_doorbell", json!({})).await;
+    assert_eq!(g["state"], "off", "{g}");
+    assert_eq!(g["origin"], "automatic");
+    assert_eq!(g["auto"], true);
+    assert_eq!(
+        g["summary"],
+        "Wake-ups are off. Ask your AI to turn them on."
+    );
+    assert!(g["doorbell"].is_object(), "listen still gets its address");
     let p = page(alice.clone()).await;
     assert!(p.contains(off), "auto address only");
     assert!(
@@ -1191,6 +1216,18 @@ async fn wakeups_state_reflects_a_real_doorbell() {
         "set up on purpose"
     );
     assert!(!p.contains("Wake-ups are off"));
+    let g = bot.ok("get_doorbell", json!({})).await;
+    assert_eq!(g["state"], "on", "{g}");
+    assert_eq!(g["origin"], "manual");
+    assert_eq!(g["auto"], false);
+    let summary = g["summary"].as_str().unwrap();
+    assert_eq!(summary, "Wake-ups are on (all rooms), sent to a phone or desktop notification app. Last wake-up sent: never.");
+    assert!(
+        p.replace("<strong>", "")
+            .replace("</strong>", "")
+            .contains(summary),
+        "the same words as the account page"
+    );
     // Provenance: a doorbell set through the tool is explicitly manual.
     let (cfg, _) = relay.db.bot_doorbell(&bot_id).unwrap().unwrap();
     assert!(cfg.manual && !cfg.auto && !cfg.is_automatic());

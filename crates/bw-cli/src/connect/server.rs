@@ -340,12 +340,40 @@ pub(crate) fn respond(result: anyhow::Result<Value>) -> Result<CallToolResult, E
         Ok(v) => CallToolResult::structured(v),
         Err(e) => match e.downcast_ref::<super::relay::ToolError>() {
             Some(t) => CallToolResult::structured_error(t.0.clone()),
+            None if super::relay::is_unreachable(&e) => CallToolResult::structured_error(json!({
+                "error": "RELAY_UNREACHABLE",
+                "message": format!("{e}. This call did not complete; if it was a send, nothing was confirmed as sent, so send it again."),
+            })),
             None => CallToolResult::structured_error(json!({
                 "error": "CONNECTOR",
                 "message": e.to_string(),
             })),
         },
     })
+}
+
+/// What a read returns while the relay is briefly unreachable (restarting):
+/// the empty result plus `relay_reconnecting`, not an error.
+pub(crate) const RECONNECTING_MESSAGE: &str = "relay reconnecting, try again";
+
+pub(crate) fn reconnecting(mut empty: Value) -> Value {
+    empty["relay_reconnecting"] = json!(true);
+    empty["message"] = json!(RECONNECTING_MESSAGE);
+    empty
+}
+
+/// `respond` for read-only tools: an unreachable relay (after the relay
+/// client's one retry) is an empty result with `relay_reconnecting: true`.
+pub(crate) fn respond_read(
+    result: anyhow::Result<Value>,
+    empty: impl FnOnce() -> Value,
+) -> Result<CallToolResult, ErrorData> {
+    match result {
+        Err(e) if super::relay::is_unreachable(&e) => {
+            Ok(CallToolResult::structured(reconnecting(empty())))
+        }
+        r => respond(r),
+    }
 }
 
 /// What one fetch of a room's queue produced.
@@ -1207,7 +1235,7 @@ impl Connector {
                     "mode": created["mode"],
                     "round_table": created["round_table"],
                     "thread_start": created["thread_start"],
-                    "expires_at": created["expires_at"],
+                    "room_expires_at": created["room_expires_at"],
                     "next": "call create_invite once per bot; joiners are added automatically when you call wait_for_message or send_message",
                 }))
             }
@@ -1479,7 +1507,8 @@ impl Connector {
         &self,
         Parameters(a): Parameters<WaitArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        respond(
+        let room_arg = a.room_id.clone();
+        respond_read(
             async {
                 let timeout = Duration::from_secs(a.timeout_s.unwrap_or(DEFAULT_WAIT_S).min(MAX_WAIT_S));
                 let rooms = match &a.room_id {
@@ -1537,8 +1566,21 @@ impl Connector {
                     let r = r.clone();
                     async move { (r.clone(), c.drain(&r, timeout).await) }
                 });
+                let mut reconnect = false;
                 for (room, res) in futures_join(polls).await {
-                    let d = res?;
+                    let d = match res {
+                        Ok(d) => d,
+                        Err(e) if super::relay::is_unreachable(&e) => {
+                            // Still hand over anything already saved here,
+                            // so nothing taken from the inbox is lost.
+                            reconnect = true;
+                            let (messages, events) = self.take_inbox(&room).await;
+                            any |= !messages.is_empty() || !events.is_empty();
+                            out.push(json!({ "room_id": room, "messages": messages, "events": events, "closed": false, "relay_reconnecting": true }));
+                            continue;
+                        }
+                        Err(e) => return Err(e),
+                    };
                     let (messages, events) = self.take_inbox(&room).await;
                     any |= !messages.is_empty() || !events.is_empty() || d.closed || !d.warnings.is_empty();
                     let mut r = json!({ "room_id": room, "messages": messages, "events": events, "closed": d.closed, "mode": d.mode, "turn": d.turn });
@@ -1556,21 +1598,28 @@ impl Connector {
                 if !added_all.is_empty() {
                     v["added_members"] = json!(added_all);
                 }
+                if reconnect {
+                    v = reconnecting(v);
+                }
                 Ok(v)
             }
             .await,
+            || match room_arg {
+                Some(r) => json!({ "room_id": r, "messages": [], "events": [], "closed": false, "timed_out": true }),
+                None => json!({ "rooms": [], "timed_out": true }),
+            },
         )
     }
 
     #[tool(
         name = "get_status",
-        description = "Relay status of a room (members, expiry, who is still pending_join) plus this connector's group view (epoch, title)."
+        description = "Relay status of a room (members, `room_expires_at` = when the room itself closes, who is still pending_join) plus this connector's group view (epoch, title)."
     )]
     async fn get_status(
         &self,
         Parameters(a): Parameters<StatusArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        respond(
+        respond_read(
             async {
                 let mut v = match &a.room_id {
                     Some(r) => {
@@ -1623,6 +1672,7 @@ impl Connector {
                 Ok(v)
             }
             .await,
+            || json!({}),
         )
     }
 
@@ -1685,16 +1735,17 @@ impl Connector {
 
     #[tool(
         name = "list_rooms",
-        description = "Rooms this bot belongs to, with your member id. Each room has `expires_at` / `expires_at_utc` (when the room closes, null if never) and `pending_expires_at` / `pending_expires_at_utc` (when the oldest message waiting for you is deleted if you do not fetch it); `message_retention` says how long the relay holds undelivered messages."
+        description = "Rooms this bot belongs to, with your member id. Each room has `room_expires_at` / `room_expires_at_utc` (when the room itself closes, null if never) and `pending_expires_at` / `pending_expires_at_utc` (when the oldest message waiting for you is deleted if you do not fetch it); `message_retention` says how long the relay holds undelivered messages."
     )]
     async fn list_rooms(&self) -> Result<CallToolResult, ErrorData> {
-        respond(
+        respond_read(
             async {
                 let mut v = self.relay.call("list_rooms", json!({})).await?;
                 self.mark_unreadable(&mut v).await;
                 Ok(v)
             }
             .await,
+            || json!({ "rooms": [] }),
         )
     }
 
@@ -1807,13 +1858,13 @@ impl Connector {
 
     #[tool(
         name = "get_doorbell",
-        description = "Your effective doorbell (status, topic, wake commands). Secrets are never returned."
+        description = "Your effective doorbell: `state` (`on`/`off`, as the account page shows it), `origin` (`automatic`/`manual`), a one-line `summary`, plus status, topic and wake commands. Secrets are never returned."
     )]
     async fn get_doorbell(
         &self,
         Parameters(a): Parameters<StatusArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        respond(
+        respond_read(
             async {
                 let mut args = json!({});
                 if let Some(r) = &a.room_id {
@@ -1824,6 +1875,7 @@ impl Connector {
                 Ok(v)
             }
             .await,
+            || json!({}),
         )
     }
 }

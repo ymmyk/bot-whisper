@@ -821,7 +821,7 @@ impl Room {
             "members": self.members,
             "max_members": self.max_members,
             "created_at": self.created_at,
-            "expires_at": self.expires_at,
+            "room_expires_at": self.expires_at,
             "encryption": ENCRYPTION_LABEL,
             "mode": self.mode,
             "round_table": self.mode.enforces_turns(),

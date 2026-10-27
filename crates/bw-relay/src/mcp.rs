@@ -443,8 +443,8 @@ impl BotWhisperServer {
                             "epoch": s["e2e"]["epoch"],
                             "members": s["members"].as_array().map(Vec::len).unwrap_or(0),
                             "pending_items_for_you": s["e2e"]["pending_items_for_you"],
-                            "expires_at": s["expires_at"],
-                            "expires_at_utc": s["expires_at"].as_u64().map(crate::config::iso_utc),
+                            "room_expires_at": s["room_expires_at"],
+                            "room_expires_at_utc": s["room_expires_at"].as_u64().map(crate::config::iso_utc),
                             "pending_expires_at": s["e2e"]["pending_expires_at"],
                             "pending_expires_at_utc": s["e2e"]["pending_expires_at"].as_u64().map(crate::config::iso_utc),
                         }));
@@ -476,7 +476,7 @@ impl BotWhisperServer {
 
     #[tool(
         name = "get_doorbell",
-        description = "[Only through the local `botwhisper connect` connector.] Show your effective doorbell (for a room, or your bot-wide default): type, destination host, events, delivery status, the ntfy topic and the copy-paste `botwhisper listen` commands. Secrets are never returned."
+        description = "[Only through the local `botwhisper connect` connector.] Show your effective doorbell (for a room, or your bot-wide default): `state` (`on`/`off`, the same as the account page; an automatic sign-in address never set up on purpose is `off`), `origin` (`automatic`/`manual`), a one-line `summary`, type, destination host, events, delivery status, the ntfy topic and the copy-paste `botwhisper listen` commands. Secrets are never returned."
     )]
     async fn get_doorbell(
         &self,
@@ -867,7 +867,7 @@ impl BotWhisperServer {
             "room_id": status["room_id"],
             "member_id": "m1",
             "role": "owner",
-            "expires_at": status["expires_at"],
+            "room_expires_at": status["room_expires_at"],
             "max_members": status["max_members"],
             "encryption": status["encryption"],
             "mode": status["mode"],
@@ -1088,11 +1088,28 @@ impl BotWhisperServer {
                 None => (None, None, "none", None),
             },
         };
+        // The same state /account shows: an automatic sign-in address that
+        // was never set up on purpose is "off".
+        let on = cfg.as_ref().is_some_and(|c| !c.is_automatic());
+        let last = status
+            .as_ref()
+            .and_then(|s| s.last_delivery_at)
+            .map(crate::config::iso_utc)
+            .unwrap_or_else(|| "never".into());
+        let where_ = if scope == "room" {
+            "this room"
+        } else {
+            "all rooms"
+        };
         Ok(json!({
             "scope": scope,
             "room_id": room_id,
+            "state": if on { "on" } else { "off" },
+            "origin": cfg.as_ref().map(|c| if c.is_automatic() { "automatic" } else { "manual" }),
+            "auto": cfg.as_ref().is_some_and(|c| c.is_automatic()),
+            "summary": crate::doorbell::wakeups_summary(cfg.as_ref(), status.as_ref(), where_, &last),
             "doorbell": cfg.as_ref().map(|c| self.describe_doorbell(c, status.as_ref())),
-            "hint": if cfg.is_none() { Some("no doorbell set; call set_doorbell (no arguments) to get a private ntfy topic") } else { None },
+            "hint": if on { None } else { Some("wake-ups are off; call set_doorbell (no arguments) to turn them on with a private ntfy topic") },
         }))
     }
 

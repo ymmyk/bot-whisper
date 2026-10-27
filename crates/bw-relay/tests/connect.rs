@@ -1292,3 +1292,88 @@ async fn a_room_without_saved_keys_needs_a_rejoin_with_a_role_aware_hint() {
     .await
     .expect("the test must not hang");
 }
+
+/// A relay restart is not an error for reads: one quick retry, then an
+/// empty result marked `relay_reconnecting`. Sends still fail loudly.
+#[tokio::test]
+async fn reads_say_relay_reconnecting_while_sends_fail_clearly() {
+    tokio::time::timeout(Duration::from_secs(90), async {
+        let relay = TestRelay::start().await;
+        let a = Connector::new(
+            RelayClient::with_token(&relay.base(), TOKENS[0]),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let alice = serve_connector(a).await;
+        let created = call(&alice, "create_room", json!({ "title": "restart" })).await;
+        let room = created["room_id"].as_str().unwrap().to_string();
+        assert!(created.get("room_expires_at").is_some(), "{created}");
+        assert!(created.get("expires_at").is_none(), "{created}");
+
+        // Relay down for good: reads are empty and say so, never CONNECTOR.
+        let (cfg, db) = relay.shutdown().await;
+        let started = std::time::Instant::now();
+        let got = call(
+            &alice,
+            "wait_for_message",
+            json!({ "room_id": room, "timeout_s": 1 }),
+        )
+        .await;
+        assert_eq!(got["relay_reconnecting"], true, "{got}");
+        assert_eq!(got["message"], "relay reconnecting, try again");
+        assert_eq!(got["messages"], json!([]));
+        assert!(got.get("error").is_none(), "{got}");
+        assert!(
+            started.elapsed() >= Duration::from_millis(700),
+            "retried once with a short backoff first"
+        );
+        let rooms = call(&alice, "list_rooms", json!({})).await;
+        assert_eq!(rooms["relay_reconnecting"], true, "{rooms}");
+        assert_eq!(rooms["rooms"], json!([]));
+        let bell = call(&alice, "get_doorbell", json!({})).await;
+        assert_eq!(bell["relay_reconnecting"], true, "{bell}");
+        // A send is never dropped silently: it is an error that says so.
+        let r: CallToolResult = alice
+            .call_tool(
+                CallToolRequestParams::new("send_message").with_arguments(
+                    json!({ "room_id": room, "text": "while down" })
+                        .as_object()
+                        .cloned()
+                        .unwrap(),
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.is_error, Some(true));
+        let err = r.structured_content.unwrap();
+        assert_eq!(err["error"], "RELAY_UNREACHABLE", "{err}");
+        assert!(err["message"].as_str().unwrap().contains("send it again"));
+
+        // A short blip: the relay is back before the retry, so the read
+        // just works.
+        let restart = {
+            let (cfg, db) = (cfg.clone(), db.clone());
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                TestRelay::start_on(cfg, db).await
+            })
+        };
+        let rooms = call(&alice, "list_rooms", json!({})).await;
+        assert!(rooms.get("relay_reconnecting").is_none(), "{rooms}");
+        assert_eq!(rooms["rooms"][0]["room_id"], room.as_str(), "{rooms}");
+        assert!(rooms["rooms"][0].get("room_expires_at").is_some());
+        let relay = restart.await.unwrap();
+        let sent = call(
+            &alice,
+            "send_message",
+            json!({ "room_id": room, "text": "back" }),
+        )
+        .await;
+        assert!(sent.get("error").is_none(), "{sent}");
+        relay.shutdown().await;
+    })
+    .await
+    .expect("the test must not hang");
+}

@@ -153,6 +153,49 @@ impl DoorbellConfig {
     }
 }
 
+/// The one sentence /account and `get_doorbell` both use for wake-ups that
+/// are off (none, or only the automatic sign-in address).
+pub const WAKEUPS_OFF: &str = "Wake-ups are off. Ask your AI to turn them on.";
+
+/// How a wake-up reaches the bot, in plain words (shared by /account and
+/// `get_doorbell`).
+pub fn wakeups_how(target: &DoorbellTarget) -> &'static str {
+    match target {
+        DoorbellTarget::Ntfy { .. } => "a phone or desktop notification app",
+        DoorbellTarget::Webhook { .. } => "a web address you set up",
+        DoorbellTarget::WebPush { .. } => "browser notifications",
+        DoorbellTarget::Gotify { .. } => "Gotify",
+        DoorbellTarget::Pushover { .. } => "Pushover",
+    }
+}
+
+/// The health tail of the "on" sentence ("" when healthy).
+pub fn wakeups_health(status: &str) -> &'static str {
+    match status {
+        "failing" => " The last attempts failed; it will keep trying.",
+        "dead" => " It stopped after repeated failures. Ask your AI to set wake-ups up again.",
+        _ => "",
+    }
+}
+
+/// The plain-text summary of a bot's wake-ups, worded like /account.
+/// `last` is already formatted ("never" or a time).
+pub fn wakeups_summary(
+    cfg: Option<&DoorbellConfig>,
+    status: Option<&DoorbellStatus>,
+    scope: &str,
+    last: &str,
+) -> String {
+    match cfg {
+        Some(c) if !c.is_automatic() => format!(
+            "Wake-ups are on ({scope}), sent to {}. Last wake-up sent: {last}.{}",
+            wakeups_how(&c.target),
+            wakeups_health(status.map(|s| s.status.as_str()).unwrap_or("never")),
+        ),
+        _ => WAKEUPS_OFF.to_string(),
+    }
+}
+
 impl DoorbellConfig {
     pub fn wants(&self, event: &str) -> bool {
         self.events.iter().any(|e| e == event)

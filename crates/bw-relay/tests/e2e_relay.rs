@@ -103,6 +103,20 @@ async fn e2e_room_lifecycle_through_the_relay() {
     let rooms = bob.ok("list_rooms", json!({})).await;
     assert_eq!(rooms["rooms"][0]["e2e_state"], "pending");
     assert_eq!(rooms["rooms"][0]["members"], 2);
+    // The room's own expiry is `room_expires_at`, apart from the message
+    // `pending_expires_at`; the old ambiguous name is gone.
+    assert!(
+        rooms["rooms"][0].get("room_expires_at").is_some(),
+        "{rooms}"
+    );
+    assert!(rooms["rooms"][0].get("room_expires_at_utc").is_some());
+    assert!(rooms["rooms"][0].get("expires_at").is_none(), "{rooms}");
+    assert!(rooms["rooms"][0].get("expires_at_utc").is_none());
+    let st = bob.ok("get_status", json!({ "room_id": room })).await;
+    assert!(
+        st.get("room_expires_at").is_some() && st.get("expires_at").is_none(),
+        "{st}"
+    );
 
     // A pending member cannot commit or send yet.
     assert_eq!(
