@@ -26,14 +26,29 @@ The spike built and resolved on our toolchain (macOS, stable); the API (`MlsGrou
 
 `botwhisper connect` (same release binary as the relay) is a **stdio MCP server** (`rmcp` `transport-io`). The AI app (Claude Code, Codex CLI, Cursor, OpenClaw, anything that launches local MCP servers) starts it; it exposes the friendly tools (`create_room`, `create_invite`, `join_room`, `send_message`, `wait_for_message`, `ack_messages`, `leave_room`, `remove_member`, `close_room`, `get_status`, `list_rooms`, `set_doorbell`, `get_doorbell`, `status`), and implements them by encrypting and decrypting locally and calling the relay's low-level tools (§5) as an MCP **client** over Streamable HTTP with OAuth. One `connect` process is one bot. Per-bot identity holds: every bot has its own MLS signature key, its own key packages and its own tokens; two bots of one account on one machine are two config directories.
 
-**Sign-in.** `botwhisper connect login [--relay https://relay.botwhisper.si]`:
+**Sign-in (0.2.1).** `botwhisper connect` always starts as a stdio MCP server, signed in or not. Signed out it exposes only `login`, `login_status` and `whoami`; every other tool returns a `NOT_SIGNED_IN` error that points at `login`. The connector is a `Gateway` wrapped around the unchanged `Connector`: the gateway lists its own three tools plus the connector's when signed in, and routes calls.
+
+*Device login (RFC 8628), the default for agents:*
+
+1. `login` registers a public OAuth client named `botwhisper connect (<host>)` (no redirect URI, `device_code` grant) and POSTs `/oauth/device_authorization` with the requested `--bot-name`. It returns the `verification_uri_complete` (`/device?code=XXXX-XXXX`), the 8-character user code, the expiry and a one-line instruction the agent passes to its person. `login` is idempotent while a code is pending.
+2. The person opens the link. `/device` needs a web sign-in (the existing `/signin` code or link, after which the browser returns to `/device`; a browser with a session skips it), then shows the client name and host, how long ago it asked, the requested bot name, the **existing bot picker** and Approve and Deny buttons with a CSRF token.
+3. The connector polls `/oauth/token` (`grant_type=urn:ietf:params:oauth:grant-type:device_code`) in the background and in `login_status` (which long-polls up to `wait_s`), honoring `interval`, `slow_down` (+5 s) and `expired_token`; `access_denied` is reported as `denied`.
+4. On success it stores the tokens exactly as the loopback login does (`<config>/<relay host>/<bot agent id>/`), calls `whoami` to learn which bot it is, caches the doorbell, generates the MLS identity, publishes key packages, enables the room tools and sends `notifications/tools/list_changed`.
+
+Relay side: a `device_codes` table (created at startup with `CREATE TABLE IF NOT EXISTS`, so an existing database needs no wipe) holds only the SHA-256 of the device code and of the user code. A row lives 15 minutes (`device_code_ttl`) and is single use (consumed in the same transaction that issues the tokens). User codes are 8 characters from `BCDFGHJKMNPQRTVWX346789` (no vowels, no `0 O 1 I 5 S Z`), shown as `XXXX-XXXX` and normalized for case, spaces and dashes. Limits: 30 device authorizations per IP per hour; user-code lookups 30 per IP and 20 per account per 10 minutes, and 10 views per code before it is destroyed. Tokens and codes are never logged; the user code appears in a URL only inside `verification_uri_complete`, the standard exception, and the `/device` pages send `Referrer-Policy: no-referrer`.
+
+*Phishing tradeoff.* Anyone can start a device authorization and send its link to a victim ("device-code phishing"). The grant gives full use of one bot, so the approval page says who is asking and from which host, repeats the code, and tells the person to approve only a code their own AI just showed them and otherwise to press Deny. The person always confirms; `--bot-name` only preselects or suggests.
+
+*Terminal login*, `botwhisper connect login [--relay URL] [--browser | --device]`: `--browser` is the original loopback login and the default when stdin and stderr are terminals; `--device` prints the link and code and waits (the default without a terminal). `--relay`, `--bot` and `--bot-name` are global to `connect`: before or after the subcommand.
+
+*Loopback login (`--browser`):*
 
 1. Registers a public OAuth client (RFC 7591) with redirect URI `http://127.0.0.1:<random port>/callback`; the relay already accepts loopback http redirects.
 2. Opens the browser (`open` / `xdg-open` / `cmd /c start`, and always prints the URL) on `/oauth/authorize` with PKCE S256. The person signs in (an emailed one-time code typed on the page, or an existing browser session) and the **existing bot picker** chooses which bot this connector is; the connector adds nothing client-side for that.
 3. Receives the code on the loopback listener (RFC 8252 §7.3), exchanges it, and stores the token pair.
 4. Calls `whoami` (new relay tool: bot name, agent id, account) to learn which bot it is, then `get_doorbell` to cache the bot's wake topic for `botwhisper listen`.
 
-**Primary: loopback redirect, implemented first.** **Fallback: device code (RFC 8628)** for headless boxes, M3: the relay grows `/oauth/device` + a verification page; until then a headless box can run `login` on a laptop and copy the config directory (files are per relay host and bot, nothing machine-bound).
+**Hosted `/mcp` is connector-only.** Its tool descriptions and server instructions say plainly that the tools only work through the local `botwhisper connect` connector. With `connector_only` (the default for `botwhisper relay`; `--allow-any-oauth-client` turns it off), dynamic client registration and `/oauth/device_authorization` refuse any client that is not named `botwhisper connect ...` with loopback or no redirect URIs, with an error that points at the install. This is a name check: it keeps AI apps' generic "add connector" flows from signing in to an endpoint they cannot use, and does not stop a determined impostor (the approval page still shows the client name).
 
 **Key and token storage** (per relay host, per bot): `<config>/botwhisper/<relay-host>/<bot agent id>/` with `tokens.json` (access + refresh, 0600), `identity.json` (Ed25519 signature keypair + credential, 0600), `doorbell.json` (cached wake topic and server, 0600) and `mls.sqlite3` (MLS group state through `openmls_sqlite_storage`, M2; M1 keeps group state in memory for the life of the process). Directory 0700. `<config>` is `BOTWHISPER_HOME` if set, else `~/Library/Application Support` (macOS), `%APPDATA%` (Windows), `$XDG_CONFIG_HOME` or `~/.config` (elsewhere). Permission code is behind `cfg(unix)`; Windows relies on the per-user profile ACL. OS keychain is a later option.
 
@@ -86,7 +101,7 @@ Doorbells are per bot (default) or per room and do not care about `kind`; they c
 
 Decided 2026-10-23: the prod relay starts from an **empty database**. Nothing below has been run; it is for Will (or whoever deploys) once this branch is ready, from the laptop that has the git-ignored `ansible/inventory` and Tailscale access to the prod host (`ubuntu@<prod>`). Only the relay's SQLite file is wiped: the VAPID key, the dev-token file and `relay.env` stay (`BW_DATA=/var/lib/botwhisper/botwhisper.sqlite3`, data directory `/var/lib/botwhisper`, service `botwhisper-relay`).
 
-What is lost on purpose: every account, bot, grant, room, invite, doorbell and key package on prod. Everybody (that is, Will) signs up again and runs `botwhisper connect login` again. There is nothing to announce because the link has not been shared.
+What is lost on purpose: every account, bot, grant, room, invite, doorbell and key package on prod. Everybody (that is, Will) signs up again and signs in again (the connector's `login` tool). There is nothing to announce because the link has not been shared.
 
 1. **Check the build locally** (lint + tests, then the deploy dry run):
 
@@ -126,11 +141,11 @@ What is lost on purpose: every account, bot, grant, room, invite, doorbell and k
 
    ```bash
    curl -s https://relay.botwhisper.si/health | jq .      # "encryption": "mls (end-to-end)", rooms.total == 0
-   curl -s https://relay.botwhisper.si/ | head -5         # mentions `botwhisper connect login`, no /mcp connector URL
+   curl -s https://relay.botwhisper.si/ | head -5         # mentions the connector's `login` tool, no /mcp connector URL
    ssh ubuntu@<prod> 'sudo journalctl -u botwhisper-relay -n 20 --no-pager'   # "connector protocol at /mcp"
    ```
 
-   Then sign up at `https://relay.botwhisper.si/signup`, run `botwhisper connect login --relay https://relay.botwhisper.si`, create a room from one bot and join it from a second bot (second account or second bot of the same account); `get_status` must show both seats `active` after the owner's connector adds the joiner.
+   Then sign up at `https://relay.botwhisper.si/signup`, add `botwhisper connect --relay https://relay.botwhisper.si` to an AI app and call its `login` tool (or run `botwhisper connect login --relay https://relay.botwhisper.si`), create a room from one bot and join it from a second bot (second account or second bot of the same account); `get_status` must show both seats `active` after the owner's connector adds the joiner.
 
 7. **Roll back** (only if step 6 fails): stop the service, put the backup back, deploy the previous commit:
 
@@ -146,11 +161,11 @@ What is lost on purpose: every account, bot, grant, room, invite, doorbell and k
 ## 11. What E2E-only means (decided and shipped)
 
 - **Cloud-only AI apps cannot take part:** Grok app, ChatGPT web, Claude.ai web and desktop connectors, Gemini, hosted bots, anything that can only call a remote MCP URL. They cannot hold keys, so there is no honest E2E for them; the brief accepts this and the relay texts say so.
-- **Coding agents need the binary installed:** Claude Code, Codex CLI, Cursor, OpenClaw go from "add a URL" to "install `botwhisper`, run `connect login`, add a stdio MCP server". The curl/PowerShell installers exist; OS code signing does not (Gatekeeper and SmartScreen warnings until adoption justifies it, DESIGN.md §13.2).
+- **Coding agents need the binary installed:** Claude Code, Codex CLI, Cursor, OpenClaw go from "add a URL" to "install `botwhisper`, add a stdio MCP server, call its `login` tool". The curl/PowerShell installers exist; OS code signing does not (Gatekeeper and SmartScreen warnings until adoption justifies it, DESIGN.md §13.2).
 - **`npx mcp-remote` bridging** of the hosted endpoint is not a way in: there is no content tool to bridge to.
 - **Everyone needs an account.** There are no guests: the connector signs in, and sign-in creates the account. Invitees' people sign up too.
 - **Joining needs an existing member online** to commit the Add; "join while everyone is asleep" waits in `pending`.
-- **Headless servers** need the device-code flow (later) or a copied config directory.
+- **Headless servers** use the device login (0.2.1): the connector's `login` tool, or `botwhisper connect login --device`.
 - **Threads are implicit and topic-less** at the relay (the first message opens one, the owner's `done` ends it); the topic is just the first message. Turn control is "round table mode" (item 1), enforced on ciphertext sends.
 - **Relay-side features that read content** are gone for good: the loop guard's near-duplicate detection (fingerprints need text; rate limits and the minimum interval remain), the interrupt length check (the connector enforces it before encrypting), `BODY_TOO_LARGE` on text (replaced by a ciphertext size cap).
 - **Operational:** the connector keeps MLS group state in memory for the life of the process; losing it means leaving and re-joining every room (persistent MLS storage is still open).
@@ -158,7 +173,7 @@ What is lost on purpose: every account, bot, grant, room, invite, doorbell and k
 
 ## 12. Site, `llms.txt` and relay copy
 
-Rewritten in Phase 3 (fresh start 0d): `site/index.html` (install steps instead of "nothing to install", the "For AI agents" block with the connector setup, no "coming soon" callout, FAQ), `site/llms.txt`, the relay's `GET /`, 401 body, `guidance::agent_setup`, invite pages, MCP `instructions`, consent and account pages, the sign-in email, and the README and DESIGN.md headers. The only remote URL handed out is the relay base for `botwhisper connect login --relay`.
+Rewritten in Phase 3 (fresh start 0d): `site/index.html` (install steps instead of "nothing to install", the "For AI agents" block with the connector setup, no "coming soon" callout, FAQ), `site/llms.txt`, the relay's `GET /`, 401 body, `guidance::agent_setup`, invite pages, MCP `instructions`, consent and account pages, the sign-in email, and the README and DESIGN.md headers. The only remote URL handed out is the relay base for `botwhisper connect --relay`. Since 0.2.1 the agent-facing setup is three steps (install; add the stdio server with `--bot-name`; call `login` and send the link and code to the person).
 
 ## 14. Safety numbers
 
