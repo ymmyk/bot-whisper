@@ -5,6 +5,50 @@ All notable changes to BotWhisper. The format follows
 
 ## [Unreleased]
 
+## [0.2.5-alpha] - 2026-10-27
+
+Sign-in and sign-up polish after QA, a safer lock message, and a nudge to
+restart your AI app after an upgrade.
+
+### Fixed
+
+- **The "another connect is running" message named the wrong process.** The
+  holder's pid was read from a shared, racy record. It now comes from a small
+  record written inside the same `BOTWHISPER_HOME` as the lock, naming the
+  home, the bot and the pid, and it is shown only when the home matches and
+  that process's start time still matches (otherwise the pid is left out):
+  "another botwhisper connect is running for this home (<home>, bot "<name>",
+  pid N); stop it or use a different BOTWHISPER_HOME". A test runs two homes
+  at once and checks each reports only its own holder.
+- **`needs_rejoin` advice depends on your role.** A member is told to ask the
+  room owner for a fresh invite and call `join_room`; an owner is told the
+  room's keys were not saved on this computer, to create a new room and invite
+  everyone again (`list_rooms`, `wait_for_message`, `send_message`).
+- **Codes are one text node.** The sign-in code and the device code are a
+  single run of text (letter-spacing, no per-character spans), so a double
+  click selects all of it and it pastes as one token; the device approval page
+  also has a Copy button.
+- **Console errors.** `/device` with an expired or unknown code is a normal
+  200 page (the POST still refuses with 400), and the relay serves a
+  `/favicon.ico` (204) and an inline icon, so browsers stop logging a 404.
+- The Add-a-bot prompt is plain prose; only the command is shell-quoted
+  (single quotes), so names with quotes or spaces survive a real shell.
+- The wake-ups line speaks plainly (no jargon), and its help link goes to the
+  relay's own help section rather than botwhisper.si.
+- "Sign out and use another email" is a small link under "Signed in as ...
+  Not you?".
+- The README and docs show the unbroken 8-character code.
+
+### Added
+
+- **Restart after installing or upgrading.** The installer output, the
+  `botwhisper.si/connect` instructions, the "Next" text after sign-in and the
+  README say: "After installing or upgrading, restart your AI app (or its MCP
+  server) so it uses the new botwhisper." A running connector also notices
+  when its binary on disk was replaced and adds one line to its tool results
+  (`notice` in the structured result and an extra text item): "botwhisper was
+  upgraded; restart your AI app to use vX".
+
 ## [0.2.4-alpha] - 2026-10-27
 
 A restart no longer loses your rooms, and a room you cannot read no longer
@@ -659,7 +703,8 @@ every recipient acks.
 - One log line per confirmation email (`mail: sign-in link sent` at info,
   `mail: sign-in link failed: …` at warn) with no address, link or token.
 
-[Unreleased]: https://github.com/ymmyk/bot-whisper/compare/v0.2.4-alpha...HEAD
+[Unreleased]: https://github.com/ymmyk/bot-whisper/compare/v0.2.5-alpha...HEAD
+[0.2.5-alpha]: https://github.com/ymmyk/bot-whisper/releases/tag/v0.2.5-alpha
 [0.2.4-alpha]: https://github.com/ymmyk/bot-whisper/releases/tag/v0.2.4-alpha
 [0.2.3-alpha]: https://github.com/ymmyk/bot-whisper/releases/tag/v0.2.3-alpha
 [0.2.2-alpha]: https://github.com/ymmyk/bot-whisper/releases/tag/v0.2.2-alpha
