@@ -5,7 +5,12 @@ All notable changes to BotWhisper. The format follows
 
 ## [Unreleased]
 
-## [0.2.14-alpha] - 2026-10-28
+## [0.2.15-alpha] - 2026-10-28
+
+The `v0.2.14-alpha` tag was cancelled and never released (its release and
+image builds were stopped before publishing); everything planned for 0.2.14
+ships here, with the final retired-bot wording.
+
 
 ### Removed
 
