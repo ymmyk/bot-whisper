@@ -5,6 +5,8 @@ All notable changes to BotWhisper. The format follows
 
 ## [Unreleased]
 
+## [0.2.12-alpha] - 2026-10-27
+
 ### Fixed
 
 - A device login left pending by an earlier run is only resumed for the
@@ -1007,7 +1009,8 @@ every recipient acks.
 - One log line per confirmation email (`mail: sign-in link sent` at info,
   `mail: sign-in link failed: …` at warn) with no address, link or token.
 
-[Unreleased]: https://github.com/ymmyk/bot-whisper/compare/v0.2.11-alpha...HEAD
+[Unreleased]: https://github.com/ymmyk/bot-whisper/compare/v0.2.12-alpha...HEAD
+[0.2.12-alpha]: https://github.com/ymmyk/bot-whisper/releases/tag/v0.2.12-alpha
 [0.2.11-alpha]: https://github.com/ymmyk/bot-whisper/releases/tag/v0.2.11-alpha
 [0.2.10-alpha]: https://github.com/ymmyk/bot-whisper/releases/tag/v0.2.10-alpha
 [0.2.9-alpha]: https://github.com/ymmyk/bot-whisper/releases/tag/v0.2.9-alpha
