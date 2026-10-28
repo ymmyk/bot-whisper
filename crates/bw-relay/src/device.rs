@@ -444,18 +444,10 @@ fn approval_page(
             .map(|n| format!("<strong>“{}”</strong>", esc(n)))
             .collect();
         format!(
-            r#"<p class="muted retired-note">BotWhisper updated how bots are identified. Your older {what} {names} {verb} retired and the rooms {pron} {verb2} in were closed, so {pron2} no longer {verb3} here. Approving connects this AI as a new bot; ask for new invites to the rooms you still need.</p>"#,
+            r#"<p class="muted retired-note">BotWhisper updated how bots are identified; this bot needs to sign in once more. Its old rooms will need a new invite. (Your older {what} {names} {verb} no longer listed.)</p>"#,
             what = if retired.len() == 1 { "bot" } else { "bots" },
             names = names.join(", "),
-            verb = if retired.len() == 1 { "was" } else { "were" },
-            pron = if retired.len() == 1 { "it" } else { "they" },
-            verb2 = if retired.len() == 1 { "was" } else { "were" },
-            pron2 = if retired.len() == 1 { "it" } else { "they" },
-            verb3 = if retired.len() == 1 {
-                "appears"
-            } else {
-                "appear"
-            },
+            verb = if retired.len() == 1 { "is" } else { "are" },
         )
     };
     let new_checked = if reconnect.is_none() { " checked" } else { "" };

@@ -214,7 +214,7 @@ pub struct LoginStatusArgs {
 }
 
 /// The `login` note after the relay said the old bot was retired.
-pub const RETIRED_LOGIN_NOTE: &str = "BotWhisper updated how bots are identified: this bot's older ID was retired and the rooms it was in were closed. Approving this link connects it again as a new bot (its old name is free to reuse); ask for new invites to the rooms you still need.";
+pub const RETIRED_LOGIN_NOTE: &str = "BotWhisper updated how bots are identified; this bot needs to sign in once more. Its old rooms will need a new invite. Approving this link signs it in as a new bot.";
 
 /// The one line a bot sees once the relay revoked its sign-in.
 pub const SIGNED_OUT_MESSAGE: &str = "SIGNED_OUT: the relay no longer accepts this bot's sign-in (revoked, the bot was deleted on /account, or it expired). Call `login` (force=true): it returns a link and a short code. Send both to your person, who opens the link, signs in and approves this bot; the room tools work again as soon as they do.";

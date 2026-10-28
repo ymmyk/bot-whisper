@@ -153,7 +153,7 @@ async fn older_bots_are_retired_only_with_the_switch_and_once() {
     let (code, body) = mcp_status(&relay, &old_access).await;
     assert_eq!(code, 401);
     assert!(
-        body.starts_with("unauthorized (BOT_RETIRED): BotWhisper updated how bots are identified."),
+        body.starts_with("unauthorized (BOT_RETIRED): BotWhisper updated how bots are identified; this bot needs to sign in once more. Its old rooms will need a new invite."),
         "{body}"
     );
     let r = reqwest::Client::new()
@@ -170,7 +170,7 @@ async fn older_bots_are_retired_only_with_the_switch_and_once() {
     assert_eq!(v["error"], "invalid_grant");
     let d = v["error_description"].as_str().unwrap();
     assert!(
-        d.starts_with("BOT_RETIRED: BotWhisper updated how bots are identified."),
+        d.starts_with("BOT_RETIRED: BotWhisper updated how bots are identified; this bot needs to sign in once more. Its old rooms will need a new invite."),
         "{d}"
     );
     // A token nobody ever had is not "retired".

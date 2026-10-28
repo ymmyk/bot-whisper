@@ -2843,7 +2843,7 @@ mod invite_link_tests {
         assert_eq!(v["retired"], true);
         let m = v["message"].as_str().unwrap();
         assert!(
-            m.starts_with("SIGNED_OUT: BotWhisper updated how bots are identified."),
+            m.starts_with("SIGNED_OUT: BotWhisper updated how bots are identified; this bot needs to sign in once more. Its old rooms will need a new invite."),
             "{m}"
         );
         assert!(m.contains("login tool (force=true)"), "{m}");
@@ -2854,8 +2854,7 @@ mod invite_link_tests {
         )
         .to_string();
         assert!(shown.contains("BOT_RETIRED: BotWhisper updated"), "{shown}");
-        assert!(super::super::gateway::RETIRED_LOGIN_NOTE
-            .starts_with("BotWhisper updated how bots are identified"));
+        assert!(super::super::gateway::RETIRED_LOGIN_NOTE.starts_with("BotWhisper updated how bots are identified; this bot needs to sign in once more. Its old rooms will need a new invite."));
     }
 
     #[test]

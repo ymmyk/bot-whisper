@@ -20,7 +20,8 @@ All notable changes to BotWhisper. The format follows
   `retired_tokens` (hashes only), let the relay say why: the retired bot's
   access token gets `401 unauthorized (BOT_RETIRED)` and its refresh token
   `invalid_grant` with `BOT_RETIRED`, both "BotWhisper updated how bots are
-  identified…". The connector's `SIGNED_OUT` carries that wording
+  identified; this bot needs to sign in once more. Its old rooms will need a
+  new invite." The connector's `SIGNED_OUT` carries that wording
   (`retired: true`), its next `login` adds a note, and the approval page
   explains why the old bot is no longer offered.
 - `whoami` no longer returns `member_id_format` / `member_id_note`, and
@@ -60,7 +61,8 @@ All notable changes to BotWhisper. The format follows
 - `status.previous_doorbell` says what really happened: never turned on and
   never sent, or sent until a date and off now because nobody turned
   wake-ups on on purpose.
-- /account: copy fields have one height with the text centred, the secret
+- /account: copy fields are 40px with the text centred (padding 0 10px,
+  line-height 1, flex-centred), the secret
   wake-up address is a copy field ("Copy secret address"), bots with
   wake-ups off show a pill and the page has one sentence on turning them
   on, and the disconnect confirm page has the header and a way back.

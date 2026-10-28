@@ -442,7 +442,7 @@ async fn a_retired_bot_is_explained_and_not_offered() {
         .await
         .unwrap();
     assert!(
-        page.contains("BotWhisper updated how bots are identified. Your older bot <strong>“Atlas”</strong> was retired"),
+        page.contains("BotWhisper updated how bots are identified; this bot needs to sign in once more. Its old rooms will need a new invite. (Your older bot <strong>“Atlas”</strong> is no longer listed.)"),
         "{page}"
     );
     assert!(

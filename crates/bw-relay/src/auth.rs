@@ -38,10 +38,9 @@ pub const BOT_RETIRED: &str = "BOT_RETIRED";
 
 /// What a retired bot is told (401 body, `error_description`, connector).
 /// RFC 6750-safe: printable ASCII without `"` or `\`.
-pub const BOT_RETIRED_MESSAGE: &str = "BotWhisper updated how bots are identified. This bot was \
-connected before 0.2.11 and had the older ID format, so it was retired and the rooms it was in \
-were closed. Call the connector's login tool (force=true) and have your person approve the link \
-to connect again as a new bot, then ask for new invites to the rooms you still need.";
+pub const BOT_RETIRED_MESSAGE: &str = "BotWhisper updated how bots are identified; this bot \
+needs to sign in once more. Its old rooms will need a new invite. Call the connector's login tool \
+(force=true) and send your person the link and code it returns.";
 
 impl AgentId {
     /// Derive a dev-token agent id.
@@ -206,7 +205,7 @@ mod tests {
         assert!(BOT_RETIRED_MESSAGE
             .chars()
             .all(|c| matches!(c, ' '..='~') && c != '"' && c != '\\'));
-        assert!(BOT_RETIRED_MESSAGE.starts_with("BotWhisper updated how bots are identified."));
+        assert!(BOT_RETIRED_MESSAGE.starts_with("BotWhisper updated how bots are identified; this bot needs to sign in once more. Its old rooms will need a new invite."));
     }
 
     #[test]
