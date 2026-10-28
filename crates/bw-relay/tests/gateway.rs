@@ -120,6 +120,18 @@ async fn tool_names(svc: &RunningService<RoleClient, Watcher>) -> Vec<String> {
 /// The person: open the link, sign in on the web with an emailed code,
 /// and press `action` ("approve" or "deny") on the approval page.
 async fn person(relay: &TestRelay, link: &str, user_code: &str, action: &str, bot_name: &str) {
+    person_as(relay, link, user_code, action, "new", bot_name).await
+}
+
+/// `person`, choosing which bot: "new" or an existing bot's id.
+async fn person_as(
+    relay: &TestRelay,
+    link: &str,
+    user_code: &str,
+    action: &str,
+    bot: &str,
+    bot_name: &str,
+) {
     let base = relay.base();
     let http = Client::builder()
         .redirect(Policy::none())
@@ -178,8 +190,9 @@ async fn person(relay: &TestRelay, link: &str, user_code: &str, action: &str, bo
             ("csrf", csrf.as_str()),
             ("action", action),
             ("code", user_code),
-            ("bot", "new"),
+            ("bot", bot),
             ("bot_name", bot_name),
+            ("confirm", "yes"),
         ])
         .send()
         .await
@@ -568,7 +581,9 @@ async fn a_login_finished_elsewhere_is_picked_up_on_the_next_call() {
         assert!(
             msg.starts_with("another botwhisper connect is running for this home (")
                 && msg.contains(", bot \"")
-                && msg.contains(&format!(", pid {})", std::process::id()))
+                // Both gateways live in this test process: its own pid is
+                // never named as the one in the way.
+                && !msg.contains(&format!("pid {}", std::process::id()))
                 && msg.ends_with(
                     "stop it or start this bot with --home DIR (or BOTWHISPER_HOME=DIR)"
                 )
@@ -716,4 +731,150 @@ async fn every_file_stays_under_botwhisper_home() {
     })
     .await
     .expect("the test must not hang");
+}
+
+/// 0.2.16 (QA on 0.2.15): a connector whose bot the relay retired. Every
+/// room tool says SIGNED_OUT with the plain explanation in `message` (whole,
+/// never cut), never RELAY_UNREACHABLE; whoami says retired; `login` is
+/// never CONNECTOR_BUSY against this very process, carries the ID-change
+/// note (also after a connector restart) and its expiry as numbers, UTC and
+/// words; the person's approval signs it in as a new bot.
+#[tokio::test]
+async fn a_retired_bot_is_told_why_everywhere_and_signs_in_again() {
+    tokio::time::timeout(Duration::from_secs(120), retired_inner())
+        .await
+        .expect("no hang");
+}
+
+async fn retired_inner() {
+    const WHY: &str = "BotWhisper updated how bots are identified; this bot needs to sign in once more. Its old rooms will need a new invite.";
+    let relay = TestRelay::start_with(cfg()).await;
+    let base = relay.base();
+    let (access, refresh) = legacy_bot(&relay.db, "acct1", "c1", "Atlas");
+    let config = tmp_dir("retired");
+    let store = BotStore::new(&config, &base, "acct1:c1");
+    store
+        .save_tokens(&botwhisper::connect::store::Tokens {
+            access_token: access.clone(),
+            refresh_token: Some(refresh),
+            expires_at: bw_relay::doorbell::now_unix() + 3600,
+            client_id: Some("c1".into()),
+        })
+        .unwrap();
+    store.save_bot_name("Atlas").unwrap();
+    store.set_current().unwrap();
+    let gw = Gateway::new(&base, config.clone(), None, None);
+    assert!(
+        gw.resume().await.unwrap(),
+        "the older bot works before retirement"
+    );
+    let (svc, _) = serve(gw).await;
+    call(&svc, "create_room", json!({ "title": "old room" })).await;
+
+    // The relay restarts with retirement on (same storage, same port).
+    let (c, db) = relay.shutdown().await;
+    let mut on = (*c).clone();
+    on.retire_legacy_ids = true;
+    let relay = TestRelay::start_on(Arc::new(on), db).await;
+
+    let check_signed_out = |v: &Value, tool: &str| {
+        assert_eq!(v["error"], "SIGNED_OUT", "{tool}: {v}");
+        assert_eq!(v["retired"], true, "{tool}: {v}");
+        let m = v["message"].as_str().unwrap();
+        assert!(
+            m.contains(WHY),
+            "{tool}: the explanation is the message: {m}"
+        );
+        let r = v["reason"].as_str().unwrap();
+        assert!(
+            r.starts_with("BOT_RETIRED: ") && r.contains(WHY),
+            "{tool}: {r}"
+        );
+        assert!(
+            r.ends_with("send your person the link and code it returns."),
+            "{tool}: whole, not cut: {r}"
+        );
+        let all = v.to_string();
+        assert!(
+            !all.contains("UNREACHABLE") && !all.contains("Transport"),
+            "{tool}: {all}"
+        );
+        assert!(!all.contains(".."), "{tool}: doubled punctuation: {all}");
+    };
+    for tool in ["list_rooms", "create_room", "status"] {
+        let r = raw(&svc, tool, json!({ "title": "x" })).await;
+        assert_eq!(r.is_error, Some(true), "{tool}");
+        check_signed_out(&r.structured_content.unwrap(), tool);
+    }
+    let who = call(&svc, "whoami", json!({})).await;
+    assert_eq!(who["signed_in"], false, "{who}");
+    assert_eq!(who["retired"], true, "{who}");
+    assert!(who["message"].as_str().unwrap().starts_with(WHY), "{who}");
+    assert!(!who.to_string().contains(".."), "{who}");
+
+    // login (not forced) in the same process: no CONNECTOR_BUSY, the note,
+    // and the expiry as numbers, UTC and words.
+    let l = call(&svc, "login", json!({})).await;
+    assert_eq!(l["status"], "pending", "{l}");
+    assert!(l["note"].as_str().unwrap().starts_with(WHY), "{l}");
+    let left = l["expires_in_s"].as_u64().unwrap();
+    let at = l["expires_at"].as_u64().unwrap();
+    let now = bw_relay::doorbell::now_unix();
+    assert!(at >= now + left - 2 && at <= now + left + 2, "{l}");
+    assert_eq!(l["expires_at_utc"], bw_proto::time::iso_utc(at));
+    assert!(
+        l["instruction"]
+            .as_str()
+            .unwrap()
+            .contains("The link expires in 15 minutes."),
+        "{l}"
+    );
+    assert!(!l.to_string().contains(".."), "{l}");
+    svc.cancel().await.ok();
+
+    // A restarted connector on the same home: the same story, from startup.
+    let gw = Gateway::new(&base, config.clone(), None, None);
+    assert!(gw.resume().await.is_err(), "the stored sign-in was retired");
+    let (svc, _) = serve(gw).await;
+    let r = raw(&svc, "list_rooms", json!({})).await;
+    check_signed_out(&r.structured_content.unwrap(), "list_rooms after restart");
+    let who = call(&svc, "whoami", json!({})).await;
+    assert_eq!(who["retired"], true, "{who}");
+    let l = call(&svc, "login", json!({ "force": true })).await;
+    assert!(l["note"].as_str().unwrap().starts_with(WHY), "{l}");
+    assert_ne!(l["status"], "CONNECTOR_BUSY");
+    let url = l["verification_url"].as_str().unwrap().to_string();
+    let code = l["user_code"].as_str().unwrap().to_string();
+    person(&relay, &url, &code, "approve", "Atlas").await;
+    let s = call(&svc, "login_status", json!({ "wait_s": 20 })).await;
+    assert_eq!(s["status"], "signed_in", "{s}");
+    let who = call(&svc, "whoami", json!({})).await;
+    assert_eq!(who["signed_in"], true, "{who}");
+    assert!(
+        !who["agent_id"].as_str().unwrap().contains(':'),
+        "a new-format id: {who}"
+    );
+    // The new bot starts clean: none of the older bot's rooms.
+    let st = call(&svc, "status", json!({})).await;
+    assert_eq!(st["rooms"], json!([]), "{st}");
+    let lr = call(&svc, "list_rooms", json!({})).await;
+    assert_eq!(lr["rooms"], json!([]), "{lr}");
+
+    // login force=true for the SAME bot in this process: the connector being
+    // replaced holds this bot's home lock; it must never be "busy" to itself.
+    let id = who["agent_id"].as_str().unwrap().to_string();
+    let l = call(&svc, "login", json!({ "force": true })).await;
+    assert_eq!(l["status"], "pending", "{l}");
+    let url = l["verification_url"].as_str().unwrap().to_string();
+    let code = l["user_code"].as_str().unwrap().to_string();
+    person_as(&relay, &url, &code, "approve", &id, "Atlas").await;
+    let s = call(&svc, "login_status", json!({ "wait_s": 20 })).await;
+    assert_eq!(s["status"], "signed_in", "{s}");
+    let r = raw(&svc, "status", json!({})).await;
+    assert_ne!(r.is_error, Some(true), "{r:?}");
+    let who = call(&svc, "whoami", json!({})).await;
+    assert_eq!(who["agent_id"], id.as_str(), "{who}");
+    svc.cancel().await.ok();
+    relay.shutdown().await;
+    let _ = std::fs::remove_dir_all(&config);
 }

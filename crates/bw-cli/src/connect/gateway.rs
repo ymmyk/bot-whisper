@@ -238,8 +238,8 @@ pub(crate) fn short_reason(r: &str) -> String {
     {
         return "the relay refused this bot's stored sign-in (HTTP 401)".to_string();
     }
-    let line = r.lines().next().unwrap_or_default().trim();
-    line.chars().take(200).collect()
+    // Whole, never cut: a reason cut mid-sentence is worse than a long one.
+    r.lines().next().unwrap_or_default().trim().to_string()
 }
 
 /// Did the relay say this bot was retired (0.2.14, older Member ID)?
@@ -320,6 +320,16 @@ fn revoked(r: &CallToolResult) -> Option<String> {
         })?;
     (text.contains("expired or was revoked") || text.contains("cannot be refreshed"))
         .then(|| "the relay no longer accepts the stored sign-in".to_string())
+}
+
+/// `15 minutes`, `1 minute`, `40 seconds`: how long a login link still
+/// lasts, from the seconds left (rounded up to whole minutes from one up).
+pub(crate) fn expires_in_words(secs: u64) -> String {
+    if secs < 60 {
+        return format!("{secs} second{}", if secs == 1 { "" } else { "s" });
+    }
+    let m = secs.div_ceil(60);
+    format!("{m} minute{}", if m == 1 { "" } else { "s" })
 }
 
 fn minutes_left(expires: Instant) -> u64 {
@@ -404,7 +414,12 @@ impl Gateway {
     /// out (the tool list is unchanged, but the descriptions may differ for
     /// hosts that care, so say so) and answer `NOT_SIGNED_IN`.
     async fn signed_out_by_relay(&self, why: String) -> CallToolResult {
-        *self.inner.connector.write().expect("lock") = None;
+        // Let go of this bot's home now: a clone of the old connector may
+        // live on in a background task, and its lock must not make this
+        // process look busy to itself when the bot signs in again.
+        if let Some(old) = self.inner.connector.write().expect("lock").take() {
+            old.release_lock();
+        }
         *self.inner.resume_note.lock().expect("lock") = None;
         *self.inner.signed_out.lock().expect("lock") = Some(why.clone());
         self.notify_tools_changed().await;
@@ -520,13 +535,17 @@ impl Gateway {
     fn pending_view(&self, p: &Pending, status: &str) -> Value {
         let url = &p.start.verification_uri_complete;
         let code = &p.start.user_code;
+        let left = minutes_left(p.expires);
         json!({
             "status": status,
             "verification_url": url,
             "user_code": code,
-            "expires_in_s": minutes_left(p.expires),
+            "expires_in_s": left,
+            "expires_at": p.expires_at,
+            "expires_at_utc": bw_proto::time::iso_utc(p.expires_at),
             "instruction": format!(
-                "Tell your person: open {url} (code {code}), sign in with your email, check the code matches, and approve this bot. Only your person should open it. You do not need to poll: the connector keeps checking by itself, and the room tools work as soon as they approve (`login_status` is an optional check)."
+                "Tell your person: open {url} (code {code}), sign in with your email, check the code matches, and approve this bot. The link expires in {}. Only your person should open it. You do not need to poll: the connector keeps checking by itself, and the room tools work as soon as they approve (`login_status` is an optional check).",
+                expires_in_words(left)
             ),
         })
     }
@@ -615,7 +634,10 @@ impl Gateway {
             }
             DevicePoll::Failed(e) => {
                 st.pending = None;
-                st.last_failure = Some(format!("The login failed: {e}. Call `login` again."));
+                st.last_failure = Some(format!(
+                    "The login failed: {} Call `login` again.",
+                    super::relay::sentence(&e.to_string())
+                ));
                 Step::Failed
             }
             DevicePoll::Tokens(tokens) => {
@@ -631,7 +653,8 @@ impl Gateway {
                             st.last_failure = None;
                         } else {
                             st.last_failure = Some(format!(
-                                "Approved, but finishing the sign-in failed: {e}. Call `login` again."
+                                "Approved, but finishing the sign-in failed: {} Call `login` again.",
+                                super::relay::sentence(&e.to_string())
                             ));
                         }
                         Step::Failed
@@ -646,6 +669,11 @@ impl Gateway {
     async fn complete(&self, tokens: &Tokens) -> anyhow::Result<()> {
         let i = &self.inner;
         let signed = finish_sign_in(&i.config, &i.relay, tokens).await?;
+        // A connector being replaced (login force=true) gives up its home
+        // first, so the new one never finds this very process in the way.
+        if let Some(old) = i.connector.write().expect("lock").take() {
+            old.release_lock();
+        }
         let client = RelayClient::new(&i.relay, tokens.clone(), Some(signed.store.clone()));
         let connector = Connector::new(client, Some(signed.store), Some(&i.config)).await?;
         *i.connector.write().expect("lock") = Some(connector);
@@ -833,8 +861,10 @@ impl Gateway {
                     })));
                 }
             }
-            // A stored login from an earlier run may still work.
-            if self.connector().is_none() && matches!(self.resume().await, Ok(true)) {
+            // A stored login from an earlier run may still work (not once
+            // the relay refused it: that one is known to be dead).
+            let refused = self.inner.signed_out.lock().expect("lock").is_some();
+            if self.connector().is_none() && !refused && matches!(self.resume().await, Ok(true)) {
                 self.notify_tools_changed().await;
                 return respond(Ok(json!({
                     "status": "signed_in",
@@ -964,32 +994,50 @@ impl Gateway {
     async fn whoami(&self) -> Result<CallToolResult, ErrorData> {
         let relay = &self.inner.relay;
         if let Some(c) = self.connector() {
-            return respond(Ok(match c.whoami().await {
+            match c.whoami().await {
                 Ok(who) => {
-                    json!({
+                    return respond(Ok(json!({
                         "signed_in": true,
                         "relay": relay,
                         "bot_name": who["bot_name"],
                         "agent_id": who["agent_id"],
-                    })
+                    })))
                 }
-                Err(e) => json!({
-                    "signed_in": "unknown",
-                    "relay": relay,
-                    "agent_id": c.agent_id(),
-                    "message": format!("The relay did not accept the stored sign-in ({e}). Call `login` with force=true."),
-                }),
-            }));
+                // Refused (revoked, retired): signed out now, said below.
+                Err(e) if super::relay::signed_out(&e).is_some() => {
+                    let why = super::relay::signed_out(&e).expect("checked").0.clone();
+                    let _ = self.signed_out_by_relay(why).await;
+                }
+                Err(e) => {
+                    return respond(Ok(json!({
+                        "signed_in": "unknown",
+                        "relay": relay,
+                        "agent_id": c.agent_id(),
+                        "message": format!("The relay did not answer whoami ({e}); try again in a minute."),
+                    })))
+                }
+            }
         }
         let note = self.inner.resume_note.lock().expect("lock").clone();
         let pending = self.inner.login.lock().await.pending.is_some();
-        respond(Ok(json!({
+        let why = self.inner.signed_out.lock().expect("lock").clone();
+        let mut v = json!({
             "signed_in": false,
             "relay": relay,
             "requested_bot_name": self.inner.bot_name,
             "login_in_progress": pending,
             "message": note.unwrap_or_else(|| "Not signed in. Call `login` and send your person the link and code; the room tools work as soon as they approve.".into()),
-        })))
+        });
+        if let Some(why) = why {
+            if is_retired(&why) {
+                v["retired"] = json!(true);
+                v["message"] = json!(bw_relay::auth::BOT_RETIRED_MESSAGE);
+            } else {
+                v["message"] = json!(SIGNED_OUT_MESSAGE);
+            }
+            v["reason"] = json!(short_reason(&why));
+        }
+        respond(Ok(v))
     }
 }
 
@@ -1138,6 +1186,17 @@ impl Gateway {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn expiry_in_words_comes_from_the_value() {
+        assert_eq!(super::expires_in_words(900), "15 minutes");
+        assert_eq!(super::expires_in_words(899), "15 minutes");
+        assert_eq!(super::expires_in_words(600), "10 minutes");
+        assert_eq!(super::expires_in_words(61), "2 minutes");
+        assert_eq!(super::expires_in_words(60), "1 minute");
+        assert_eq!(super::expires_in_words(59), "59 seconds");
+        assert_eq!(super::expires_in_words(1), "1 second");
+    }
+
     use super::*;
 
     fn saved(relay: &str, bot_name: Option<&str>) -> Vec<u8> {

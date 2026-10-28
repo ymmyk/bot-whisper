@@ -457,7 +457,10 @@ async fn connect(args: ConnectArgs) -> anyhow::Result<()> {
                             {
                                 // Never serve this bot signed out (or as
                                 // another bot): refuse to start.
-                                eprintln!("botwhisper connect: not starting: {held}.");
+                                eprintln!(
+                                    "botwhisper connect: not starting: {}",
+                                    botwhisper::connect::relay::sentence(&held.to_string())
+                                );
                                 std::process::exit(3);
                             } else if let Some(w) =
                                 e.downcast_ref::<botwhisper::connect::WrongBot>()

@@ -20,6 +20,7 @@
 use std::{
     fs::{File, OpenOptions, TryLockError},
     path::{Path, PathBuf},
+    sync::Mutex,
 };
 
 use serde::{Deserialize, Serialize};
@@ -65,9 +66,10 @@ fn process_started(pid: u32) -> Option<String> {
 }
 
 /// Held for as long as this process serves the bot.
+/// Released by [`ConfigLock::release`] or on drop, whichever comes first.
 #[derive(Debug)]
 pub struct ConfigLock {
-    file: File,
+    file: Mutex<Option<File>>,
     pid_path: PathBuf,
 }
 
@@ -111,10 +113,22 @@ impl ConfigLock {
     /// The holder's pid, if the record is trustworthy (see the module docs).
     fn holder_pid(pid_path: &Path, who: &LockWho) -> Option<u32> {
         let rec: Record = serde_json::from_slice(&std::fs::read(pid_path).ok()?).ok()?;
-        if Path::new(&rec.home) != who.home {
+        Self::trusted_pid(&rec, who, std::process::id())
+    }
+
+    /// The recorded pid, if it can be trusted to be the holder: never this
+    /// process itself (that record is stale: a connector here gave the lock
+    /// up, or a recycled pid), never a process that is not running, and
+    /// never one whose start time differs (a reused pid).
+    fn trusted_pid(rec: &Record, who: &LockWho, me: u32) -> Option<u32> {
+        if Path::new(&rec.home) != who.home || rec.pid == me || rec.pid == 0 {
             return None;
         }
-        if !rec.started.is_empty() && process_started(rec.pid).as_deref() != Some(&rec.started) {
+        let started = process_started(rec.pid);
+        if cfg!(unix) && started.is_none() {
+            return None;
+        }
+        if !rec.started.is_empty() && started.as_deref() != Some(&rec.started) {
             return None;
         }
         Some(rec.pid)
@@ -158,17 +172,31 @@ impl ConfigLock {
             started: process_started(me).unwrap_or_default(),
         };
         crate::paths::write_private(&pid_path, &serde_json::to_vec(&rec)?)?;
-        Ok(ConfigLock { file, pid_path })
+        Ok(ConfigLock {
+            file: Mutex::new(Some(file)),
+            pid_path,
+        })
+    }
+
+    /// Give the lock up now (idempotent). The connector holding it is
+    /// being dropped or replaced, but clones of it may outlive that in
+    /// background tasks; without this, this very process would find its
+    /// own lock in the way when the bot signs in again.
+    pub fn release(&self) {
+        let Some(file) = self.file.lock().unwrap_or_else(|p| p.into_inner()).take() else {
+            return;
+        };
+        let _ = std::fs::remove_file(&self.pid_path);
+        // The lock file itself is left in place (it is not a lock without a
+        // holder): unlinking it while others may have it open lets two
+        // processes lock two different files.
+        let _ = file.unlock();
     }
 }
 
 impl Drop for ConfigLock {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.pid_path);
-        // The lock file itself is left in place (it is not a lock without a
-        // holder): unlinking it while others may have it open lets two
-        // processes lock two different files.
-        let _ = self.file.unlock();
+        self.release();
     }
 }
 
@@ -257,20 +285,20 @@ mod tests {
     fn a_second_holder_is_refused_with_the_first_pid() {
         let home = tmp("two");
         let dir = home.join("relay").join("bot");
-        let first = ConfigLock::acquire(&dir, &who(&home, "QA Test 3")).unwrap();
-        let err = ConfigLock::acquire(&dir, &who(&home, "QA Test 3")).unwrap_err();
-        let held = err.downcast_ref::<LockHeld>().expect("LockHeld");
-        assert_eq!(held.pid, Some(std::process::id()));
+        let mut first = spawn_holder(&home, "QA Test 3");
+        let held = refused(&home, "QA Test 3");
+        assert_eq!(held.pid, Some(first.id()));
         assert_eq!(
-            err.to_string(),
+            held.to_string(),
             format!(
                 "another botwhisper connect is running for this home ({}, bot \"QA Test 3\", pid {}); \
                  stop it or start this bot with --home DIR (or BOTWHISPER_HOME=DIR)",
                 home.display(),
-                std::process::id()
+                first.id()
             )
         );
-        drop(first);
+        drop(first.stdin.take());
+        first.wait().unwrap();
         // Released once the holder is gone: no stale lock, no stale pid.
         assert!(!ConfigLock::pid_path_in(&dir).exists());
         let again = ConfigLock::acquire(&dir, &who(&home, "QA Test 3")).unwrap();
@@ -301,7 +329,7 @@ mod tests {
         );
         assert!(!msg.contains(&pa.to_string()), "{msg}");
         let rc = refused(&hc, "Third");
-        assert_eq!(rc.pid, Some(std::process::id()));
+        assert_eq!(rc.pid, None, "this process never names itself");
 
         // The pid files are inside their own homes and name their own homes.
         for (h, pid) in [(&ha, pa), (&hb, pb)] {
@@ -378,6 +406,77 @@ mod tests {
         holder.unlock().unwrap();
         drop(holder);
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn released_lock_is_free_again_in_the_same_process() {
+        let home = tmp("release");
+        let dir = home.join("relay").join("bot");
+        let first = ConfigLock::acquire(&dir, &who(&home, "Atlas")).unwrap();
+        // Still held: a second acquire in this process is refused, and the
+        // refusal never names this process as the holder.
+        let held = ConfigLock::acquire(&dir, &who(&home, "Atlas"))
+            .expect_err("held")
+            .downcast::<LockHeld>()
+            .unwrap();
+        assert_eq!(held.pid, None, "never our own pid");
+        first.release();
+        first.release();
+        let again = ConfigLock::acquire(&dir, &who(&home, "Atlas")).expect("free after release");
+        drop(first);
+        assert!(
+            ConfigLock::acquire(&dir, &who(&home, "Atlas")).is_err(),
+            "dropping the released lock does not free the new one"
+        );
+        drop(again);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn own_dead_or_recycled_pids_are_not_trusted() {
+        let home = PathBuf::from("/h");
+        let w = who(&home, "Atlas");
+        let me = std::process::id();
+        let rec = |pid: u32, started: &str| Record {
+            pid,
+            home: "/h".into(),
+            bot: "Atlas".into(),
+            started: started.into(),
+        };
+        assert_eq!(
+            ConfigLock::trusted_pid(&rec(me, ""), &w, me),
+            None,
+            "own pid"
+        );
+        assert_eq!(
+            ConfigLock::trusted_pid(&rec(me, &process_started(me).unwrap_or_default()), &w, me),
+            None,
+            "own pid even with the right start time"
+        );
+        if cfg!(unix) {
+            assert_eq!(
+                ConfigLock::trusted_pid(&rec(4_000_000, ""), &w, me),
+                None,
+                "not running"
+            );
+            let mut child = std::process::Command::new("sleep")
+                .arg("5")
+                .spawn()
+                .unwrap();
+            let pid = child.id();
+            let started = process_started(pid).unwrap();
+            assert_eq!(
+                ConfigLock::trusted_pid(&rec(pid, &started), &w, me),
+                Some(pid)
+            );
+            assert_eq!(
+                ConfigLock::trusted_pid(&rec(pid, "Mon Jan  1 00:00:00 2001"), &w, me),
+                None,
+                "recycled pid"
+            );
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 
     #[test]

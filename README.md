@@ -41,7 +41,7 @@ powershell -ExecutionPolicy Bypass -c "irm https://github.com/ymmyk/bot-whisper/
 
 Alpha releases are published as the latest GitHub release, so the
 `releases/latest` URLs above work; to pin a version use e.g.
-`https://github.com/ymmyk/bot-whisper/releases/download/v0.2.15-alpha/botwhisper-installer.sh`.
+`https://github.com/ymmyk/bot-whisper/releases/download/v0.2.16-alpha/botwhisper-installer.sh`.
 The installers put `botwhisper` in `~/.cargo/bin`. Or download the archive
 for your platform from the release page and unpack it anywhere.
 
@@ -401,7 +401,7 @@ docker run -d --name botwhisper -p 9100:9100 -v bw-data:/data \
   -e BW_MAIL_TRANSPORT=smtp -e BW_SMTP_HOST=smtp.resend.com \
   -e BW_SMTP_USERNAME=resend -e BW_SMTP_PASSWORD=re_... \
   -e BW_MAIL_FROM="BotWhisper <no-reply@relay.example.com>" \
-  ghcr.io/ymmyk/bot-whisper:0.2.15-alpha
+  ghcr.io/ymmyk/bot-whisper:0.2.16-alpha
 ```
 
 The image listens on `0.0.0.0:9100` and keeps its SQLite file in the `/data`
@@ -423,7 +423,7 @@ from its working directory (`dotenvy`); real environment variables win.
 | `--data` | `BW_DATA` | `data/botwhisper.sqlite3` | SQLite file for rooms, accounts, token hashes, and encrypted messages and handshakes until delivered (ciphertext only, never message text). `memory` for none |
 | `--public-url` | `BW_PUBLIC_URL` | `http://<bind>` | Base URL in invite links, sign-in links and OAuth metadata |
 | `--allow-dev-tokens` | `BW_ALLOW_DEV_TOKENS` | off | Accept `--dev-token` bearer tokens (local dev) |
-| `--retire-legacy-ids` | `BW_RETIRE_LEGACY_IDS` | off | At startup, retire bots with the older Member ID format (before 0.2.11) and close their rooms; idempotent. Off: only logs what it would retire |
+| `--retire-legacy-ids` | `BW_RETIRE_LEGACY_IDS` | off | At startup, retire bots with the older Member ID format (before 0.2.11) and close their rooms; idempotent. Off: only logs what it would retire. Turn on with `BW_RETIRE_LEGACY_IDS=true` (a bool: `=1` is rejected and the relay will not start) |
 | `--dev-token` (repeatable) | `BW_DEV_TOKENS` (comma-separated) | none | Dev bearer tokens. **Each token is one agent identity** |
 | `--behind-proxy` | `BW_BEHIND_PROXY` | off | Trust `X-Forwarded-For` for per-IP rate limits (Caddy, Cloudflare) |
 | `--unacked-ttl` | `BW_UNACKED_TTL` | `7d` | Delete undelivered encrypted messages after this (max 14d) |

@@ -4,70 +4,9 @@ mod common;
 
 use std::sync::Arc;
 
-use bw_relay::{
-    auth::sha256_hex,
-    db::{AccountRow, BotRow, ClientRow, TokenRow},
-    doorbell::now_unix,
-    RelayConfig,
-};
+use bw_relay::RelayConfig;
 use common::*;
 use serde_json::json;
-
-/// An account with one older-format bot (agent id `<account>:<client>`) and
-/// live access and refresh tokens. Returns (access, refresh).
-fn legacy_bot(
-    db: &bw_relay::db::Db,
-    account: &str,
-    client_id: &str,
-    name: &str,
-) -> (String, String) {
-    let now = now_unix();
-    let _ = db.insert_account(&AccountRow {
-        id: account.into(),
-        email: format!("{account}@example.com"),
-        created_at: now,
-    });
-    db.insert_bot(&BotRow {
-        id: format!("bot_{client_id}"),
-        account_id: account.into(),
-        name: name.into(),
-        agent_id: format!("{account}:{client_id}"),
-        created_at: now,
-        last_used_at: None,
-        last_client_id: Some(client_id.into()),
-        last_client_name: None,
-    })
-    .unwrap();
-    db.insert_client(&ClientRow {
-        id: client_id.into(),
-        secret_hash: None,
-        name: Some(name.into()),
-        redirect_uris: vec!["http://127.0.0.1:9199/cb".into()],
-        auth_method: "none".into(),
-        created_at: now,
-    })
-    .unwrap();
-    let access = format!("bwa_test_{client_id}");
-    let refresh = format!("bwr_test_{client_id}");
-    for (kind, tok, ttl) in [
-        ("access", &access, 3600),
-        ("refresh", &refresh, 90 * 86_400),
-    ] {
-        db.insert_token(
-            &sha256_hex(tok),
-            &TokenRow {
-                kind: kind.into(),
-                client_id: client_id.into(),
-                account_id: account.into(),
-                scope: "rooms".into(),
-                expires_at: now + ttl,
-                bot_id: Some(format!("bot_{client_id}")),
-            },
-        )
-        .unwrap();
-    }
-    (access, refresh)
-}
 
 fn with_switch(cfg: &Arc<RelayConfig>, on: bool) -> Arc<RelayConfig> {
     let mut c = (**cfg).clone();

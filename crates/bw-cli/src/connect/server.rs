@@ -192,7 +192,10 @@ fn join_failure(detail: &str) -> String {
          cause: keep just one running. This connector has left the room.)"
             .to_string()
     } else {
-        format!("could not join the room: {detail}. Ask for a fresh invite. This connector has left the room.")
+        format!(
+            "could not join the room: {} Ask for a fresh invite. This connector has left the room.",
+            super::relay::sentence(detail)
+        )
     }
 }
 
@@ -508,12 +511,8 @@ fn is_transport(e: &anyhow::Error) -> bool {
 
 /// An error chain as one short line, for `detail`.
 fn one_line(e: &anyhow::Error) -> String {
-    let full = format!("{e:#}").replace(['\n', '\r'], " ");
-    if full.chars().count() > 300 {
-        full.chars().take(300).chain(['…']).collect()
-    } else {
-        full
-    }
+    // Whole, never cut mid-word.
+    format!("{e:#}").replace(['\n', '\r'], " ")
 }
 
 /// What a read returns while the relay is briefly unreachable (restarting):
@@ -723,6 +722,14 @@ impl Connector {
         &self.agent_id
     }
 
+    /// Give up this bot's home lock now (the connector is being dropped
+    /// or replaced; clones in background tasks no longer count).
+    pub fn release_lock(&self) {
+        if let Some(l) = &self._lock {
+            l.release();
+        }
+    }
+
     /// The relay's answer to `whoami` for this connector's login (account,
     /// bot id and name). Fails when the stored sign-in no longer works.
     pub async fn whoami(&self) -> anyhow::Result<Value> {
@@ -879,11 +886,17 @@ impl Connector {
     async fn prune_stale_rooms(&self, listed: &[String]) -> Vec<Value> {
         let held: Vec<String> = {
             let st = self.state.lock().await;
-            st.rooms
+            // Rooms held here and seats still waiting for their Welcome.
+            let mut v: Vec<String> = st
+                .rooms
                 .keys()
+                .chain(st.pending.keys())
                 .filter(|r| !listed.contains(r))
                 .cloned()
-                .collect()
+                .collect();
+            v.sort();
+            v.dedup();
+            v
         };
         let mut out = Vec::new();
         for r in held {
@@ -904,7 +917,9 @@ impl Connector {
                 let title = {
                     let mut st = self.state.lock().await;
                     let title = st.rooms.get(&r).and_then(|x| x.title.clone());
-                    self.forget_room(&mut st, &r);
+                    if st.rooms.contains_key(&r) {
+                        self.forget_room(&mut st, &r);
+                    }
                     st.pending.remove(&r);
                     st.removed.insert(r.clone(), title.clone());
                     self.persist_rooms(&st);
@@ -1585,10 +1600,18 @@ impl Connector {
     async fn status(&self) -> Result<CallToolResult, ErrorData> {
         // Drop rooms the bot was removed from (or that closed), so status
         // never lists a room it can no longer use.
-        let pruned = match self.my_e2e_rooms().await {
+        let mut pruned = match self.my_e2e_rooms().await {
             Ok(listed) => self.prune_stale_rooms(&listed).await,
             Err(_) => Vec::new(),
         };
+        // Join requests still waiting for approval: drop the ones whose room
+        // closed (or that were declined) instead of listing them.
+        let (_, notes) = self.check_awaiting().await;
+        pruned.extend(
+            notes
+                .into_iter()
+                .filter(|n| n["state"] != "awaiting_approval"),
+        );
         let st = self.state.lock().await;
         let rooms: Vec<Value> = st
             .rooms

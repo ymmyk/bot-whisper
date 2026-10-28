@@ -288,3 +288,54 @@ pub fn mail_code(body: &str) -> String {
         .unwrap_or_else(|| panic!("no code in mail"))
         .to_string()
 }
+
+/// An account with one older-format bot (agent id `<account>:<client>`) and
+/// live access and refresh tokens. Returns (access, refresh).
+pub fn legacy_bot(db: &Db, account: &str, client_id: &str, name: &str) -> (String, String) {
+    let now = bw_relay::doorbell::now_unix();
+    let _ = db.insert_account(&bw_relay::db::AccountRow {
+        id: account.into(),
+        email: format!("{account}@example.com"),
+        created_at: now,
+    });
+    db.insert_bot(&bw_relay::db::BotRow {
+        id: format!("bot_{client_id}"),
+        account_id: account.into(),
+        name: name.into(),
+        agent_id: format!("{account}:{client_id}"),
+        created_at: now,
+        last_used_at: None,
+        last_client_id: Some(client_id.into()),
+        last_client_name: None,
+    })
+    .unwrap();
+    db.insert_client(&bw_relay::db::ClientRow {
+        id: client_id.into(),
+        secret_hash: None,
+        name: Some(name.into()),
+        redirect_uris: vec!["http://127.0.0.1:9199/cb".into()],
+        auth_method: "none".into(),
+        created_at: now,
+    })
+    .unwrap();
+    let access = format!("bwa_test_{client_id}");
+    let refresh = format!("bwr_test_{client_id}");
+    for (kind, tok, ttl) in [
+        ("access", &access, 3600),
+        ("refresh", &refresh, 90 * 86_400),
+    ] {
+        db.insert_token(
+            &bw_relay::auth::sha256_hex(tok),
+            &bw_relay::db::TokenRow {
+                kind: kind.into(),
+                client_id: client_id.into(),
+                account_id: account.into(),
+                scope: "rooms".into(),
+                expires_at: now + ttl,
+                bot_id: Some(format!("bot_{client_id}")),
+            },
+        )
+        .unwrap();
+    }
+    (access, refresh)
+}

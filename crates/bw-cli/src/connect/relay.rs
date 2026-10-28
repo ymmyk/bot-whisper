@@ -69,12 +69,24 @@ impl std::error::Error for RelayUnreachable {}
 #[derive(Debug, Clone)]
 pub struct SignedOut(pub String);
 
+/// `s` as one sentence: exactly one closing period (a reason that already
+/// ends with `.`, `!` or `?` gets none added, so text never reads "..").
+pub fn sentence(s: &str) -> String {
+    let t = s.trim_end();
+    let t = t.trim_end_matches('.');
+    if t.ends_with('!') || t.ends_with('?') {
+        t.to_string()
+    } else {
+        format!("{t}.")
+    }
+}
+
 impl std::fmt::Display for SignedOut {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "signed out: {}. Call `login` (force=true) for a new sign-in link and code for your person",
-            super::gateway::short_reason(&self.0)
+            "signed out: {} Call `login` (force=true) for a new sign-in link and code for your person",
+            sentence(&super::gateway::short_reason(&self.0))
         )
     }
 }
@@ -125,6 +137,85 @@ pub fn is_retryable_read(tool: &str, args: &Value) -> bool {
 pub fn is_unreachable(e: &anyhow::Error) -> bool {
     e.chain()
         .any(|c| c.downcast_ref::<RelayUnreachable>().is_some())
+}
+
+/// A BotWhisper error code (`BOT_RETIRED`, `ACCOUNT_REQUIRED`, ...) and its
+/// message from a relay HTTP error body: `unauthorized (CODE): message`,
+/// `{"error": "CODE", "message": ...}`, an OAuth `error_description` of
+/// `CODE: message`, or plain `CODE: message`. The message is kept whole.
+pub fn botwhisper_code(body: &str) -> Option<(String, String)> {
+    fn is_code(c: &str) -> bool {
+        c.len() >= 3
+            && c.chars().all(|ch| ch.is_ascii_uppercase() || ch == '_')
+            && c.chars().next().is_some_and(|ch| ch.is_ascii_uppercase())
+    }
+    if let Ok(v) = serde_json::from_str::<Value>(body.trim()) {
+        if let Some(c) = v["error"].as_str().filter(|c| is_code(c)) {
+            let m = v["message"]
+                .as_str()
+                .or(v["error_description"].as_str())
+                .unwrap_or_default();
+            return Some((c.to_string(), m.to_string()));
+        }
+        if let Some(d) = v["error_description"].as_str() {
+            return botwhisper_code(d);
+        }
+        return None;
+    }
+    let first = body.trim().lines().next().unwrap_or_default().trim();
+    // `unauthorized (CODE): message`
+    if let Some(open) = first.find(" (") {
+        let rest = &first[open + 2..];
+        if let Some(close) = rest.find("):") {
+            let c = &rest[..close];
+            if is_code(c) {
+                return Some((c.to_string(), rest[close + 2..].trim().to_string()));
+            }
+        }
+    }
+    // `CODE: message`
+    let (c, m) = first.split_once(": ")?;
+    is_code(c).then(|| (c.to_string(), m.trim().to_string()))
+}
+
+/// What a relay HTTP error means for the connector: a 401/403 is a
+/// sign-out (`CODE: message` as its reason); any other status with a
+/// BotWhisper code is that code, as a tool error.
+pub fn refusal_from_http(status: u16, body: &str) -> Option<anyhow::Error> {
+    let code = botwhisper_code(body);
+    match (status, code) {
+        (401 | 403, Some((c, m))) => Some(SignedOut(format!("{c}: {m}")).into()),
+        (401 | 403, None) => Some(
+            SignedOut(format!(
+                "HTTP {status}: {}",
+                body.trim().lines().next().unwrap_or_default().trim()
+            ))
+            .into(),
+        ),
+        (400..=599, Some((c, m))) => {
+            Some(ToolError(json!({ "error": c, "message": m, "http_status": status })).into())
+        }
+        _ => None,
+    }
+}
+
+/// Whether an error text is a reused (keep-alive) connection the relay had
+/// already closed: the request never got an answer, so one immediate
+/// retry on a fresh connection is safe. rmcp drops the cause, so a reset
+/// often reads only as reqwest's "error sending request for url".
+pub fn is_stale_connection(msg: &str) -> bool {
+    let l = msg.to_ascii_lowercase();
+    [
+        "error sending request",
+        "connection reset",
+        "connection closed before message completed",
+        "broken pipe",
+        "incompletemessage",
+        "connection was reset",
+        "channel closed",
+    ]
+    .iter()
+    .any(|k| l.contains(k))
 }
 
 fn unreachable_or_plain(msg: String) -> anyhow::Error {
@@ -222,12 +313,62 @@ impl RelayClient {
     /// tried once and reports the failure.
     pub async fn call(&self, tool: &str, args: Value) -> anyhow::Result<Value> {
         match self.call_once(tool, args.clone()).await {
+            // A reused keep-alive connection the relay had already closed
+            // (e.g. across its restart): the request got no answer, so
+            // retry once, at once, on a fresh connection (any tool).
+            Err(e) if is_unreachable(&e) && is_stale_connection(&format!("{e:#}")) => {
+                tracing::debug!("relay call {tool}: stale connection, retrying once");
+                match self.call_once(tool, args.clone()).await {
+                    Err(e) if is_unreachable(&e) && is_retryable_read(tool, &args) => {
+                        tokio::time::sleep(READ_RETRY_BACKOFF).await;
+                        self.call_once(tool, args).await
+                    }
+                    r => r,
+                }
+            }
             Err(e) if is_unreachable(&e) && is_retryable_read(tool, &args) => {
                 tokio::time::sleep(READ_RETRY_BACKOFF).await;
                 self.call_once(tool, args).await
             }
             r => r,
         }
+    }
+
+    /// Why the relay refused us, asked directly: the MCP client flattens
+    /// an HTTP error to text without its body, so one plain request with
+    /// the same bearer reads the status and the BotWhisper code. `None`
+    /// when the relay answers fine, or cannot be reached at all.
+    async fn probe_refusal(&self) -> Option<anyhow::Error> {
+        let token = self.tokens.lock().await.access_token.clone();
+        let http = crate::tls::client_builder()
+            .ok()?
+            .timeout(Duration::from_secs(10))
+            .build()
+            .ok()?;
+        let r = http
+            .post(format!("{}/mcp", self.relay))
+            .bearer_auth(token)
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .body("{}")
+            .send()
+            .await
+            .ok()?;
+        let status = r.status().as_u16();
+        if !(400..600).contains(&status) {
+            return None;
+        }
+        let body = r.text().await.unwrap_or_default();
+        refusal_from_http(status, &body)
+    }
+
+    /// A failed call, classified: a refusal the relay explains (its code),
+    /// else a sign-out or unreachable from the error text.
+    async fn classify_failure(&self, msg: String) -> anyhow::Error {
+        if let Some(r) = self.probe_refusal().await {
+            return r;
+        }
+        unreachable_or_plain(msg)
     }
 
     /// Whether a failed connection was a certificate problem: from the error
@@ -258,8 +399,9 @@ impl RelayClient {
                     .expect("checked")
                     .into())
             }
+            // A refused refresh already carries the relay's own reason.
             Err(e) if signed_out(&e).is_some() => return Err(e),
-            Err(e) => return Err(unreachable_or_plain(e.to_string())),
+            Err(e) => return Err(self.classify_failure(format!("{e:#}")).await),
         };
         let arguments = args.as_object().cloned().unwrap_or_default();
         let result = match svc
@@ -270,9 +412,9 @@ impl RelayClient {
             Err(e) => {
                 // Drop the session so the next call reconnects.
                 *self.svc.lock().await = None;
-                return Err(unreachable_or_plain(format!(
-                    "relay call {tool} failed: {e}"
-                )));
+                return Err(self
+                    .classify_failure(format!("relay call {tool} failed: {e}"))
+                    .await);
             }
         };
         let v = result.structured_content.clone().unwrap_or_else(|| {
@@ -321,6 +463,146 @@ pub fn tool_error_code(e: &anyhow::Error) -> Option<String> {
 #[cfg(test)]
 mod retry_tests {
     use super::*;
+
+    const WHY: &str = "BotWhisper updated how bots are identified; this bot needs to sign in once more. Its old rooms will need a new invite. Call the connector's login tool (force=true) and send your person the link and code it returns.";
+
+    #[test]
+    fn relay_codes_are_read_from_every_body_shape() {
+        let plain = format!("unauthorized (BOT_RETIRED): {WHY}\n\nSetup: ...\nTechnical: x");
+        assert_eq!(
+            botwhisper_code(&plain),
+            Some(("BOT_RETIRED".into(), WHY.into()))
+        );
+        let j = json!({ "error": "RATE_LIMITED", "message": "slow down" }).to_string();
+        assert_eq!(
+            botwhisper_code(&j),
+            Some(("RATE_LIMITED".into(), "slow down".into()))
+        );
+        let oauth =
+            json!({ "error": "invalid_grant", "error_description": format!("BOT_RETIRED: {WHY}") })
+                .to_string();
+        assert_eq!(
+            botwhisper_code(&oauth),
+            Some(("BOT_RETIRED".into(), WHY.into()))
+        );
+        assert_eq!(
+            botwhisper_code("ROOM_CLOSED: gone"),
+            Some(("ROOM_CLOSED".into(), "gone".into()))
+        );
+        for none in [
+            "",
+            "Not Acceptable: Client must accept both application/json and text/event-stream",
+            "Bad Gateway",
+            "{}",
+            "Transport send error: Transport [rmcp::x] error: Client error",
+        ] {
+            assert_eq!(botwhisper_code(none), None, "{none}");
+        }
+    }
+
+    #[test]
+    fn an_http_error_with_a_code_is_that_code() {
+        let plain = format!("unauthorized (BOT_RETIRED): {WHY}\n\nmore");
+        let e = refusal_from_http(401, &plain).unwrap();
+        let so = signed_out(&e).expect("a sign-out");
+        assert_eq!(so.0, format!("BOT_RETIRED: {WHY}"), "whole, never cut");
+        assert!(!is_unreachable(&e));
+        let e = refusal_from_http(
+            429,
+            &json!({ "error": "RATE_LIMITED", "message": "m" }).to_string(),
+        )
+        .unwrap();
+        assert_eq!(tool_error_code(&e).as_deref(), Some("RATE_LIMITED"));
+        assert_eq!(e.downcast_ref::<ToolError>().unwrap().0["http_status"], 429);
+        // No code, not an auth status: not a refusal (the caller keeps its
+        // own reading, e.g. unreachable).
+        assert!(refusal_from_http(400, "").is_none());
+        assert!(refusal_from_http(502, "Bad Gateway").is_none());
+        assert!(refusal_from_http(200, "ok").is_none());
+    }
+
+    #[test]
+    fn sentences_end_with_one_period() {
+        assert_eq!(sentence("it returns."), "it returns.");
+        assert_eq!(sentence("it returns"), "it returns.");
+        assert_eq!(sentence("it returns..  "), "it returns.");
+        assert_eq!(sentence("really?"), "really?");
+        // The restart log line QA saw as "returns.. Call".
+        let line = SignedOut(format!("BOT_RETIRED: {WHY}")).to_string();
+        assert!(line.contains("code it returns. Call `login`"), "{line}");
+        assert!(!line.contains(".."), "{line}");
+        let line = SignedOut("HTTP 401: nope".into()).to_string();
+        assert!(!line.contains(".."), "{line}");
+    }
+
+    /// No user-facing string literal in the connector or relay sources
+    /// has doubled punctuation (".." before a word, ",,", ". .").
+    #[test]
+    fn no_source_string_has_doubled_punctuation() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let mut bad = Vec::new();
+        let mut stack = vec![root.join("bw-cli/src"), root.join("bw-relay/src")];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).unwrap().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                    continue;
+                }
+                if p.extension().and_then(|x| x.to_str()) != Some("rs") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&p).unwrap();
+                for (n, line) in text.lines().enumerate() {
+                    if line.trim_start().starts_with("//") {
+                        continue;
+                    }
+                    let b = line.as_bytes();
+                    for i in 1..b.len().saturating_sub(2) {
+                        let prev = b[i - 1];
+                        let word = prev.is_ascii_alphabetic() || prev == b')' || prev == b'`';
+                        let doubled = (b[i] == b'.'
+                            && b[i + 1] == b'.'
+                            && b[i + 2] != b'.'
+                            && b.get(i.wrapping_sub(2)) != Some(&b'.')
+                            && (b[i + 2] == b'"'
+                                || (b[i + 2] == b' '
+                                    && b.get(i + 3).is_some_and(|c| c.is_ascii_uppercase()))))
+                            || (b[i] == b',' && b[i + 1] == b',')
+                            || (b[i] == b'.'
+                                && b[i + 1] == b' '
+                                && b[i + 2] == b'.'
+                                && b.get(i + 3) != Some(&b'.'));
+                        if word && doubled && !line.contains("..=") {
+                            bad.push(format!("{}:{}: {}", p.display(), n + 1, line.trim()));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(bad.is_empty(), "doubled punctuation:\n{}", bad.join("\n"));
+    }
+
+    #[test]
+    fn a_reset_reused_connection_is_recognised() {
+        for m in [
+            "Client error: error sending request for url (http://h/mcp)",
+            "connection reset by peer",
+            "connection closed before message completed",
+            "IncompleteMessage",
+            "Broken pipe (os error 32)",
+        ] {
+            assert!(is_stale_connection(m), "{m}");
+        }
+        for m in [
+            "invalid certificate",
+            "HTTP 500",
+            "ROOM_CLOSED: gone",
+            "timed out",
+        ] {
+            assert!(!is_stale_connection(m), "{m}");
+        }
+    }
 
     #[test]
     fn only_reads_are_retried() {

@@ -5,6 +5,39 @@ All notable changes to BotWhisper. The format follows
 
 ## [Unreleased]
 
+## [0.2.16-alpha] - 2026-10-28
+
+Fixes from QA on 0.2.15.
+
+### Fixed
+- A retired bot's connector says so in plain words: `SIGNED_OUT` carries
+  "BotWhisper updated how bots are identified; this bot needs to sign in
+  once more. Its old rooms will need a new invite." in `message` (with
+  `retired: true`), and `reason` is never cut short.
+- A relay HTTP error that names a BotWhisper code is reported as that code:
+  a 401 `BOT_RETIRED` is a sign-out, never `RELAY_UNREACHABLE` / "cannot
+  reach the relay … Transport".
+- `CONNECTOR_BUSY` no longer names the connector's own process: signing in
+  again (or `login force=true`) releases the old sign-in's lock first, and
+  the busy check ignores its own, dead and recycled pids.
+- After a connector restart, `login` includes the ID-change note when the
+  stored bot was retired; `whoami` says `retired: true` with the
+  explanation.
+- No more doubled punctuation ("returns.. Call") in log lines and errors.
+- `status` / `list_rooms` stop listing rooms that closed (e.g. because their
+  owner was retired) or that the bot was removed from, including seats still
+  waiting for their Welcome and declined join requests; the local state is
+  dropped.
+- A call on a kept-alive connection the relay had already reset is retried
+  once on a fresh connection instead of failing as `RELAY_UNREACHABLE`.
+
+### Added
+- `login` returns `expires_at` and `expires_at_utc` next to `expires_in_s`,
+  and its instruction says when the link expires ("expires in 15 minutes").
+
+### Docs
+- README: `BW_RETIRE_LEGACY_IDS=true` (a bool; `=1` is rejected).
+
 ## [0.2.15-alpha] - 2026-10-28
 
 The `v0.2.14-alpha` tag was cancelled and never released (its release and
@@ -16,7 +49,7 @@ ships here, with the final retired-bot wording.
 
 - Older Member IDs (`<account>:<bot>`, bots first connected before 0.2.11)
   are retired. A relay started with `--retire-legacy-ids`
-  (`BW_RETIRE_LEGACY_IDS=1`) deletes those bots, closes every room one of
+  (`BW_RETIRE_LEGACY_IDS=true`) deletes those bots, closes every room one of
   them sits in (for every member), and drops their seats, join requests,
   wake-up addresses, key packages and tokens before any room loads. It runs
   in one transaction and is idempotent; with the switch off (the default)
