@@ -339,6 +339,19 @@ fn signed_in_banner(st: &OauthState) -> String {
 
 // ----- account -----
 
+/// `bw-3dd31e…59c1`: recognisable, not usable.
+fn mask_topic(t: &str) -> String {
+    let c: Vec<char> = t.chars().collect();
+    if c.len() <= 12 {
+        return "…".into();
+    }
+    format!(
+        "{}…{}",
+        c[..9].iter().collect::<String>(),
+        c[c.len() - 4..].iter().collect::<String>()
+    )
+}
+
 fn short(s: &str) -> String {
     s.chars().take(8).collect()
 }
@@ -361,7 +374,7 @@ pub(crate) fn ago(now: u64, t: u64) -> String {
 /// A relative time ("5 minutes ago") whose tooltip is the exact time: UTC
 /// without JavaScript, the viewer's local time and zone with it (the shared
 /// page script fills the tooltip for `data-rel` times).
-fn ago_html(now: u64, t: u64) -> String {
+pub(crate) fn ago_html(now: u64, t: u64) -> String {
     format!(
         r#"<time datetime="{iso}" data-rel title="{utc}">{ago}</time>"#,
         iso = iso_utc(t),
@@ -441,6 +454,7 @@ fn doorbell_setup(st: &OauthState, scope: &str, cfg: &DoorbellConfig) -> String 
         .clone()
         .unwrap_or_else(|| st.registry.bells.ntfy_base_url().to_string());
     let recipes = crate::doorbell::ntfy_recipes(&server, topic, token.is_some());
+    let masked = mask_topic(topic);
     let mut cmds = String::new();
     for (key, label) in [
         ("listen", "Listen for wake-ups"),
@@ -452,16 +466,19 @@ fn doorbell_setup(st: &OauthState, scope: &str, cfg: &DoorbellConfig) -> String 
         let Some(cmd) = recipes[key].as_str() else {
             continue;
         };
+        // Shown with the topic masked; the Copy button copies the real
+        // command.
         cmds.push_str(&format!(
             r#"<div class="cmd"><div class="cmd-h"><span>{label}</span>{copy}</div><pre>{cmd_html}</pre></div>"#,
             copy = copy_named(cmd, &format!("{label} command")),
-            cmd_html = esc(cmd),
+            cmd_html = esc(&cmd.replace(topic.as_str(), &masked)),
         ));
     }
     format!(
-        r#"<div class="setup-item"><p class="setup-scope">{scope}</p><p>The secret address is <code>{topic}</code> on {server}. Anyone who has it can send your bot a wake-up, so treat it like a password.</p>{cmds}</div>"#,
+        r#"<div class="setup-item"><p class="setup-scope">{scope}</p><p>The secret address is <code>{masked_html}</code> on {server} (hidden here; the Copy buttons copy it in full). Anyone who has it can send your bot a wake-up, so treat it like a password. {copy_topic}</p>{cmds}</div>"#,
         scope = esc(scope),
-        topic = esc(topic),
+        masked_html = esc(&masked),
+        copy_topic = copy_named(topic, "Copy secret address"),
         server = esc(&server),
     )
 }

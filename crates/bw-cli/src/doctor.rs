@@ -104,6 +104,10 @@ pub async fn check(relay: &str, src: &tls::CaSources) -> Report {
         {
             Ok(t) => {
                 say(format!("FAIL tls: {}: {}", tls::TLS_UNTRUSTED, t));
+                say(format!(
+                    "     fix: point at your network's CA (PEM) and run again, e.g. {}=/path/to/ca.pem botwhisper doctor",
+                    tls::CA_FILE_ENV
+                ));
                 r.tls_untrusted = Some(t);
             }
             Err(e) => say(format!("FAIL connect: {e:#}")),
@@ -112,12 +116,37 @@ pub async fn check(relay: &str, src: &tls::CaSources) -> Report {
     r
 }
 
+/// Which bot this home is signed in as for `relay` (no secrets: the name
+/// and whether a sign-in is stored).
+pub fn signed_in_line(config: &std::path::Path, relay: &str) -> String {
+    use crate::connect::store::BotStore;
+    match BotStore::current(config, relay) {
+        Some(s) => {
+            let name = s.load_bot_name();
+            let signed = s.load_tokens().is_some();
+            match (name, signed) {
+                (Some(n), true) => format!("bot: signed in as \"{n}\" (home {})", config.display()),
+                (Some(n), false) => {
+                    format!("bot: \"{n}\", not signed in (home {})", config.display())
+                }
+                (None, true) => format!(
+                    "bot: signed in, name not saved yet (home {})",
+                    config.display()
+                ),
+                (None, false) => format!("bot: not signed in (home {})", config.display()),
+            }
+        }
+        None => format!("bot: not signed in (home {})", config.display()),
+    }
+}
+
 /// The CLI entry point. Returns the exit code.
 pub async fn run(relay: &str) -> i32 {
     let r = check(relay, &tls::CaSources::from_env()).await;
     for l in &r.lines {
         println!("{l}");
     }
+    println!("{}", signed_in_line(&crate::paths::config_dir(), relay));
     if r.ok {
         println!("all checks passed");
         0

@@ -67,6 +67,9 @@ struct SavedLogin {
     interval: u64,
     /// Unix seconds.
     expires_at: u64,
+    /// The bot name this login was started for (`--bot-name`), if any.
+    #[serde(default)]
+    bot_name: Option<String>,
 }
 
 fn pending_login_path(config: &std::path::Path, relay: &str) -> PathBuf {
@@ -615,6 +618,7 @@ impl Gateway {
             verification_uri_complete: p.start.verification_uri_complete.clone(),
             interval: p.start.interval,
             expires_at: p.expires_at,
+            bot_name: self.inner.bot_name.clone(),
         };
         if let Err(e) = crate::paths::write_private(
             &self.saved_login_path(),
@@ -654,6 +658,25 @@ impl Gateway {
             note("The login code from the previous run expired before it was approved. Call `login` to get a new link and code.");
             return false;
         }
+        // Started for another bot name: never carry it on quietly, since
+        // approving it would register the old name.
+        if let Some(want) = self.inner.bot_name.as_deref() {
+            if saved.bot_name.as_deref() != Some(want) {
+                let _ = std::fs::remove_file(&path);
+                let was = saved
+                    .bot_name
+                    .as_deref()
+                    .map(|n| format!("bot \"{n}\""))
+                    .unwrap_or_else(|| "a bot with no name given".to_string());
+                tracing::warn!(
+                    "botwhisper connect: dropped a pending login started for {was}; this connector is bot \"{want}\""
+                );
+                note(&format!(
+                    "A login started earlier for {was} was dropped because this connector is now bot \"{want}\". Call `login` to get a link and code for \"{want}\"."
+                ));
+                return false;
+            }
+        }
         let left = saved.expires_at - now;
         let generation = {
             let mut st = self.inner.login.lock().await;
@@ -675,7 +698,12 @@ impl Gateway {
             });
             st.generation
         };
-        tracing::info!("botwhisper connect: resumed a pending login");
+        match saved.bot_name.as_deref() {
+            Some(n) => {
+                tracing::info!("botwhisper connect: resumed a pending login for bot \"{n}\"")
+            }
+            None => tracing::info!("botwhisper connect: resumed a pending login"),
+        }
         self.background_poll(generation);
         true
     }

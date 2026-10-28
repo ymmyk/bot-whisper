@@ -69,6 +69,19 @@ struct Awaiting {
 /// Split an invite URL into the part the relay sees and the inviter
 /// fingerprint from its fragment (`#f=...`, `#k=...&f=...`). Nothing after
 /// `#` is ever sent to the relay.
+/// `bw-3dd31e…59c1`: enough to recognise a secret, not to use it.
+pub(crate) fn mask_secret(s: &str) -> String {
+    let c: Vec<char> = s.chars().collect();
+    if c.len() <= 12 {
+        return "…".into();
+    }
+    format!(
+        "{}…{}",
+        c[..6].iter().collect::<String>(),
+        c[c.len() - 4..].iter().collect::<String>()
+    )
+}
+
 pub(crate) fn split_invite(url: &str) -> (String, Option<String>) {
     let url = url.trim();
     match url.split_once('#') {
@@ -286,6 +299,7 @@ pub struct RoomArg {
 pub struct SendArgs {
     pub room_id: String,
     /// The message. Max 48 KiB. Encrypted before it leaves this machine.
+    #[serde(default)]
     pub text: String,
     /// Round table: `yield` (default, the floor moves to the next seat),
     /// `hold` (keep it for `lease_s`), or `done` (owner only: end the
@@ -1497,7 +1511,7 @@ impl Connector {
 
     #[tool(
         name = "send_message",
-        description = "Encrypt a message on this machine and send it to the room. In a round_table room it fails with NOT_YOUR_TURN out of turn (the result names the holder and the seating order); `turn: hold` keeps the floor, `turn: done` (owner) ends the thread, `interrupt: true` uses your one short interrupt. Pending joiners in rooms you own are added first. The result has `expires_at` (Unix) and `expires_at_utc`: an undelivered message is deleted then (held until delivered, up to the relay's retention, 7 days by default)."
+        description = "Encrypt a message on this machine and send it to the room. In a round_table room it fails with NOT_YOUR_TURN out of turn (the result names the holder and the seating order); `turn: hold` keeps the floor, `turn: done` (owner) ends the thread, `interrupt: true` uses your one short interrupt. Pending joiners in rooms you own are added first. `delivered_to` lists the members it was queued for at send time (each gets it on its next fetch; it is not a read receipt). The result has `expires_at` (Unix) and `expires_at_utc`: an undelivered message is deleted then (held until delivered, up to the relay's retention, 7 days by default)."
     )]
     async fn send_message(
         &self,
@@ -1506,7 +1520,7 @@ impl Connector {
         respond(
             async {
                 if a.text.trim().is_empty() {
-                    anyhow::bail!("text is empty");
+                    anyhow::bail!("`text` is required: the message to send (it cannot be empty)");
                 }
                 if a.text.len() > bw_proto::MAX_MESSAGE_BYTES {
                     anyhow::bail!("text is too long (max 48 KiB)");
@@ -2143,10 +2157,15 @@ impl Connector {
                 }
                 let v = self.relay.call("get_doorbell", args).await?;
                 // Off still has the stored address `listen` subscribes to.
+                let mut v = v;
                 if v["doorbell"].is_object() {
                     self.cache_doorbell(&v["doorbell"]).await;
                 } else {
                     self.cache_doorbell(&v["previous_doorbell"]).await;
+                    // Off: the secret topic is kept for `listen`, not shown.
+                    if let Some(t) = v["previous_doorbell"]["topic"].as_str() {
+                        v["previous_doorbell"]["topic"] = json!(mask_secret(t));
+                    }
                 }
                 Ok(v)
             }

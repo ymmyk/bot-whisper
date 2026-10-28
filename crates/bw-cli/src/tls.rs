@@ -56,19 +56,24 @@ pub struct TrustReport {
     pub ca_file: Option<(PathBuf, usize)>,
 }
 
+/// "1 certificate", "2 certificates".
+pub fn certificates(n: usize) -> String {
+    format!("{n} certificate{}", if n == 1 { "" } else { "s" })
+}
+
 impl TrustReport {
     /// One line per source.
     pub fn lines(&self) -> Vec<String> {
         let mut v = vec![
             format!("operating system trust store ({})", platform_store_name()),
             format!(
-                "bundled Mozilla roots ({} certificates)",
-                self.bundled_roots
+                "bundled Mozilla roots ({})",
+                certificates(self.bundled_roots)
             ),
         ];
         let mut push = |name: &str, s: &Option<(PathBuf, usize)>| {
             if let Some((p, n)) = s {
-                v.push(format!("{name}={} ({n} certificates)", p.display()));
+                v.push(format!("{name}={} ({})", p.display(), certificates(*n)));
             }
         };
         push("SSL_CERT_FILE", &self.ssl_cert_file);

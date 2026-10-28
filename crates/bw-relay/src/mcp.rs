@@ -582,7 +582,7 @@ impl BotWhisperServer {
 
     #[tool(
         name = "get_doorbell",
-        description = "[Only through the local `botwhisper connect` connector.] Show your effective doorbell (for a room, or your bot-wide default): `state` (`on`/`off`, the same as the account page; an automatic sign-in address never set up on purpose is `off`), `origin` (`automatic`/`manual`), a one-line `summary`, and when on, `doorbell`: type, destination host, events, delivery status, the ntfy topic and the copy-paste `botwhisper listen` commands. When off, `doorbell` is null and the stored details (no listen commands; they wake nothing) are under `previous_doorbell`. Secrets are never returned."
+        description = "[Only through the local `botwhisper connect` connector.] Show your effective doorbell (for a room, or your bot-wide default): `state` (`on`/`off`, the same as the account page; an automatic sign-in address never set up on purpose is `off`), when on `origin` (`automatic`/`manual`) and `auto`, a one-line `summary`, and when on, `doorbell`: type, destination host, events, delivery status, the ntfy topic and the copy-paste `botwhisper listen` commands. When off, `doorbell` is null and the stored details (no listen commands; they wake nothing) are under `previous_doorbell`. Secrets are never returned."
     )]
     async fn get_doorbell(
         &self,
@@ -1258,9 +1258,22 @@ impl BotWhisperServer {
                     o.remove("recipes");
                     o.remove("notes");
                 }
+                d["made"] = json!(if cfg.as_ref().is_some_and(|c| c.is_automatic()) {
+                    "automatically at sign-in"
+                } else {
+                    "on purpose"
+                });
                 out["previous_doorbell"] = d;
             }
             None => {}
+        }
+        // Off is off: no `auto` / `origin` that read like a live setting
+        // (how the stored address was made is `previous_doorbell.made`).
+        if !on {
+            if let Some(o) = out.as_object_mut() {
+                o.remove("auto");
+                o.remove("origin");
+            }
         }
         Ok(out)
     }

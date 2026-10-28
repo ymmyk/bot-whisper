@@ -238,7 +238,8 @@ pub(crate) const PAGE_SCRIPT: &str = r#"<script>(function(){function fb(t,b){var
 document.addEventListener('click',function(e){var b=e.target.closest&&e.target.closest('[data-copy]');if(!b)return;var t=b.getAttribute('data-copy'),o=b.getAttribute('data-label')||b.textContent;
 function ok(){b.textContent='Copied';setTimeout(function(){b.textContent=o},1500)}
 if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(t).then(ok,function(){fb(t,b);ok()})}else{fb(t,b);ok()}});
-document.querySelectorAll('time[datetime]').forEach(function(el){var d=new Date(el.getAttribute('datetime'));if(isNaN(d))return;var s=d.toLocaleString([],{year:'numeric',month:'short',day:'numeric',hour:'numeric',minute:'2-digit',timeZoneName:'short'});if(el.hasAttribute('data-rel')){el.title=s;return}el.title=el.textContent;el.textContent=s});})();</script>"#;
+var tl=document.querySelectorAll('time[datetime]'),o={year:'numeric',month:'short',day:'numeric',hour:'numeric',minute:'2-digit'};tl.forEach(function(el){var d=new Date(el.getAttribute('datetime'));if(isNaN(d))return;var s=d.toLocaleString([],o),z=d.toLocaleString([],Object.assign({timeZoneName:'short'},o));if(el.hasAttribute('data-rel')){el.title=z;return}el.title=z;el.textContent=s});
+if(tl.length){var tz='';try{tz=Intl.DateTimeFormat().resolvedOptions().timeZone||''}catch(e){}var m=document.querySelector('main')||document.body,p=document.createElement('p');p.className='meta tz-note';p.textContent='Times are in your time zone'+(tz?' ('+tz+')':'')+'. Past times are relative; hover for the exact time.';m.appendChild(p)}})();</script>"#;
 
 /// A tiny inline icon, so browsers never request /favicon.ico (a 404 there is
 /// a console error on every page).
@@ -284,9 +285,15 @@ pub(crate) fn copy_button(value: &str, label: &str) -> String {
     )
 }
 
-/// A UTC time that the browser shows in local time (UTC kept as the tooltip
-/// and as the text without JavaScript).
+/// A time on a page. Past times read relative ("5 minutes ago", exact time
+/// on hover); future times are absolute, shown by the browser in local
+/// time without a zone label (the page names the zone once). UTC is the
+/// text without JavaScript.
 pub(crate) fn time_html(secs: u64) -> String {
+    let now = now_unix();
+    if secs <= now {
+        return crate::web::ago_html(now, secs);
+    }
     format!(
         r#"<time datetime="{iso}">{utc}</time>"#,
         iso = iso_utc(secs),
