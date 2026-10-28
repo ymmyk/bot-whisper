@@ -1310,6 +1310,27 @@ async fn wakeups_state_reflects_a_real_doorbell() {
         "{prev}"
     );
     assert!(!g.to_string().contains("botwhisper listen"), "{g}");
+    // Once the relay has sent a wake-up there, the note tells that history
+    // instead of "never turned on".
+    relay
+        .db
+        .set_doorbell_status(
+            &bw_relay::doorbell::DoorbellKey::Bot {
+                agent_id: format!("{alice_id}:bwc_wake1"),
+            },
+            "ok",
+            1_761_667_200,
+        )
+        .unwrap();
+    let g = bot.ok("get_doorbell", json!({})).await;
+    assert_eq!(g["state"], "off", "{g}");
+    let note = g["previous_doorbell"]["note"].as_str().unwrap();
+    assert!(!note.contains("never"), "{note}");
+    assert!(note.contains("until 2025-10-28T16:00:00Z"), "{note}");
+    assert_eq!(
+        g["previous_doorbell"]["last_delivery_at_utc"],
+        "2025-10-28T16:00:00Z"
+    );
     // get_status agrees: off, no live doorbell and no topic at all.
     let room = bot.ok("create_room", json!({})).await;
     let st = bot

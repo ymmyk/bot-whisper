@@ -196,6 +196,26 @@ pub fn wakeups_summary(
     }
 }
 
+/// What `get_doorbell` says about the stored, off address, true to its
+/// history: whether the relay ever sent a wake-up to it, and when last.
+pub fn previous_doorbell_note(last_delivery_at: Option<u64>) -> String {
+    const HEAD: &str =
+        "An address your connector reserved for this bot (set_doorbell auto: true, done when it \
+         signs in and finds no wake-up).";
+    const TAIL: &str = "Call set_doorbell (no arguments) to turn wake-ups on.";
+    match last_delivery_at {
+        None => format!(
+            "{HEAD} Wake-ups were never turned on for it and none was ever sent to it, so nothing \
+             wakes your AI app yet. {TAIL}"
+        ),
+        Some(t) => format!(
+            "{HEAD} Wake-ups were sent to it until {} (the last one); they count as off now because \
+             nobody turned wake-ups on for this bot on purpose, so don't rely on them. {TAIL}",
+            crate::config::iso_utc(t)
+        ),
+    }
+}
+
 impl DoorbellConfig {
     pub fn wants(&self, event: &str) -> bool {
         self.events.iter().any(|e| e == event)
@@ -1061,5 +1081,23 @@ mod tests {
         let back: DoorbellConfig =
             serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
         assert_eq!(back, cfg);
+    }
+}
+
+#[cfg(test)]
+mod previous_note_tests {
+    use super::previous_doorbell_note;
+
+    #[test]
+    fn the_note_matches_the_delivery_history() {
+        let never = previous_doorbell_note(None);
+        assert!(never.contains("never turned on") && never.contains("none was ever sent"));
+        let sent = previous_doorbell_note(Some(1_761_667_200));
+        assert!(!sent.contains("never"), "{sent}");
+        assert!(
+            sent.contains("were sent to it until 2025-10-28T16:00:00Z"),
+            "{sent}"
+        );
+        assert!(sent.contains("count as off now"), "{sent}");
     }
 }

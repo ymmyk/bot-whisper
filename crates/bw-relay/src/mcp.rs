@@ -1331,11 +1331,9 @@ impl BotWhisperServer {
                 // Only an automatic address is ever off: say what it is
                 // without implying anyone turned wake-ups on.
                 d["made_by"] = json!("connector");
-                d["note"] = json!(
-                    "An address your connector reserved for this bot (set_doorbell auto: true, done when it \
-                     signs in and finds no wake-up). Wake-ups were never turned on for it, so nothing \
-                     wakes your AI app yet. Call set_doorbell (no arguments) to turn wake-ups on."
-                );
+                d["note"] = json!(crate::doorbell::previous_doorbell_note(
+                    status.as_ref().and_then(|s| s.last_delivery_at)
+                ));
                 out["previous_doorbell"] = d;
             }
             None => {}
