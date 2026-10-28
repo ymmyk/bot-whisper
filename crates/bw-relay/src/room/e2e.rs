@@ -635,6 +635,12 @@ impl Room {
             "seq": seq,
             "epoch": self.e2e.epoch,
             "delivered_to": if has_content { recipients.iter().cloned().collect() } else { Vec::<MemberId>::new() },
+            // The same seats with their names.
+            "delivered_to_members": if has_content {
+                recipients.iter().map(|m| json!({ "member": m, "display_name": self.name_of(m) })).collect()
+            } else {
+                Vec::<Value>::new()
+            },
             "thread": thread_id,
             "counted_toward_cap": outcome.counted,
             "interrupt": outcome.interrupt,

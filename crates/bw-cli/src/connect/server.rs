@@ -551,6 +551,15 @@ struct Drained {
 }
 
 /// The relay's seat id for an agent id, from a `get_status` members list.
+/// The display name on the seat of `agent_id` (null when unnamed).
+fn seat_name(seats: &Value, agent_id: &str) -> Value {
+    seats
+        .as_array()
+        .and_then(|a| a.iter().find(|m| m["agent_id"] == agent_id))
+        .map(|m| m["display_name"].clone())
+        .unwrap_or(Value::Null)
+}
+
 fn seat_of(seats: &Value, agent_id: &str) -> Option<String> {
     seats
         .as_array()?
@@ -1102,7 +1111,7 @@ impl Connector {
                                         "room_id": room_id,
                                         "seq": item["seq"],
                                         "encryption": "mls (end-to-end)",
-                                        "sender": { "member": from, "agent_id": sender },
+                                        "sender": { "member": from, "display_name": seat_name(&seats, &sender), "agent_id": sender },
                                         "kind": "file",
                                         "file_id": file.blob_id,
                                         "name": file.name,
@@ -1122,7 +1131,7 @@ impl Connector {
                                     "room_id": room_id,
                                     "seq": item["seq"],
                                     "encryption": "mls (end-to-end)",
-                                    "sender": { "member": from, "agent_id": sender },
+                                    "sender": { "member": from, "display_name": seat_name(&seats, &sender), "agent_id": sender },
                                     "content": inner.text.unwrap_or_default(),
                                 })),
                             }
@@ -1725,7 +1734,7 @@ impl Connector {
                 }
                 let sent = self.relay.call("e2e_send", args).await?;
                 let mut out = json!({
-                    "seq": sent["seq"], "epoch": epoch, "delivered_to": sent["delivered_to"],
+                    "seq": sent["seq"], "epoch": epoch, "delivered_to": sent["delivered_to"], "delivered_to_members": sent["delivered_to_members"],
                     "encryption": "mls (end-to-end)", "thread": sent["thread"], "turn": sent["turn"],
                     "counted_toward_cap": sent["counted_toward_cap"], "interrupt": sent["interrupt"],
                     "expires_at": sent["expires_at"], "expires_at_utc": sent["expires_at_utc"],
@@ -2491,7 +2500,7 @@ impl Connector {
             "name": name,
             "size": size,
             "seq": sent["seq"],
-            "delivered_to": sent["delivered_to"],
+            "delivered_to": sent["delivered_to"], "delivered_to_members": sent["delivered_to_members"],
             "expires_at": body["expires_at"],
             "expires_at_utc": body["expires_at_utc"],
             "message_expires_at": sent["expires_at"],

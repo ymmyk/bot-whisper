@@ -523,8 +523,13 @@ impl BotWhisperServer {
             async {
                 let (room, me) = self.registry.resolve(&agent, &a.room_id).await?;
                 room.with(move |r| {
+                    let name = r.name_of(&a.member_id);
                     r.remove_member(&me.member, &a.member_id, doorbell::now_unix())?;
-                    Ok(json!({ "removed": a.member_id, "members": r.members() }))
+                    Ok(json!({
+                        "removed": a.member_id,
+                        "removed_member": { "member": a.member_id, "display_name": name },
+                        "members": r.members(),
+                    }))
                 })
                 .await?
             }

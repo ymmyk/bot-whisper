@@ -208,3 +208,91 @@ async fn an_invite_never_outlives_its_room() {
         "{d} {short}"
     );
 }
+
+#[tokio::test]
+async fn approval_events_arrive_in_order_with_names() {
+    let relay = TestRelay::start().await;
+    let a = relay.bot(TOKENS[0]).await;
+    let c = relay.bot(TOKENS[2]).await;
+    let created = a
+        .ok("create_room", json!({ "display_name": "Alice" }))
+        .await;
+    let room = created["room_id"].as_str().unwrap().to_string();
+    let inv = a
+        .ok(
+            "create_invite",
+            json!({ "room_id": room, "require_approval": true }),
+        )
+        .await;
+    let w = c
+        .ok(
+            "join_room",
+            json!({ "invite_url": inv["invite_url"], "name": "Carol" }),
+        )
+        .await;
+    // Drain join_requested.
+    a.ok("e2e_fetch", json!({ "room_id": room, "timeout_s": 1 }))
+        .await;
+    a.ok(
+        "approve_join",
+        json!({ "room_id": room, "request_id": w["request_id"] }),
+    )
+    .await;
+    let f = a
+        .ok("e2e_fetch", json!({ "room_id": room, "timeout_s": 1 }))
+        .await;
+    let evs: Vec<&str> = f["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["event"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        evs,
+        ["join_decided", "member_joined", "members_changed"],
+        "{f}"
+    );
+    let me = a.ok("get_status", json!({ "room_id": room })).await;
+    let my_name = me["members"][0]["display_name"].clone();
+    assert_eq!(f["events"][0]["by"], "m1");
+    assert_eq!(f["events"][0]["by_name"], my_name, "{f}");
+    assert_eq!(f["events"][0]["display_name"], "Carol", "{f}");
+    assert_eq!(f["events"][1]["approved_by_name"], my_name, "{f}");
+    // Added and confirmed: one members_changed with Carol joined, nothing
+    // pending left behind.
+    a.ok(
+        "e2e_commit",
+        json!({ "room_id": room, "epoch": 0, "commit": b64("add"), "welcome": b64("w"),
+                "welcome_to": ["m2"], "added": ["m2"] }),
+    )
+    .await;
+    c.wait(&room, 0).await;
+    c.ok("e2e_confirm_joined", json!({ "room_id": room })).await;
+    let f = a
+        .ok("e2e_fetch", json!({ "room_id": room, "timeout_s": 1 }))
+        .await;
+    let changed: Vec<&Value> = f["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["event"] == "members_changed")
+        .collect();
+    let last = changed.last().expect("members_changed after joining");
+    assert!(
+        last["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m == "m2"),
+        "{f}"
+    );
+    assert_eq!(last["pending"], json!([]), "{f}");
+    // remove_member names who was removed.
+    let r = a
+        .ok(
+            "remove_member",
+            json!({ "room_id": room, "member_id": "m2" }),
+        )
+        .await;
+    assert_eq!(r["removed_member"]["display_name"], "Carol", "{r}");
+}

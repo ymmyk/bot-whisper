@@ -168,6 +168,8 @@ pub enum MemberEvent {
         label: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         approved_by: Option<MemberId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        approved_by_name: Option<String>,
         members: Vec<MemberId>,
     },
     /// A bot asks to join through a `require_approval` invite: any joined
@@ -187,6 +189,11 @@ pub enum MemberEvent {
         request_id: String,
         approved: bool,
         by: MemberId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        by_name: Option<String>,
+        /// The requester's name, so the event reads on its own.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display_name: Option<String>,
     },
     /// `members` are the seats that are in the group (confirmed);
     /// `pending` are seated but not joined yet (waiting for a commit, or
@@ -954,12 +961,14 @@ impl Room {
         self.db.insert_member(&self.id, &member_row(&member))?;
         self.members.push(member.clone());
         self.removed.remove(&member.agent_id);
+        let approved_by_name = approved_by.as_deref().and_then(|b| self.name_of(b));
         let joined = MemberEvent::MemberJoined {
             member: member.member.clone(),
             display_name: member.display_name.clone(),
             invite_id: invite.id.clone(),
             label: invite.label.clone(),
             approved_by,
+            approved_by_name,
             members: self.member_ids(),
         };
         self.broadcast_event(joined, Some(&member.member));
@@ -968,6 +977,14 @@ impl Room {
         self.ring_all("members_changed", Some(&member.member), now);
         self.touch();
         Ok(member)
+    }
+
+    /// A member's display name (None when unnamed or unknown).
+    pub(crate) fn name_of(&self, member: &str) -> Option<String> {
+        self.members
+            .iter()
+            .find(|m| m.member == member)
+            .and_then(|m| m.display_name.clone())
     }
 
     /// Events for members already in the group (not pending seats).
@@ -1069,6 +1086,15 @@ impl Room {
                 self.decide(&req, false, by, now)?;
                 return Err(used_up(&invite));
             }
+            // Order members see: join_decided, then member_joined, then
+            // members_changed (pending until the joiner is added).
+            self.broadcast_joined_only(MemberEvent::JoinDecided {
+                request_id: req.id.clone(),
+                approved: true,
+                by: by.to_string(),
+                by_name: self.name_of(by),
+                display_name: req.display_name.clone(),
+            });
             let member = self.seat(
                 req.agent_id.clone(),
                 req.display_name.clone(),
@@ -1078,11 +1104,6 @@ impl Room {
             )?;
             self.db
                 .decide_join_request(&req.id, "approved", by, Some(&member.member))?;
-            self.broadcast_joined_only(MemberEvent::JoinDecided {
-                request_id: req.id.clone(),
-                approved: true,
-                by: by.to_string(),
-            });
             Ok(json!({
                 "request_id": req.id,
                 "approved": true,
@@ -1111,6 +1132,8 @@ impl Room {
                 request_id: req.id.clone(),
                 approved: approve,
                 by: by.to_string(),
+                by_name: self.name_of(by),
+                display_name: req.display_name.clone(),
             });
         }
         Ok(())
