@@ -46,7 +46,8 @@ pub struct RelayConfig {
     /// Confirmation link lifetime. Default 15 min.
     pub login_link_ttl: Duration,
     /// How long an undelivered message is kept (on disk, ciphertext only)
-    /// before it expires. Default 7 d, max 14 d.
+    /// before it expires. Default 30 d (like Signal), max 30 d. Delivered
+    /// messages are deleted as soon as every recipient acks.
     pub unacked_ttl: Duration,
     /// Hard cap on members per room. Default 8.
     pub max_members: u32,
@@ -72,7 +73,7 @@ pub struct RelayConfig {
     /// Minimum spacing between pings to one ntfy topic.
     pub ntfy_min_interval: Duration,
     /// Rings for one member within this window are sent as one wake-up
-    /// (the latest seq, with `first_seq`). Zero sends each ring at once.
+    /// (the latest ring wins). Zero sends each ring at once.
     pub doorbell_debounce: Duration,
     /// VAPID private key file (hex P-256 scalar, 0600). `None` means
     /// `vapid.key` next to the SQLite file, or an ephemeral key when the
@@ -118,7 +119,7 @@ impl Default for RelayConfig {
             refresh_token_ttl: Duration::from_secs(90 * 24 * 3600),
             session_ttl: Duration::from_secs(30 * 24 * 3600),
             login_link_ttl: Duration::from_secs(15 * 60),
-            unacked_ttl: Duration::from_secs(7 * 24 * 3600),
+            unacked_ttl: Duration::from_secs(DEFAULT_UNACKED_TTL_S),
             max_members: 50,
             default_turn_cap: 40,
             default_room_expiry: Duration::from_secs(7 * 24 * 3600),
@@ -183,7 +184,7 @@ impl RelayConfig {
 
     /// Clamp values into their documented ranges.
     pub fn normalized(mut self) -> Self {
-        let max_ttl = Duration::from_secs(14 * 24 * 3600);
+        let max_ttl = Duration::from_secs(MAX_UNACKED_TTL_S);
         if self.unacked_ttl > max_ttl {
             self.unacked_ttl = max_ttl;
         }
@@ -201,6 +202,11 @@ impl RelayConfig {
 pub fn iso_utc(secs: u64) -> String {
     bw_proto::time::iso_utc(secs)
 }
+
+/// How long an undelivered encrypted message is held: 30 days, like Signal.
+pub const DEFAULT_UNACKED_TTL_S: u64 = 30 * 24 * 3600;
+/// The most `BW_UNACKED_TTL` may be.
+pub const MAX_UNACKED_TTL_S: u64 = 30 * 24 * 3600;
 
 /// A retention period in words: `7 days`, `1 day`, `36 hours`, `1 hour`.
 pub fn ttl_words(ttl: Duration) -> String {
@@ -265,6 +271,17 @@ mod tests {
         assert_eq!(ttl_words(Duration::from_secs(7 * 86_400)), "7 days");
         assert_eq!(ttl_words(Duration::from_secs(86_400)), "1 day");
         assert_eq!(ttl_words(Duration::from_secs(36 * 3600)), "36 hours");
+        assert_eq!(
+            ttl_words(RelayConfig::default().unacked_ttl),
+            "30 days",
+            "held like Signal"
+        );
+        let long = RelayConfig {
+            unacked_ttl: Duration::from_secs(90 * 86_400),
+            ..RelayConfig::default()
+        }
+        .normalized();
+        assert_eq!(long.unacked_ttl.as_secs(), MAX_UNACKED_TTL_S);
     }
 
     #[test]

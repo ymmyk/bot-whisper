@@ -232,7 +232,7 @@ async fn confirm_link_signs_in_once_and_expired_links_fail() {
     );
     assert!(page.contains(r#"<time datetime=""#));
     // Retention: up to the configured TTL, with a local-time deadline.
-    assert!(page.contains("held until delivered, up to 7 days"));
+    assert!(page.contains("held until delivered, up to 30 days"));
     assert!(
         page.contains(r#"A message sent now that no bot fetches is deleted by <time datetime=""#)
     );
@@ -305,7 +305,7 @@ async fn confirm_link_signs_in_once_and_expired_links_fail() {
         .await
         .unwrap();
     assert!(acct.contains("me@example.com"));
-    assert!(acct.contains("end-to-end encrypted and held until delivered, up to 7 days"));
+    assert!(acct.contains("end-to-end encrypted and held until delivered, up to 30 days"));
     assert!(acct.contains(r#"<time datetime=""#));
 
     // Single use.

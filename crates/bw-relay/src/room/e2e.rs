@@ -575,14 +575,14 @@ impl Room {
                 } else {
                     ("message", "theirs")
                 };
-                self.ring(m, event, s, hint, now);
+                self.ring(m, event, hint, now);
             }
         } else {
             // Content-free signal: nothing queued, but waiters should see the
             // new turn state and whoever gained the floor should be rung.
             for m in &outcome.now_speaking {
                 if m != by && outcome.now_speaking.len() == 1 {
-                    self.ring(m, "turn", self.e2e.last_seq(), "yours", now);
+                    self.ring(m, "turn", "yours", now);
                 }
             }
         }
@@ -609,7 +609,7 @@ impl Room {
                         turn_cap: cap,
                     },
                 );
-                self.ring(&owner, "turn", self.e2e.last_seq(), "yours", now);
+                self.ring(&owner, "turn", "yours", now);
             }
             _ => {}
         }

@@ -1,6 +1,7 @@
-//! Fixes from the three-bot trial room: shared seqs, names on received
-//! messages, the local re-read, `already_delivered`, one reply per message,
-//! wake-up debounce, webhook `auth_header` rules and failures, seat names.
+//! Fixes from the three-bot trial room: names on received messages, zero
+//! retention once received (with a hint when nothing is new), one reply per
+//! message, wake-up debounce with "go check" rings (no seq), webhook
+//! `auth_header` rules and failures, seat names.
 
 mod common;
 
@@ -13,7 +14,7 @@ use axum::{
     routing::post,
     Router,
 };
-use botwhisper::connect::{relay::RelayClient, Connector};
+use botwhisper::connect::{relay::RelayClient, store::BotStore, Connector};
 use bw_relay::config::RelayConfig;
 use common::*;
 use rmcp::{
@@ -39,8 +40,19 @@ async fn start_hook(answer: StatusCode) -> (String, Hook) {
         hits: Arc::new(Mutex::new(Vec::new())),
         answer,
     };
-    let addr = free_port();
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    // A probed port can still be taken a moment later: try the next one.
+    let mut tries = 0;
+    let (addr, listener) = loop {
+        let addr = free_port();
+        match tokio::net::TcpListener::bind(addr).await {
+            Ok(l) => break (addr, l),
+            Err(e) if tries < 5 => {
+                tries += 1;
+                eprintln!("hook port {addr}: {e}; trying another");
+            }
+            Err(e) => panic!("no hook port: {e}"),
+        }
+    };
     let app = Router::new()
         .route("/hook", post(receive))
         .with_state(hook.clone());
@@ -114,15 +126,53 @@ async fn pair(relay: &TestRelay) -> (Svc, Svc, String) {
 }
 
 #[tokio::test]
-async fn second_session_sees_already_delivered_and_rereads() {
-    tokio::time::timeout(Duration::from_secs(90), second_session_inner())
+async fn zero_retention_hint_and_one_reply_per_message() {
+    tokio::time::timeout(Duration::from_secs(90), zero_retention_inner())
         .await
         .expect("the test must not hang");
 }
 
-async fn second_session_inner() {
+async fn zero_retention_inner() {
     let relay = TestRelay::start().await;
-    let (alice, bob, room) = pair(&relay).await;
+    // Bob has a home on disk, with a re-read buffer an older 0.2.17 build
+    // left behind: it is deleted when the connector starts.
+    let home = std::env::temp_dir().join(format!("bw-trial-home-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    let store = BotStore::new(&home, &relay.base(), "bob");
+    std::fs::create_dir_all(&store.dir).unwrap();
+    let stale = store.dir.join("history.json");
+    std::fs::write(&stale, r#"{"rooms":{}}"#).unwrap();
+    let alice = connector(&relay, TOKENS[0]).await;
+    let bob_c = Connector::new(
+        RelayClient::with_token(&relay.base(), TOKENS[1]),
+        Some(store.clone()),
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(!stale.exists(), "stale history.json removed on startup");
+    let bob = serve_connector(bob_c).await;
+    let created = call(&alice, "create_room", json!({ "title": "Trial" })).await;
+    let room = created["room_id"].as_str().unwrap().to_string();
+    let inv = call(&alice, "create_invite", json!({ "room_id": room })).await;
+    let url = inv["invite_url"].as_str().unwrap().to_string();
+    let (joined, _) = tokio::join!(
+        call(&bob, "join_room", json!({ "invite_url": url })),
+        async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            call(
+                &alice,
+                "wait_for_message",
+                json!({ "room_id": room, "timeout_s": 2 }),
+            )
+            .await
+        }
+    );
+    assert_eq!(joined["joined"], true, "{joined}");
+
+    // No re-read tool any more.
+    let tools = bob.list_all_tools().await.unwrap();
+    assert!(!tools.iter().any(|t| t.name == "read_messages"));
 
     // Rename your own seat; the name rides on what others receive.
     let renamed = call(
@@ -143,66 +193,49 @@ async fn second_session_inner() {
     let sent = call(
         &alice,
         "send_message",
-        json!({ "room_id": room, "text": "hello" }),
+        json!({ "room_id": room, "text": "hello-zero-retention" }),
     )
     .await;
     let seq = sent["seq"].as_u64().expect("a seq");
 
-    // Session 1 (woken for `seq`) takes it: same seq as the sender saw,
-    // and the sender's name is filled in.
+    // Session 1 takes it: same seq as the sender saw, the name filled in.
     let got = call(
         &bob,
         "wait_for_message",
-        json!({ "room_id": room, "timeout_s": 5, "seq": seq }),
+        json!({ "room_id": room, "timeout_s": 5 }),
     )
     .await;
     let msgs = got["messages"].as_array().unwrap();
     assert_eq!(msgs.len(), 1, "{got}");
     assert_eq!(msgs[0]["seq"], seq, "send seq == received seq");
     assert_eq!(msgs[0]["sender"]["display_name"], "Alice", "{got}");
-    assert!(got.get("already_delivered").is_none(), "{got}");
-    // Seqs before it belong to the group change that added Bob.
-    assert!(seq > 1, "seq {seq}: commits share the counter");
+    assert!(got.get("hint").is_none(), "{got}");
 
-    // Session 2, woken by the same ring: told at once, not after 20 s.
-    let t0 = std::time::Instant::now();
+    // Session 2, woken by the same ring: nothing left, and told why.
     let again = call(
         &bob,
         "wait_for_message",
-        json!({ "room_id": room, "timeout_s": 20, "seq": seq }),
+        json!({ "room_id": room, "timeout_s": 1 }),
     )
     .await;
-    assert!(t0.elapsed() < Duration::from_secs(10), "did not block");
     assert_eq!(again["messages"], json!([]), "{again}");
-    assert_eq!(again["already_delivered"][0]["seq"], seq, "{again}");
-    assert!(again["already_delivered"][0]["at_utc"].is_string());
-    assert!(again["already_delivered_note"]
-        .as_str()
-        .unwrap()
-        .contains("read_messages"));
-    assert_eq!(again["timed_out"], false);
+    let hint = again["hint"].as_str().unwrap();
+    assert!(hint.starts_with("No new messages."), "{again}");
+    assert!(hint.contains("another session of this bot"), "{again}");
+    for gone in ["already_delivered", "seq_note"] {
+        assert!(again.get(gone).is_none(), "{again}");
+    }
 
-    // The read-only re-read: the text, by seq, on this computer.
-    let read = call(
-        &bob,
-        "read_messages",
-        json!({ "room_id": room, "since_seq": seq }),
-    )
-    .await;
-    assert_eq!(read["read_only"], true);
-    assert_eq!(read["messages"][0]["content"], "hello", "{read}");
-    assert_eq!(read["messages"][0]["sender"]["display_name"], "Alice");
-    assert!(read["messages"][0]["delivered_at_utc"].is_string());
-    let via_wait = call(
-        &bob,
-        "wait_for_message",
-        json!({ "room_id": room, "since_seq": seq }),
-    )
-    .await;
-    assert_eq!(via_wait["messages"], read["messages"]);
-    // Re-reading took nothing away.
-    let read2 = call(&bob, "read_messages", json!({ "room_id": room })).await;
-    assert_eq!(read2["messages"].as_array().unwrap().len(), 1, "{read2}");
+    // Zero retention: nothing decrypted is left in the bot's home.
+    assert!(!stale.exists(), "no history.json written");
+    for entry in walk(&home) {
+        let bytes = std::fs::read(&entry).unwrap_or_default();
+        assert!(
+            !String::from_utf8_lossy(&bytes).contains("hello-zero-retention"),
+            "decrypted text on disk in {}",
+            entry.display()
+        );
+    }
 
     // One reply per message: the second session is refused.
     let r1 = call(
@@ -221,16 +254,6 @@ async fn second_session_inner() {
     .await;
     assert_eq!(r2["error"], "ALREADY_REPLIED", "{r2}");
     assert_eq!(r2["reply_seq"], mine);
-    let shown = call(
-        &bob,
-        "wait_for_message",
-        json!({ "room_id": room, "timeout_s": 1, "seq": seq }),
-    )
-    .await;
-    assert_eq!(
-        shown["already_delivered"][0]["replied"]["seq"], mine,
-        "{shown}"
-    );
     let r3 = call(
         &bob,
         "send_message",
@@ -253,18 +276,23 @@ async fn second_session_inner() {
         .map(|m| m["seq"].as_u64().unwrap())
         .collect();
     assert_eq!(seqs, vec![mine, r3["seq"].as_u64().unwrap()], "{a}");
+    let _ = std::fs::remove_dir_all(&home);
+}
 
-    // A woken seq that is no message here (the commit that added Bob).
-    let note = call(
-        &bob,
-        "wait_for_message",
-        json!({ "room_id": room, "timeout_s": 1, "seq": 1 }),
-    )
-    .await;
-    assert!(
-        note["seq_note"].as_str().unwrap().contains("group changes"),
-        "{note}"
-    );
+/// Every file under `dir`.
+fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                out.extend(walk(&p));
+            } else {
+                out.push(p);
+            }
+        }
+    }
+    out
 }
 
 #[tokio::test]
@@ -368,9 +396,9 @@ async fn rings_close_together_are_one_wake_up() {
         json!({ "room_id": room, "webhook_url": url, "secret": "trial-secret-1", "events": ["message"] }),
     )
     .await;
-    let s1 = a.send(&room, "one").await["seq"].as_u64().unwrap();
+    a.send(&room, "one").await;
     a.send(&room, "two").await;
-    let s3 = a.send(&room, "three").await["seq"].as_u64().unwrap();
+    a.send(&room, "three").await;
     // Nothing before the window ends, then exactly one ring.
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(hook.hits.lock().await.is_empty(), "held for the debounce");
@@ -383,9 +411,10 @@ async fn rings_close_together_are_one_wake_up() {
         "one wake-up for three rings"
     );
     let p: Value = serde_json::from_slice(&hits[0].1).unwrap();
-    assert_eq!(p["seq"], s3, "{p}");
-    assert_eq!(p["first_seq"], s1, "{p}");
-    assert!(p.get("content").is_none());
+    // Only "go check": no seq, no count, no content.
+    let mut keys: Vec<&str> = p.as_object().unwrap().keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["event", "room", "thread", "ts", "turn", "v"], "{p}");
 
     // The fetch roster carries names now (here the renamed seat).
     a.ok(
@@ -430,10 +459,12 @@ async fn get_doorbell_shows_the_last_failed_http_status() {
     assert_eq!(f["reason"], "HTTP 401");
     assert!(f["at_utc"].as_str().unwrap().ends_with('Z'));
     assert!(!d.to_string().contains("Bearer wrong"), "never the secret");
-    // A new destination starts clean.
+    // A new destination starts clean (a separate, healthy hook, so a retry
+    // still in flight to the old one cannot race the check).
+    let (good, _good_hook) = start_hook(StatusCode::OK).await;
     b.ok(
         "set_doorbell",
-        json!({ "room_id": room, "webhook_url": url, "secret": "trial-secret-2", "events": ["message"] }),
+        json!({ "room_id": room, "webhook_url": good, "secret": "trial-secret-2", "events": ["message"] }),
     )
     .await;
     let d = b.ok("get_doorbell", json!({ "room_id": room })).await;

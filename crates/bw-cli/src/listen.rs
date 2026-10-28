@@ -42,7 +42,7 @@ pub enum Action {
         url: String,
         /// Already-resolved bearer value (read from an env var by the CLI).
         bearer: Option<String>,
-        /// Template with `{room}`, `{event}`, `{seq}`, `{thread}`.
+        /// Template with `{room}`, `{event}`, `{thread}`.
         body_template: Option<String>,
     },
 }
@@ -103,7 +103,6 @@ struct NtfyEvent {
 pub struct Ping {
     pub room: String,
     pub event: String,
-    pub seq: u64,
     pub thread: Option<String>,
     pub raw: Value,
 }
@@ -117,7 +116,6 @@ impl Ping {
         Some(Ping {
             room,
             event: raw["event"].as_str().unwrap_or("message").to_string(),
-            seq: raw["seq"].as_u64().unwrap_or(0),
             thread: raw["thread"].as_str().map(str::to_string),
             raw,
         })
@@ -129,7 +127,9 @@ pub fn fill_template(template: &str, p: &Ping) -> String {
     template
         .replace("{room}", &p.room)
         .replace("{event}", &p.event)
-        .replace("{seq}", &p.seq.to_string())
+        // Pings carry no seq (a ring is only "go check"); an older
+        // template's `{seq}` becomes empty.
+        .replace("{seq}", "")
         .replace("{thread}", p.thread.as_deref().unwrap_or(""))
 }
 
@@ -226,7 +226,6 @@ impl Runner {
         };
         cmd.env("BOTWHISPER_ROOM", &p.room)
             .env("BOTWHISPER_EVENT", &p.event)
-            .env("BOTWHISPER_SEQ", p.seq.to_string())
             .stdin(Stdio::null());
         if let Some(t) = &p.thread {
             cmd.env("BOTWHISPER_THREAD", t);
@@ -416,14 +415,14 @@ mod tests {
 
     #[test]
     fn parses_pings_and_templates() {
-        let p = Ping::parse(r#"{"v":1,"event":"turn","room":"r1","seq":7,"turn":"yours","ts":1}"#)
-            .unwrap();
+        let p = Ping::parse(r#"{"v":1,"event":"turn","room":"r1","turn":"yours","ts":1}"#).unwrap();
         assert_eq!(p.room, "r1");
-        assert_eq!(p.seq, 7);
         assert_eq!(
-            fill_template(r#"{"text":"room {room} {event} {seq} {thread}"}"#, &p),
-            r#"{"text":"room r1 turn 7 "}"#
+            fill_template(r#"{"text":"room {room} {event} {thread}"}"#, &p),
+            r#"{"text":"room r1 turn "}"#
         );
+        // An older template's {seq} is left empty.
+        assert_eq!(fill_template("{event}:{seq}", &p), "turn:");
         assert!(Ping::parse("hello").is_none());
         assert!(Ping::parse(r#"{"event":"x"}"#).is_none());
         let opts = ListenOpts::new(

@@ -109,7 +109,7 @@ fn content_free(body: &[u8], secret_text: &str) -> Value {
         .map(String::as_str)
         .collect();
     keys.sort_unstable();
-    assert_eq!(keys, ["event", "room", "seq", "thread", "ts", "turn", "v"]);
+    assert_eq!(keys, ["event", "room", "thread", "ts", "turn", "v"]);
     payload
 }
 
@@ -154,7 +154,7 @@ async fn ntfy_is_the_default_with_a_generated_private_topic() {
         "relay token never shown to bots"
     );
 
-    // 500, then 429 (Retry-After), then delivered: three hits, same seq.
+    // 500, then 429 (Retry-After), then delivered: three hits, same ring.
     let secret_text = "SECRET-CONTENT-ntfy-4b1c";
     a.send(&room, secret_text).await;
     let hits = wait_for_hits(&mock, 3).await;
@@ -168,7 +168,7 @@ async fn ntfy_is_the_default_with_a_generated_private_topic() {
         let payload = content_free(body, secret_text);
         assert_eq!(payload["event"], "message");
         assert_eq!(payload["room"], room);
-        assert_eq!(payload["seq"], 3, "after the add commit and Welcome");
+        assert!(payload.get("seq").is_none(), "no seq: only \"go check\"");
         assert_eq!(payload["turn"], "open");
     }
     let stats = relay.relay.registry.bells.stats();

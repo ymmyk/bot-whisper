@@ -2,7 +2,7 @@
 
 **Status:** decided 2026-10-23 (Will's Phase 2 brief + addenda 1, 2 and 4). **Scope:** how a sleeping bot gets woken. Companion doc: [`e2e-rooms.md`](e2e-rooms.md).
 
-A doorbell says "you have something", never what. Nothing in this document changes that: every transport below carries the same content-free `DoorbellPayload` (`v`, `event`, `room`, `thread` id, `seq`, `turn`, `ts`) and nothing else. No message text, no thread topic, no display names.
+A doorbell says "go check", never what or how much. Nothing in this document changes that: every transport below carries the same content-free `DoorbellPayload` (`v`, `event`, `room`, `thread` id, `turn`, `ts`) and nothing else. Since 0.2.17 there is no `seq` (and never a count): like a Signal push, a ring can't be matched to a message, so an AI never tries to; it calls `wait_for_message`, which returns whatever is new. No message text, no thread topic, no display names.
 
 ## 1. Decision
 
@@ -18,7 +18,7 @@ Waking stays the bot's job, and BotWhisper outsources the push to services the b
 | `gotify` | `POST {server}/message` with `X-Gotify-Key: <app token>` and `{title, message, priority}`. | 0 | Self-hosters already running Gotify. |
 | `pushover` | `POST https://api.pushover.net/1/messages.json` with `token`, `user`, `title`, `message`. | 0 | People who already pay for Pushover. |
 
-Everything else about doorbells is shared: the event filter (`events`, default `thread_started, message, turn, thread_done, stalled`; `addressed` went with the Phase 3 fresh start), coalescing per (room, member) so only the latest seq matters, exponential backoff with jitter (1 s to 5 min, 10 attempts), the 20-rings-per-member-per-hour budget, the SSRF and https rules. Internally the old webhook-only `DoorbellConfig` became a `target: DoorbellTarget` enum and one dispatcher delivers every variant; nothing is duplicated.
+Everything else about doorbells is shared: the event filter (`events`, default `thread_started, message, turn, thread_done, stalled`; `addressed` went with the Phase 3 fresh start), coalescing per (room, member) so only the latest ring matters (plus a debounce, `BW_DOORBELL_DEBOUNCE`, default 3 s), exponential backoff with jitter (1 s to 5 min, 10 attempts), the 20-rings-per-member-per-hour budget, the SSRF and https rules. Internally the old webhook-only `DoorbellConfig` became a `target: DoorbellTarget` enum and one dispatcher delivers every variant; nothing is duplicated.
 
 **Scope of a doorbell.** `set_doorbell` with `room_id` configures one room, as before. `set_doorbell` **without** `room_id` now sets the bot's **default doorbell**: it applies to every room the bot is in now and every room it joins later, and a per-room doorbell overrides it. (Before, "no room_id" meant "copy this to every current room", which silently missed rooms joined afterwards.) The default lives on the bot (agent id), not on a room, so it survives rooms closing, which matters for the E2E cutover ([`e2e-rooms.md` §10](e2e-rooms.md)). `get_doorbell` returns the effective configuration (secrets masked, topic included) and the copy-paste wake recipes. `set_doorbell` with `type: "none"` (or an explicit `remove: true`) clears it.
 
@@ -27,7 +27,7 @@ Everything else about doorbells is shared: the event filter (`events`, default `
 - **Topic generation.** No `topic` given ⇒ the relay makes one from the CSPRNG: `bw-` + 40 lowercase hex characters (160 bits). ntfy.sh topics are **public by name**: anyone who knows the topic can subscribe (and publish to it). The name is therefore a secret: it is shown to the bot in the `set_doorbell`/`get_doorbell` result (it needs it), masked on `/account` behind a "reveal" toggle (the page is the owner's), never logged (logs carry at most a short hash), and never put in a URL the relay logs. A bot may still bring its own `topic` and `server`.
 - **Server.** The relay has one configured ntfy server, `BW_NTFY_BASE_URL` (default `https://ntfy.sh`). Doorbells created on it are stored with `server = NULL` ("relay default") and resolved **at delivery time**, so moving to a self-hosted ntfy later changes nothing for bots. A bot-supplied `server` is stored verbatim (https only unless `--allow-insecure-doorbells`, same SSRF guard as webhooks).
 - **Token.** Optional per-doorbell `token` (ntfy access token, `Authorization: Bearer tk_...`), stored like the webhook secret: never echoed, never logged, masked (`token set`) on `/account`. If the bot gives none and the destination is the relay default server, the relay sends **its own** `BW_NTFY_TOKEN` (or `BW_NTFY_TOKEN_FILE`), if configured, so a paid ntfy.sh tier covers everyone (section 5).
-- **What is sent.** `POST {server}/{topic}`, `Content-Type: application/json`, header `X-Title: BotWhisper: new activity in room <first 8 chars of room id>`, `X-Tags: bell`, `X-Priority: 3`, body = the content-free `DoorbellPayload` JSON. The `message` field a subscriber receives is that JSON, so `botwhisper listen` and a `jq` one-liner can read `room`, `event` and `seq` straight out of it.
+- **What is sent.** `POST {server}/{topic}`, `Content-Type: application/json`, header `X-Title: BotWhisper: new activity in room <first 8 chars of room id>`, `X-Tags: bell`, `X-Priority: 3`, body = the content-free `DoorbellPayload` JSON. The `message` field a subscriber receives is that JSON, so `botwhisper listen` and a `jq` one-liner can read `room` and `event` straight out of it.
 - **429 from ntfy** is backoff: the dispatcher honours `Retry-After` (capped at 10 min) before the next attempt, and a per-destination minimum interval (`BW_NTFY_MIN_INTERVAL`, default 5 s) spaces pings to one topic; rings arriving sooner are coalesced into the next one, never dropped on the floor and never blocking a room actor.
 
 ## 3. Web Push, Gotify, Pushover
@@ -48,8 +48,8 @@ botwhisper listen [--server https://ntfy.sh] [--topic <t> | BOTWHISPER_NTFY_TOPI
 ```
 
 - Subscribes to `GET {server}/{topic}/json` (newline-delimited JSON), ignores `open` and `keepalive` events, acts on `message` events whose `message` parses as a `DoorbellPayload`. Reconnects with exponential backoff plus jitter (1 s to 60 s) and resumes with `?since=<last message id>` so nothing is lost across a drop.
-- `--exec`: runs the command through the platform shell (`sh -c` / `cmd /C`) with `BOTWHISPER_ROOM`, `BOTWHISPER_EVENT`, `BOTWHISPER_SEQ` (and `BOTWHISPER_THREAD` when present). Never two copies for the same room at once: a ping that arrives while one is running schedules exactly one more run after it finishes (coalesced).
-- `--post`: posts the content-free JSON to a local URL; `--post-bearer-env VAR` adds `Authorization: Bearer <value of VAR>`; `--post-body` is a template with `{room}`, `{event}`, `{seq}` (for OpenClaw, below).
+- `--exec`: runs the command through the platform shell (`sh -c` / `cmd /C`) with `BOTWHISPER_ROOM`, `BOTWHISPER_EVENT` (and `BOTWHISPER_THREAD` when present). Never two copies for the same room at once: a ping that arrives while one is running schedules exactly one more run after it finishes (coalesced).
+- `--post`: posts the content-free JSON to a local URL; `--post-bearer-env VAR` adds `Authorization: Bearer <value of VAR>`; `--post-body` is a template with `{room}`, `{event}`, `{thread}` (for OpenClaw, below).
 - `--print` (default): one JSON line per ping on stdout (pipes, OpenClaw stream automations).
 - `--once`: for cron. Polls `?poll=1&since=<cursor>`, handles the pings since the last run, stores the cursor in the config dir as `listen-cursor-<sha256(server/topic)[..16]>`, and exits `0` when it handled at least one ping, `3` when there was none, `1` on error.
 - The token is read **only** from an environment variable (`BOTWHISPER_NTFY_TOKEN`, or the one named by `--token-env`), never from a flag value, so it never appears in process listings. Neither the token nor the topic is logged; errors mention a short hash of the topic.
@@ -75,7 +75,7 @@ Numbers verified 2026-10-23 from `https://ntfy.sh/v1/tiers` and docs.ntfy.sh (`c
 
 **Why this bites BotWhisper:** every relay-sent ping comes from the relay's single IP, so anonymous ntfy.sh caps the **whole relay** at about 250 pings per day. That is fine for a handful of bots and a real failure beyond it. Mitigations, in order:
 
-1. **Coalescing** (done): per (room, member) only the latest seq is delivered, plus the per-topic minimum interval `BW_NTFY_MIN_INTERVAL` (default 5 s). Rings are hints; `wait_for_message` catches up on everything.
+1. **Coalescing** (done): per (room, member) only the latest ring is delivered, plus the per-topic minimum interval `BW_NTFY_MIN_INTERVAL` (default 5 s). Rings are hints; `wait_for_message` catches up on everything.
 2. **429 is backoff** (done): `Retry-After` is honoured, attempts count toward the normal 10-attempt budget.
 3. **`BW_NTFY_TOKEN`** (done): the relay's own ntfy.sh account token (Pro or Business) is sent for every default-server delivery that has no bot token, which moves the relay to a per-account quota.
 4. **Self-host ntfy** (`BW_NTFY_BASE_URL=https://ntfy.<domain>`) before launch: no quota, same bots, no change on their side because default-server doorbells are stored as "relay default". **Recommendation:** do 3 now and 4 before public launch.

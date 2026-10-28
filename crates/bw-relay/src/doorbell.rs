@@ -1,12 +1,13 @@
 //! Doorbells: content-free pings that wake agents, over whichever push
 //! service the bot already has.
 //!
-//! A doorbell says "you have something", never what. The payload carries only
-//! the room id, thread id, seq and a turn hint. Transports (see
+//! A doorbell says "go check", never what or how much. The payload carries
+//! only the room id, the event type, thread id and a turn hint: no seq and
+//! no count, so it can never be matched to a message (like a Signal push). Transports (see
 //! `docs/design/push-notifications.md`): `ntfy` (default, relay-generated
 //! private topic), `webhook` (HMAC-signed POST), `webpush` (RFC 8291/8292),
 //! `gotify`, `pushover`. One dispatcher delivers all of them: deliveries are
-//! coalesced per (room, member) so only the latest seq matters, and retried
+//! coalesced per (room, member) so only the latest ring matters, and retried
 //! with exponential backoff and jitter (1 s … 5 min). ntfy pings to one topic
 //! are spaced by a minimum interval and `429` honours `Retry-After`.
 //!
@@ -318,11 +319,6 @@ pub struct DoorbellPayload {
     pub room: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread: Option<String>,
-    pub seq: u64,
-    /// When several rings were sent as this one wake-up (debounce): the
-    /// earliest of their seqs. Absent for a single ring.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub first_seq: Option<u64>,
     /// `yours`, `theirs`, `open` (free mode: anyone may send) or `none`.
     pub turn: String,
     pub ts: u64,
@@ -504,7 +500,7 @@ pub fn ntfy_recipes(server: &str, topic: &str, token: bool) -> Value {
         "cron": format!(
             "*/5 * * * * {env}botwhisper listen --once{server_flag} --topic {topic} --exec '<command>'"
         ),
-        "env_vars": "The command run by --exec sees BOTWHISPER_ROOM, BOTWHISPER_EVENT, BOTWHISPER_SEQ (and BOTWHISPER_THREAD). Pings never carry message text.",
+        "env_vars": "The command run by --exec sees BOTWHISPER_ROOM, BOTWHISPER_EVENT (and BOTWHISPER_THREAD). Pings never carry message text, a seq or a count: they only mean \"go check\".",
     })
 }
 
@@ -826,7 +822,6 @@ async fn worker(
     // together become one wake-up.
     let mut fresh = true;
     loop {
-        let first_seq = slot_rx.borrow().as_ref().map(|r| r.payload.seq);
         if fresh && !shared.opts.debounce.is_zero() {
             let until = Instant::now() + shared.opts.debounce;
             loop {
@@ -840,12 +835,9 @@ async fn worker(
             }
         }
         fresh = false;
-        let Some(mut ring) = slot_rx.borrow_and_update().clone() else {
+        let Some(ring) = slot_rx.borrow_and_update().clone() else {
             return;
         };
-        if let Some(f) = first_seq.filter(|f| *f < ring.payload.seq) {
-            ring.payload.first_seq = Some(ring.payload.first_seq.unwrap_or(f).min(f));
-        }
         // Space ntfy pings to one topic.
         if let DoorbellTarget::Ntfy { server, topic, .. } = &ring.config.target {
             let dest = topic_hash(
@@ -1121,7 +1113,7 @@ mod tests {
 
     #[test]
     fn signature_round_trip() {
-        let body = br#"{"v":1,"event":"turn","room":"r","seq":18,"turn":"yours","ts":1}"#;
+        let body = br#"{"v":1,"event":"turn","room":"r","turn":"yours","ts":1}"#;
         let header = sign("s3cret", 1_792_606_200, body);
         assert!(header.starts_with("t=1792606200,v1="));
         assert!(verify("s3cret", &header, body, 1_792_606_210, 300));
@@ -1152,15 +1144,17 @@ mod tests {
             event: "turn".into(),
             room: "r".into(),
             thread: Some("t".into()),
-            seq: 3,
-            first_seq: None,
             turn: "yours".into(),
             ts: 10,
         };
         let v: serde_json::Value = serde_json::to_value(&p).unwrap();
         let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
         keys.sort_unstable();
-        assert_eq!(keys, ["event", "room", "seq", "thread", "ts", "turn", "v"]);
+        assert_eq!(keys, ["event", "room", "thread", "ts", "turn", "v"]);
+        // A ring names no seq and no count: it cannot be matched to a message.
+        let old = r#"{"v":1,"event":"message","room":"r","seq":9,"turn":"none","ts":1}"#;
+        let back: DoorbellPayload = serde_json::from_str(old).unwrap();
+        assert!(!serde_json::to_string(&back).unwrap().contains("seq"));
     }
 
     #[test]

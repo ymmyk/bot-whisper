@@ -125,13 +125,12 @@ async fn doorbell_payload_is_signed_and_content_free() {
     keys.sort_unstable();
     assert_eq!(
         keys,
-        ["event", "room", "seq", "thread", "ts", "turn", "v"],
-        "payload shape"
+        ["event", "room", "thread", "ts", "turn", "v"],
+        "payload shape: only \"go check\", no seq or count"
     );
     assert_eq!(payload["v"], 1);
     assert_eq!(payload["event"], "message");
     assert_eq!(payload["room"], room);
-    assert_eq!(payload["seq"], 3, "after the add commit and Welcome");
     assert_eq!(payload["turn"], "open", "free room");
     assert!(payload["thread"].as_str().unwrap().starts_with("adhoc-"));
     let text = String::from_utf8_lossy(body);
@@ -189,15 +188,14 @@ async fn doorbell_retries_with_backoff_and_coalesces() {
     a.send(&room, "first").await;
     let hits = wait_for_hits(&hook, 3).await;
     assert_eq!(hits.len(), 3, "two failures then a success");
-    let seqs: Vec<u64> = hits
+    // The same ring each time.
+    let bodies: Vec<Value> = hits
         .iter()
-        .map(|(_, b)| {
-            serde_json::from_slice::<Value>(b).unwrap()["seq"]
-                .as_u64()
-                .unwrap()
-        })
+        .map(|(_, b)| serde_json::from_slice::<Value>(b).unwrap())
         .collect();
-    assert_eq!(seqs, vec![3, 3, 3]);
+    assert!(bodies
+        .iter()
+        .all(|b| b == &bodies[0] && b["event"] == "message"));
     let stats = relay.relay.registry.bells.stats();
     // The hook answers before the relay counts the delivery; wait for it.
     for _ in 0..100 {

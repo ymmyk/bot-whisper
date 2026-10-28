@@ -144,7 +144,7 @@ struct ListenArgs {
     token_env: String,
 
     /// Run this command (via sh -c / cmd /C) on each ping, with
-    /// BOTWHISPER_ROOM, BOTWHISPER_EVENT, BOTWHISPER_SEQ (and
+    /// BOTWHISPER_ROOM, BOTWHISPER_EVENT (and
     /// BOTWHISPER_THREAD) in its environment. Coalesced per room.
     #[arg(long)]
     exec: Option<String>,
@@ -157,7 +157,7 @@ struct ListenArgs {
     #[arg(long)]
     post_bearer_env: Option<String>,
 
-    /// Body template for --post with {room}, {event}, {seq}, {thread}.
+    /// Body template for --post with {room}, {event}, {thread}.
     #[arg(long)]
     post_body: Option<String>,
 
@@ -208,8 +208,9 @@ struct RelayArgs {
     behind_proxy: bool,
 
     /// How long an undelivered message is kept (ciphertext only, on disk
-    /// until delivered) before it expires (e.g. 7d, max 14d).
-    #[arg(long, env = "BW_UNACKED_TTL", default_value = "7d")]
+    /// until delivered) before it expires (e.g. 30d, max 30d). Delivered
+    /// messages are deleted on ack.
+    #[arg(long, env = "BW_UNACKED_TTL", default_value = "30d")]
     unacked_ttl: String,
 
     /// Round table: how long the floor holder may stay silent (e.g. 30m)

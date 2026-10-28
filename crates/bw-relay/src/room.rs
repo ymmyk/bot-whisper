@@ -650,7 +650,7 @@ impl Room {
     /// Ring one member's doorbell for `event` if they subscribed to it and
     /// are under their hourly ring budget. A per-room doorbell wins over the
     /// bot's default doorbell.
-    fn ring(&self, member: &str, event: &str, seq: u64, turn: &str, now: u64) {
+    fn ring(&self, member: &str, event: &str, turn: &str, now: u64) {
         let Some((cfg, key)) = self.doorbell_for(member) else {
             return;
         };
@@ -665,8 +665,6 @@ impl Room {
                     event: event.to_string(),
                     room: self.id.clone(),
                     thread: self.thread_id(),
-                    seq,
-                    first_seq: None,
                     turn: turn.to_string(),
                     ts: now,
                 },
@@ -698,10 +696,9 @@ impl Room {
     }
 
     fn ring_all(&self, event: &str, except: Option<&str>, now: u64) {
-        let seq = self.e2e.last_seq();
         for m in &self.members {
             if Some(m.member.as_str()) != except {
-                self.ring(&m.member, event, seq, "none", now);
+                self.ring(&m.member, event, "none", now);
             }
         }
     }
@@ -1332,7 +1329,7 @@ impl Room {
             None,
         );
         let owner = self.owner.clone();
-        self.ring(&owner, "stalled", self.e2e.last_seq(), "yours", now);
+        self.ring(&owner, "stalled", "yours", now);
     }
 
     /// Owner switches between `free` and `round_table`. Applies to the open
@@ -1478,20 +1475,19 @@ impl Room {
                 let speaking = t.now_speaking(&roster);
                 self.broadcast_event(MemberEvent::LeaseExpired { thread: id }, None);
                 for m in speaking {
-                    self.ring(&m, "lease_expired", self.e2e.last_seq(), "yours", now);
+                    self.ring(&m, "lease_expired", "yours", now);
                 }
                 changed = true;
             }
         }
         let timeout_s = self.cfg.turn_timeout.as_secs();
-        let seq = self.e2e.last_seq();
         if let Some(t) = &mut self.thread {
             let thread_id = t.id.clone();
             match t.check_timeout(&roster, now, timeout_s) {
                 TimeoutOutcome::None => {}
                 TimeoutOutcome::Warned(members) => {
                     for m in &members {
-                        self.ring(m, "turn", seq, "yours", now);
+                        self.ring(m, "turn", "yours", now);
                     }
                     self.broadcast_event(
                         MemberEvent::TurnTimeout {
@@ -1518,7 +1514,7 @@ impl Room {
                         .map(|t| t.now_speaking(&roster))
                         .unwrap_or_default();
                     if speaking.len() == 1 {
-                        self.ring(&speaking[0], "turn", seq, "yours", now);
+                        self.ring(&speaking[0], "turn", "yours", now);
                     }
                     changed = true;
                 }

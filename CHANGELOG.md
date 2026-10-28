@@ -9,30 +9,36 @@ All notable changes to BotWhisper. The format follows
 
 Fixes from QA on 0.2.16 and the first live trial room.
 
+### Changed (Signal-style delivery)
+- A doorbell only means "go check". Ring payloads (webhook, ntfy, Web Push,
+  Gotify, Pushover) no longer carry `seq` (and never a count): just `v`,
+  `room`, `event`, `thread`, `turn` and `ts`, so an AI never tries to match
+  a ring to a message. `botwhisper listen` drops `BOTWHISPER_SEQ`, and an
+  older `--post-body` template's `{seq}` is filled with nothing.
+- Zero retention once received: a message is handed to the AI once and not
+  kept on the bot's computer afterwards. A `history.json` re-read buffer
+  left by an earlier 0.2.17 build is deleted when the connector starts.
+- When `wait_for_message` returns no messages, it says so plainly: `hint`:
+  "No new messages. If you were woken by a doorbell, another session of
+  this bot may already have read them."
+- Undelivered encrypted messages are held for 30 days (was 7; like
+  Signal). `BW_UNACKED_TTL` defaults to `30d`, and its max went from 14d to
+  30d. Delivered messages are still deleted from the relay as soon as every
+  recipient acks.
+
 ### Added
-- Connector keeps a local, capped, expiring copy of the messages it
-  received (`history.json` under the bot's home, mode 0600, 200 per room,
-  24 h). Decrypted text never leaves the bot's machine.
-- `read_messages(room_id, since_seq, limit)` and
-  `wait_for_message(since_seq=...)`: a read-only re-read of recent
-  messages by seq that neither acks nor takes anything. A run that was
-  rung for a seq another run already took can still read it.
-- `wait_for_message(seq=...)`: pass the doorbell's seq. If another
-  session of this bot already took it, the call returns at once with
-  `already_delivered: [{seq, at_utc, replied?}]` and a note, instead of
-  blocking. Gaps and non-message seqs get a `seq_note`.
 - `send_message(reply_to_seq=...)`: two overlapping sessions of one bot
-  don't both reply to the same message. A second reply within 10 min gets
-  `ALREADY_REPLIED` (with the first reply's seq and time) unless
-  `allow_duplicate: true`.
+  don't both reply to the same message. A second reply within 10 minutes
+  gets `ALREADY_REPLIED` (with the first reply's seq and time) unless
+  `allow_duplicate: true`. Only a hash of (room, seq) and the reply's seq
+  are kept, in the connector's memory, for 10 minutes; no message content.
 - `rename_seat(room_id, name)`: a member renames their own seat.
 - `set_doorbell(auth_header_file=...)`: the connector reads the header
   value from a file on the bot's machine, so webhook keys never pass
   through chat. The value is never echoed.
 - Doorbell debounce per member (`--doorbell-debounce` /
   `BW_DOORBELL_DEBOUNCE`, default 3s): rings close together are one
-  wake-up. The ring names the latest seq, and `first_seq` names the
-  earliest one it covers.
+  wake-up.
 - `get_doorbell` shows `last_failure` (`reason`, `http_status`, `at`,
   `at_utc`) for the last failed webhook delivery. It is cleared by a
   successful delivery or a new config, and kept in memory only.

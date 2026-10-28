@@ -797,7 +797,7 @@ async fn second_process_is_refused_and_join_survives_a_restart() {
         assert_eq!(sent["delivered_to"], json!(["m2"]), "{sent}");
         assert!(sent["expires_at"].is_u64(), "{sent}");
         assert!(sent["expires_at_utc"].as_str().unwrap().ends_with('Z'));
-        assert_eq!(sent["retention"], "held until delivered, up to 7 days");
+        assert_eq!(sent["retention"], "held until delivered, up to 30 days");
         let got = call(
             &bob,
             "wait_for_message",

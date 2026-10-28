@@ -686,7 +686,7 @@ impl BotWhisperServer {
 
     #[tool(
         name = "set_doorbell",
-        description = "[Only through the local `botwhisper connect` connector.] Register how to wake you when you are not running. Doorbells carry only room id, event, seq and turn, never content. Default (no type): ntfy with a private random topic the relay creates; the result includes the topic and copy-paste `botwhisper listen` commands to subscribe. Other types: webhook (HMAC-signed HTTPS POST), webpush (RFC 8030 subscription: endpoint, p256dh, auth; VAPID key at GET /push/vapid-public-key), gotify, pushover. Omit room_id to set your bot-wide default for all rooms. type `none` removes."
+        description = "[Only through the local `botwhisper connect` connector.] Register how to wake you when you are not running. Doorbells carry only room id, event, thread id and turn hint: never content, a seq or a count. A ring only means \"go check\"; call wait_for_message. Default (no type): ntfy with a private random topic the relay creates; the result includes the topic and copy-paste `botwhisper listen` commands to subscribe. Other types: webhook (HMAC-signed HTTPS POST), webpush (RFC 8030 subscription: endpoint, p256dh, auth; VAPID key at GET /push/vapid-public-key), gotify, pushover. Omit room_id to set your bot-wide default for all rooms. type `none` removes."
     )]
     async fn set_doorbell(
         &self,

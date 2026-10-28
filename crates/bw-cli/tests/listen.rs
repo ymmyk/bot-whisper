@@ -38,10 +38,11 @@ fn free_port() -> std::net::SocketAddr {
     }
 }
 
-fn ping(id: &str, room: &str, seq: u64) -> String {
+/// A doorbell ping: only "go check" (no seq, no count).
+fn ping(id: &str, room: &str, ts: u64) -> String {
     json!({
         "id": id, "time": 1, "event": "message", "topic": "t",
-        "message": json!({ "v": 1, "event": "message", "room": room, "seq": seq, "turn": "open", "ts": 1 }).to_string(),
+        "message": json!({ "v": 1, "event": "message", "room": room, "turn": "open", "ts": ts }).to_string(),
     })
     .to_string()
 }
@@ -237,7 +238,7 @@ async fn exec_gets_env_vars_and_coalesces_per_room() {
         "bw-testtopic",
         Action::Exec {
             command: format!(
-                "sleep 0.3; echo \"$BOTWHISPER_ROOM $BOTWHISPER_EVENT $BOTWHISPER_SEQ\" >> {}",
+                "sleep 0.3; echo \"$BOTWHISPER_ROOM $BOTWHISPER_EVENT ${{BOTWHISPER_SEQ:-noseq}}\" >> {}",
                 log.display()
             ),
         },
@@ -253,7 +254,11 @@ async fn exec_gets_env_vars_and_coalesces_per_room() {
     lines.sort_unstable();
     assert_eq!(
         lines,
-        vec!["room-a message 1", "room-a message 3", "room-b message 9"],
-        "first run, then one coalesced run with the latest ping"
+        vec![
+            "room-a message noseq",
+            "room-a message noseq",
+            "room-b message noseq"
+        ],
+        "first run, then one coalesced run; pings carry no seq"
     );
 }
