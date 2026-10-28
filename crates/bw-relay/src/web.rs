@@ -1017,7 +1017,7 @@ dl.kv dd{margin:0;min-width:0}
 .idchip{display:inline-flex;align-items:stretch;max-width:100%;min-height:40px;border:1px solid var(--border);border-radius:8px;background:var(--surface-2);overflow:hidden;vertical-align:middle}
 /* Copy fields: the code box and its Copy button share one height, and the
    text sits centred with even padding (line-height 1, centred by flex). */
-.idchip code{display:flex;align-items:center;background:none;height:100%;padding:0 10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;font-size:.84rem;line-height:1}
+.idchip code{display:flex;align-items:center;align-self:stretch;background:none;padding:0 10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;font-size:.84rem;line-height:1}
 .idchip.wide code{white-space:normal;word-break:break-all;padding:10px}
 .idchip .copy{display:inline-flex;align-items:center;justify-content:center;align-self:stretch;min-height:0;padding:0 10px;line-height:1;border:0;border-left:1px solid var(--border);border-radius:0}
 .setup-addr{margin:6px 0}
@@ -1546,7 +1546,11 @@ mod account_card_tests {
         assert!(css.contains(
             ".idchip{display:inline-flex;align-items:stretch;max-width:100%;min-height:40px"
         ));
-        assert!(css.contains(".idchip code{display:flex;align-items:center;"));
+        assert!(css.contains(".idchip code{display:flex;align-items:center;align-self:stretch;"));
+        // A percentage height on a flex item of a min-height-only chip
+        // blocks the stretch and leaves the text at the top.
+        assert!(!css
+            .contains(".idchip code{display:flex;align-items:center;background:none;height:100%"));
         assert!(css.contains("padding:0 10px;white-space:nowrap"));
         assert!(css.contains(".idchip .copy{display:inline-flex;align-items:center;justify-content:center;align-self:stretch;min-height:0;padding:0 10px;line-height:1"));
         assert!(css.contains("font-size:.84rem;line-height:1}"));
