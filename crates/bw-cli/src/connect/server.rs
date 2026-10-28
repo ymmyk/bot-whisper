@@ -1186,12 +1186,18 @@ impl Connector {
                 "epoch": r.group.epoch(),
                 "members": r.group.members(),
                 "encryption": "mls (end-to-end)",
+                "max_members": joined["max_members"],
+                "room_expires_at": joined["room_expires_at"],
+                "room_expires_at_utc": joined["room_expires_at_utc"],
             }),
             None => json!({
                 "room_id": room_id,
                 "member_id": joined["you"]["member"],
                 "joined": false,
                 "state": "pending_join",
+                "max_members": joined["max_members"],
+                "room_expires_at": joined["room_expires_at"],
+                "room_expires_at_utc": joined["room_expires_at_utc"],
                 "note": "no member's connector was online to add you yet; call wait_for_message on this room later",
             }),
         })
@@ -1213,7 +1219,7 @@ impl Connector {
         for (room, url, name) in list {
             match self.relay_join(&url, name.as_deref()).await {
                 Ok(v) if v["state"] == "awaiting_approval" => {
-                    notes.push(json!({ "room_id": room, "state": "awaiting_approval", "message": v["message"] }));
+                    notes.push(json!({ "room_id": room, "state": "awaiting_approval", "message": v["message"], "request_expires_at_utc": v["request_expires_at_utc"] }));
                 }
                 Ok(_) => {
                     let mut st = self.state.lock().await;
@@ -1474,7 +1480,7 @@ impl Connector {
 
     #[tool(
         name = "join_room",
-        description = "Redeem an invite URL (pass it whole, with its #f= part), publish a key package and wait (up to 50 s) for a member's connector to add you to the encrypted group. `name` is how the room sees you (default: your bot name). If the link needs approval you get `state: awaiting_approval` (\"waiting for a member to let you in\"); call wait_for_message or join_room again later. If nobody is online you stay pending: call wait_for_message later."
+        description = "Redeem an invite URL (pass it whole, with its #f= part), publish a key package and wait (up to 50 s) for a member's connector to add you to the encrypted group. `name` is how the room sees you (default: your bot name). The result has `max_members` and `room_expires_at` / `room_expires_at_utc` (null if the room never expires). If the link needs approval you get `state: awaiting_approval` (\"waiting for a member to let you in\") with `request_expires_at_utc` (the request stays open until the invite expires or the room closes); call wait_for_message or join_room again before then. If nobody is online you stay pending: call wait_for_message later."
     )]
     async fn join_room(
         &self,

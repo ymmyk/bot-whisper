@@ -732,6 +732,12 @@ impl Room {
         }
         if let Some(r) = &mine {
             match r.status.as_str() {
+                "waiting" if now >= invite.expires_at => {
+                    return Err(RelayError::new(
+                        ErrorCode::InviteExpired,
+                        "your join request expired with its invite before a member let you in; ask the owner for a new link",
+                    ))
+                }
                 "waiting" => return Ok(JoinOutcome::Waiting(r.clone())),
                 "declined" => {
                     return Err(RelayError::new(
@@ -842,21 +848,35 @@ impl Room {
         }
     }
 
-    /// Requests waiting for approval, for joined members.
+    /// When a join request through `invite_id` stops being open: when its
+    /// invite expires, or the room does, whichever is first.
+    pub fn request_expires_at(&self, invite_id: &str) -> Option<u64> {
+        let invite = self.db.get_invite(invite_id).ok().flatten()?.expires_at;
+        Some(self.expires_at.map_or(invite, |r| r.min(invite)))
+    }
+
+    /// Requests waiting for approval (still open), for joined members.
     pub fn waiting_joins(&self) -> Vec<Value> {
+        let now = crate::doorbell::now_unix();
         self.db
             .join_requests(&self.id)
             .unwrap_or_default()
             .into_iter()
             .filter(|r| r.status == "waiting")
-            .map(|r| {
-                json!({
+            .filter_map(|r| {
+                let until = self.request_expires_at(&r.invite_id);
+                if until.is_some_and(|t| now >= t) {
+                    return None;
+                }
+                Some(json!({
                     "request_id": r.id,
                     "display_name": r.display_name,
                     "invite_id": r.invite_id,
                     "label": r.label,
                     "requested_at": r.created_at,
-                })
+                    "request_expires_at": until,
+                    "request_expires_at_utc": until.map(crate::config::iso_utc),
+                }))
             })
             .collect()
     }
@@ -899,6 +919,13 @@ impl Room {
                 self.decide(&req, false, by, now)?;
                 return Err(revoked());
             };
+            if now >= invite.expires_at {
+                self.decide(&req, false, by, now)?;
+                return Err(RelayError::new(
+                    ErrorCode::InviteExpired,
+                    "that request expired with its invite; the bot needs a new link",
+                ));
+            }
             if self.member_for_agent(&req.agent_id).is_some() {
                 self.decide(&req, false, by, now)?;
                 return Err(RelayError::new(
@@ -1150,6 +1177,7 @@ impl Room {
             "max_members": self.max_members,
             "created_at": self.created_at,
             "room_expires_at": self.expires_at,
+            "room_expires_at_utc": self.expires_at.map(crate::config::iso_utc),
             "encryption": ENCRYPTION_LABEL,
             "mode": self.mode,
             "round_table": self.mode.enforces_turns(),

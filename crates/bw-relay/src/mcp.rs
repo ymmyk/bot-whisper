@@ -933,14 +933,31 @@ impl BotWhisperServer {
                 let id = me.member.clone();
                 room.with(move |r| r.status(&id)).await?
             }
-            crate::room::JoinOutcome::Waiting(req) => Ok(json!({
-                "room_id": req.room_id,
-                "state": "awaiting_approval",
-                "request_id": req.id,
-                "message": crate::room::WAITING_MESSAGE,
-                "requested_at": req.created_at,
-                "next": "call join_room again with the same invite URL to see whether a member let you in",
-            })),
+            crate::room::JoinOutcome::Waiting(req) => {
+                let invite_id = req.invite_id.clone();
+                let (until, max_members, room_expires) = room
+                    .with(move |r| {
+                        (
+                            r.request_expires_at(&invite_id),
+                            r.max_members,
+                            r.expires_at,
+                        )
+                    })
+                    .await?;
+                Ok(json!({
+                    "room_id": req.room_id,
+                    "state": "awaiting_approval",
+                    "request_id": req.id,
+                    "message": crate::room::WAITING_MESSAGE,
+                    "requested_at": req.created_at,
+                    "request_expires_at": until,
+                    "request_expires_at_utc": until.map(crate::config::iso_utc),
+                    "max_members": max_members,
+                    "room_expires_at": room_expires,
+                    "room_expires_at_utc": room_expires.map(crate::config::iso_utc),
+                    "next": "call join_room again with the same invite URL to see whether a member let you in; the request stays open until request_expires_at_utc (when the invite expires or the room closes)",
+                }))
+            }
         }
     }
 
