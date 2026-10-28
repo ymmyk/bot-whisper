@@ -457,14 +457,10 @@ async fn account_page_shows_only_own_data_and_disconnect_needs_csrf() {
     assert!(page.contains(&format!(
         r#"<dt>Member ID</dt><dd><span class="idchip"><code class="mono" title="{member}">{shown}</code><button type="button" class="copy" data-copy="{member}" data-label="Copy" aria-label="Copy Member ID for Alice Claude">Copy</button></span>"#
     )), "member id chip");
-    // A pre-0.2.11 Member ID says plainly why it looks different.
+    // Old-format IDs are retired in 0.2.14: no "Older ID format" note.
+    assert!(!page.contains("Older ID format"), "older ID note gone");
     assert!(
-        page.contains("Older ID format: this bot was first connected before 0.2.11")
-            && page.contains("A new bot sign-in gets the new format."),
-        "older ID explained"
-    );
-    assert!(
-        page.contains(".idchip code{background:none;padding:5px 10px;white-space:nowrap"),
+        page.contains("padding:0 10px;white-space:nowrap"),
         "never wraps"
     );
     assert!(
@@ -1379,8 +1375,15 @@ async fn wakeups_state_reflects_a_real_doorbell() {
             "masked in the shown commands"
         );
         assert!(
-            p.contains(&format!("<code>{}…", &topic[..9])),
-            "masked stub shown"
+            p.contains(&format!(
+                r#"<span class="idchip"><code class="mono">{}…"#,
+                &topic[..9]
+            )),
+            "masked stub shown in a copy chip"
+        );
+        assert!(
+            p.contains(r#"aria-label="Copy secret address""#) && !p.contains("Copy Copy"),
+            "one Copy in the label"
         );
     }
     assert!(

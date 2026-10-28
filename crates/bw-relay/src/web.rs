@@ -475,10 +475,10 @@ fn doorbell_setup(st: &OauthState, scope: &str, cfg: &DoorbellConfig) -> String 
         ));
     }
     format!(
-        r#"<div class="setup-item"><p class="setup-scope">{scope}</p><p>The secret address is <code>{masked_html}</code> on {server} (hidden here; the Copy buttons copy it in full). Anyone who has it can send your bot a wake-up, so treat it like a password. {copy_topic}</p>{cmds}</div>"#,
+        r#"<div class="setup-item"><p class="setup-scope">{scope}</p><p class="setup-addr"><span class="idchip"><code class="mono">{masked_html}</code>{copy_topic}</span></p><p>The secret address above is on {server} (hidden here; the Copy buttons copy it in full). Anyone who has it can send your bot a wake-up, so treat it like a password.</p>{cmds}</div>"#,
         scope = esc(scope),
         masked_html = esc(&masked),
-        copy_topic = copy_named(topic, "Copy secret address"),
+        copy_topic = copy_named(topic, "secret address"),
         server = esc(&server),
     )
 }
@@ -574,7 +574,7 @@ fn account_confirm(title: &str, body: &str) -> axum::response::Html<String> {
         title,
         &top_bar(None, None),
         &format!(
-            r#"<main id="main" class="narrow"><div class="card"><div class="body">{body}</div></div></main>"#
+            r#"<main id="main" class="narrow"><nav class="crumbs" aria-label="Back"><a href="/account">← Back to your account</a></nav><div class="card"><div class="body">{body}</div></div></main>"#
         ),
     )
 }
@@ -626,7 +626,7 @@ fn account_html(st: &OauthState, acct: &AccountRow, csrf: &str, banner: &str) ->
         })
         .collect();
     let shared_client = shared_client(&clients);
-    // "Ask your AI to turn on wake-ups" once, on the first card that is off.
+    // Off cards show only a pill; the sentence appears once, above them.
     let mut off_said = false;
     for b in &all_bots {
         let my_seats: Vec<&AccountSeat> = bot_seats(b, &seats).collect();
@@ -683,15 +683,9 @@ fn account_html(st: &OauthState, acct: &AccountRow, csrf: &str, banner: &str) ->
             }
         }
         let wake = if sentences.is_empty() {
-            let ask = if off_said {
-                ""
-            } else {
-                " Ask your AI to turn on wake-ups."
-            };
+            // Just the pill; the one explanation sits above the cards.
             off_said = true;
-            format!(
-                r#"<div class="wake"><span class="pill off">Off</span><div><p><strong>Wake-ups are off.</strong>{ask}</p></div></div>"#
-            )
+            r#"<div class="wake"><span class="pill off">Off</span></div>"#.to_string()
         } else {
             let setup = if setup.is_empty() {
                 String::new()
@@ -739,18 +733,13 @@ fn account_html(st: &OauthState, acct: &AccountRow, csrf: &str, banner: &str) ->
         bots.push_str(&format!(
             r#"<article class="card bot" aria-labelledby="bot-{id}"><div class="body">
 <div class="bot-head"><span class="avatar" aria-hidden="true">{initial}</span><div class="bot-title"><h3 id="bot-{id}">{name}</h3><p class="meta">{detail} Added {created}.</p></div>{seen}</div>
-<dl class="kv"><dt>Member ID</dt><dd>{member}{legacy}</dd><dt>Wake-ups</dt><dd>{wake}</dd><dt>Rooms</dt><dd>{rooms_dd}</dd></dl>{reconnect}
+<dl class="kv"><dt>Member ID</dt><dd>{member}</dd><dt>Wake-ups</dt><dd>{wake}</dd><dt>Rooms</dt><dd>{rooms_dd}</dd></dl>{reconnect}
 </div><div class="foot"><details class="manage"><summary>Manage {name}</summary><div class="manage-body"><form class="rename" method="post" action="/account/bots/rename">{csrf_input}<input type="hidden" name="bot_id" value="{id}"><label for="name-{id}" class="sr-only">Name for {name}</label><input id="name-{id}" name="name" type="text" maxlength="60" value="{name}"><button type="submit" class="small">Rename</button></form>{disconnect}</div></details></div></article>
 "#,
             initial = esc(&initial(&b.name)),
             seen = seen_html(&status, b.last_used_at, now),
             created = time_html(b.created_at),
             member = id_chip(&b.agent_id, &format!("Member ID for {}", b.name)),
-            legacy = if crate::auth::legacy_member_id_note(&b.agent_id).is_some() {
-                r#"<p class="meta legacy-id">Older ID format: this bot was first connected before 0.2.11, so its ID starts with your Account ID. It keeps it when it reconnects (its rooms and encryption keys depend on it). A new bot sign-in gets the new format.</p>"#
-            } else {
-                ""
-            },
         ));
         let leaves = match my_seats.len() {
             0 => "It is not in any room; deleting it ends its connection.".to_string(),
@@ -762,6 +751,12 @@ fn account_html(st: &OauthState, acct: &AccountRow, csrf: &str, banner: &str) ->
         danger_rows.push_str(&format!(
             r#"<div class="row"><div class="row-main"><p class="row-title">Delete {name}</p><p class="meta">{leaves} This cannot be undone.</p></div><form method="post" action="/account/bots/delete">{csrf_input}<input type="hidden" name="bot_id" value="{id}"><button type="submit" class="danger small" aria-label="Delete {name}…">Delete…</button></form></div>"#,
         ));
+    }
+    if off_said {
+        bots.insert_str(
+            0,
+            r##"<p class="wake-note"><span class="pill off">Off</span> <span><strong>Wake-ups are off.</strong> Ask your AI to turn on wake-ups. A bot marked <strong>Off</strong> is only reached when its AI app next checks in (<a href="#wakeups">what are wake-ups?</a>).</span></p>"##,
+        );
     }
     if bots.is_empty() {
         bots = r##"<div class="card empty"><div class="body"><p><strong>No bots yet.</strong></p><p class="meta">Add one below: your AI app connects it in a minute.</p></div></div>"##.into();
@@ -1019,10 +1014,16 @@ dl.kv{display:grid;grid-template-columns:7rem minmax(0,1fr);gap:12px 18px;margin
 dl.kv dt{color:var(--muted);font-size:.86rem;font-weight:550;padding-top:4px}
 dl.kv dd{margin:0;min-width:0}
 .card>.body>dl.kv:first-child{margin:0;padding:0;border:0}
-.idchip{display:inline-flex;align-items:stretch;max-width:100%;border:1px solid var(--border);border-radius:8px;background:var(--surface-2);overflow:hidden}
-.idchip code{background:none;padding:5px 10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;font-size:.84rem;line-height:1.5}
-.idchip.wide code{white-space:normal;word-break:break-all}
-.idchip .copy{border:0;border-left:1px solid var(--border);border-radius:0}
+.idchip{display:inline-flex;align-items:stretch;max-width:100%;min-height:40px;border:1px solid var(--border);border-radius:8px;background:var(--surface-2);overflow:hidden;vertical-align:middle}
+/* Copy fields: the code box and its Copy button share one height, and the
+   text sits centred with even padding (line-height matched to the button). */
+.idchip code{display:flex;align-items:center;background:none;height:100%;padding:0 10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;font-size:.84rem;line-height:20px}
+.idchip.wide code{white-space:normal;word-break:break-all;padding:10px}
+.idchip .copy{display:inline-flex;align-items:center;justify-content:center;align-self:stretch;min-height:0;padding:0 10px;line-height:20px;border:0;border-left:1px solid var(--border);border-radius:0}
+.setup-addr{margin:6px 0}
+.wake-note{display:flex;align-items:flex-start;gap:10px;margin:0;font-size:.92rem;color:var(--muted)}
+.wake-note strong{color:var(--text)}
+.crumbs{margin:0 0 12px;font-size:.9rem}
 noscript .fullid{display:block;margin-top:6px;word-break:break-all;-webkit-user-select:all;user-select:all}
 .idchip+noscript+.meta,.idchip+.meta{margin-top:6px}
 .wake{display:flex;align-items:flex-start;gap:10px}
@@ -1062,7 +1063,7 @@ button.danger{background:var(--surface);border-color:var(--danger-border);color:
 button.danger:hover{background:var(--danger);border-color:var(--danger);color:#fff}
 button.danger.solid{background:var(--danger);border-color:var(--danger);color:#fff}
 button.danger.solid:hover{background:var(--danger-hover)}
-button.copy{padding:4px 10px;font-size:.8rem;border-radius:7px}
+button.copy{display:inline-flex;align-items:center;justify-content:center;padding:4px 12px;font-size:.8rem;line-height:20px;border-radius:7px}
 button.quiet{border-color:transparent;background:none;color:var(--muted)}
 button.quiet:hover{color:var(--danger);border-color:var(--danger-border);background:var(--surface)}
 details.manage{width:100%}
@@ -1110,7 +1111,7 @@ main.narrow form{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-
 .rail nav{position:static;flex-direction:row;flex-wrap:wrap;gap:4px;padding:0 14px 10px}
 .rail a{padding:6px 12px;white-space:nowrap;min-height:44px;display:inline-flex;align-items:center}
 button,.btn,button.small,button.copy,input[type=text],input[type=email]{min-height:44px}
-.idchip code{display:flex;align-items:center}
+.idchip{min-height:44px}
 details>summary{min-height:44px}
 }
 @media (max-width:560px){
@@ -1530,5 +1531,28 @@ mod account_card_tests {
         assert!(
             super::ACCOUNT_CSS.contains("button,.btn,button.small,button.copy{min-height:40px}")
         );
+    }
+    #[test]
+    fn confirm_pages_have_the_header_and_a_way_back() {
+        let page = super::account_confirm("Disconnect bot", "<h1>Disconnect X?</h1>").0;
+        assert!(page.contains(r#"<header class="top">"#), "nav header");
+        assert!(page.contains(r#"<a href="/account">← Back to your account</a>"#));
+    }
+    #[test]
+    fn copy_fields_centre_their_text() {
+        let css = super::ACCOUNT_CSS;
+        // One height for the box and its button (40px desktop, 44px phone),
+        // flex-centred, with the monospace line-height matched to the button.
+        assert!(css.contains(
+            ".idchip{display:inline-flex;align-items:stretch;max-width:100%;min-height:40px"
+        ));
+        assert!(css.contains(".idchip code{display:flex;align-items:center;"));
+        assert!(css.contains("padding:0 10px;white-space:nowrap"));
+        assert!(css.contains(".idchip .copy{display:inline-flex;align-items:center;justify-content:center;align-self:stretch;min-height:0;padding:0 10px;line-height:20px"));
+        assert!(css.contains("font-size:.84rem;line-height:20px}"));
+        assert!(css.contains(".idchip{min-height:44px}"));
+        // Every copy field uses the chip: Member ID, Account ID, topic.
+        let chip = super::id_chip("bot_0123456789abcdef0123", "Member ID");
+        assert!(chip.starts_with(r#"<span class="idchip">"#), "{chip}");
     }
 }
