@@ -79,13 +79,13 @@ async fn round_table_goes_around_with_pass_hold_interrupt_and_done() {
     let f = a.wait(&room, 2).await;
     assert_eq!(f["turn"]["now"], "you");
 
-    // a holds the floor for 1 s; b cannot send, then the lease expires and
+    // a holds the floor for 3 s; b cannot send, then the lease expires and
     // the floor moves on to b.
     let v = send_turn(
         &a,
         &room,
         "thinking",
-        json!({ "turn": "hold", "lease_s": 1 }),
+        json!({ "turn": "hold", "lease_s": 3 }),
     )
     .await;
     assert_eq!(v["turn"]["status"], "held");
@@ -93,7 +93,7 @@ async fn round_table_goes_around_with_pass_hold_interrupt_and_done() {
         send_turn(&b, &room, "no", json!({})).await["error"],
         "NOT_YOUR_TURN"
     );
-    tokio::time::sleep(Duration::from_millis(1300)).await;
+    tokio::time::sleep(Duration::from_millis(3300)).await;
     let v = send_turn(&b, &room, "after the lease", json!({})).await;
     assert!(v["seq"].is_u64(), "{v}");
     assert_eq!(v["turn"]["holder"], "m3");

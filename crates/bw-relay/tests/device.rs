@@ -506,7 +506,8 @@ async fn wrong_code_gets_nothing() {
 #[tokio::test]
 async fn expired_code_is_rejected_everywhere() {
     let relay = TestRelay::start_with(RelayConfig {
-        device_code_ttl: Duration::from_secs(1),
+        // Long enough for the sign-in below on a slow CI runner.
+        device_code_ttl: Duration::from_secs(4),
         ..cfg()
     })
     .await;
@@ -514,10 +515,10 @@ async fn expired_code_is_rejected_everywhere() {
     let http = browser();
     let cid = client_id(&http, &base).await;
     let v = start(&http, &base, &cid, None).await;
-    assert_eq!(v["expires_in"], 1);
+    assert_eq!(v["expires_in"], 4);
     let person = browser();
     let (_, csrf) = open_approval(&relay, &person, "e@example.com", &v).await;
-    tokio::time::sleep(Duration::from_millis(2100)).await;
+    tokio::time::sleep(Duration::from_millis(4100)).await;
     let r = device_post(
         &person,
         &base,
