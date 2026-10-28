@@ -587,6 +587,11 @@ impl BotWhisperServer {
                             "pending_expires_at": s["e2e"]["pending_expires_at"],
                             "pending_expires_at_utc": s["e2e"]["pending_expires_at"].as_u64().map(crate::config::iso_utc),
                         });
+                        // Why it lapses then: a message you have not fetched,
+                        // or your seat still waiting to join when the room ends.
+                        if let Some(r) = s["e2e"]["pending_expires_reason"].as_str() {
+                            row["pending_expires_reason"] = json!(r);
+                        }
                         // Whose turn it is: only while a round-table thread
                         // is running (left out otherwise, never null).
                         if !s["thread"]["now"].is_null() {
@@ -969,6 +974,9 @@ impl BotWhisperServer {
                     "requested_at": req.created_at,
                     "request_expires_at": until,
                     "request_expires_at_utc": until.map(crate::config::iso_utc),
+                    // The same deadline under list_rooms' name for it.
+                    "pending_expires_at": until,
+                    "pending_expires_at_utc": until.map(crate::config::iso_utc),
                     "max_members": max_members,
                     "room_expires_at": room_expires,
                     "room_expires_at_utc": room_expires.map(crate::config::iso_utc),

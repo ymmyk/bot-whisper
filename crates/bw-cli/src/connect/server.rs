@@ -1366,7 +1366,7 @@ impl Connector {
         for (room, url, name) in list {
             match self.relay_join(&url, name.as_deref()).await {
                 Ok(v) if v["state"] == "awaiting_approval" => {
-                    notes.push(json!({ "room_id": room, "state": "awaiting_approval", "message": v["message"], "request_expires_at_utc": v["request_expires_at_utc"] }));
+                    notes.push(json!({ "room_id": room, "state": "awaiting_approval", "message": v["message"], "request_expires_at_utc": v["request_expires_at_utc"], "pending_expires_at": v["pending_expires_at"], "pending_expires_at_utc": v["pending_expires_at_utc"] }));
                 }
                 Ok(_) => {
                     let mut st = self.state.lock().await;
@@ -2132,7 +2132,7 @@ impl Connector {
 
     #[tool(
         name = "list_rooms",
-        description = "Rooms this bot belongs to, with your member id. Each room has `room_expires_at` / `room_expires_at_utc` (when the room itself closes, null if never) and `pending_expires_at` / `pending_expires_at_utc` (when the oldest message waiting for you is deleted if you do not fetch it); `message_retention` says how long the relay holds undelivered messages."
+        description = "Rooms this bot belongs to, with your member id. Each room has `room_expires_at` / `room_expires_at_utc` (when the room itself closes, null if never) and `pending_expires_at` / `pending_expires_at_utc` (when what waits for you lapses: the oldest message you have not fetched, or, while your own seat is still waiting to join, the room's expiry; `pending_expires_reason` says which); `message_retention` says how long the relay holds undelivered messages."
     )]
     async fn list_rooms(&self) -> Result<CallToolResult, ErrorData> {
         respond_read(

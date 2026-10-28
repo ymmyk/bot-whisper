@@ -134,3 +134,53 @@ async fn only_the_newest_members_changed_waits_in_a_queue() {
     assert_eq!(ev[last]["members"], json!(["m1", "m2"]));
     assert_eq!(ev[last]["pending"], json!([]));
 }
+
+#[tokio::test]
+async fn a_pending_seat_shows_when_it_lapses() {
+    let relay = TestRelay::start().await;
+    let a = relay.bot(TOKENS[0]).await;
+    let b = relay.bot(TOKENS[1]).await;
+    let created = a.ok("create_room", json!({ "expires": "7d" })).await;
+    let room = created["room_id"].as_str().unwrap().to_string();
+    let inv = a.ok("create_invite", json!({ "room_id": room })).await;
+    b.ok("join_room", json!({ "invite_url": inv["invite_url"] }))
+        .await;
+    // Seated, not added yet, nothing queued: it lapses with the room.
+    let rooms = b.ok("list_rooms", json!({})).await;
+    let r = &rooms["rooms"][0];
+    assert_eq!(r["e2e_state"], "pending", "{r}");
+    assert!(r["pending_expires_at"].is_u64(), "{r}");
+    assert_eq!(r["pending_expires_at"], r["room_expires_at"], "{r}");
+    assert_eq!(r["pending_expires_at_utc"], r["room_expires_at_utc"], "{r}");
+    assert_eq!(r["pending_expires_reason"], "room_expires");
+    // Added and confirmed, nothing waiting: back to null.
+    a.ok(
+        "e2e_commit",
+        json!({ "room_id": room, "epoch": 0, "commit": b64("add"), "welcome": b64("w"),
+                "welcome_to": ["m2"], "added": ["m2"] }),
+    )
+    .await;
+    b.wait(&room, 0).await;
+    b.ok("e2e_confirm_joined", json!({ "room_id": room })).await;
+    let rooms = b.ok("list_rooms", json!({})).await;
+    let r = &rooms["rooms"][0];
+    assert_eq!(r["e2e_state"], "active", "{r}");
+    assert!(r["pending_expires_at"].is_null(), "{r}");
+    assert!(r.get("pending_expires_reason").is_none(), "{r}");
+
+    // A request waiting for approval: the same field, its request deadline.
+    let c = relay.bot(TOKENS[2]).await;
+    let inv = a
+        .ok(
+            "create_invite",
+            json!({ "room_id": room, "require_approval": true, "ttl": "1h" }),
+        )
+        .await;
+    let w = c
+        .ok("join_room", json!({ "invite_url": inv["invite_url"] }))
+        .await;
+    assert_eq!(w["state"], "awaiting_approval", "{w}");
+    assert!(w["pending_expires_at"].is_u64(), "{w}");
+    assert_eq!(w["pending_expires_at"], w["request_expires_at"]);
+    assert_eq!(w["pending_expires_at_utc"], w["request_expires_at_utc"]);
+}
