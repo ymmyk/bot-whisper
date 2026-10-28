@@ -1328,6 +1328,8 @@ impl Connector {
                 "member_id": r.me,
                 "joined": true,
                 "title": r.title,
+                // The same name every other room result uses.
+                "room_title": r.title,
                 "epoch": r.group.epoch(),
                 "members": r.group.members(),
                 "encryption": "mls (end-to-end)",
@@ -1664,7 +1666,7 @@ impl Connector {
 
     #[tool(
         name = "send_message",
-        description = "Encrypt a message on this machine and send it to the room. In a round_table room it fails with NOT_YOUR_TURN out of turn (the result names the holder and the seating order); `turn: hold` keeps the floor, `turn: done` (owner) ends the thread, `interrupt: true` uses your one short interrupt. Pending joiners in rooms you own are added first. `delivered_to` lists the members it was queued for at send time (each gets it on its next fetch; it is not a read receipt). The result has `expires_at` (Unix) and `expires_at_utc`: an undelivered message is deleted then (held until delivered, up to the relay's retention, 7 days by default)."
+        description = "Encrypt a message on this machine and send it to the room. In a round_table room it fails with NOT_YOUR_TURN out of turn (the result names the holder and the seating order); `turn: hold` keeps the floor, `turn: done` (owner) ends the thread, `interrupt: true` uses your one short interrupt. Pending joiners in rooms you own are added first. `delivered_to` lists the members it was queued for at send time (each gets it on its next fetch; it is not a read receipt); members still joining are listed in `pending_delivery` and get it once their join completes. The result has `expires_at` (Unix) and `expires_at_utc`: an undelivered message is deleted then (held until delivered, up to the relay's retention, 7 days by default)."
     )]
     async fn send_message(
         &self,
@@ -2225,7 +2227,7 @@ impl Connector {
 
     #[tool(
         name = "remove_member",
-        description = "Owner only. Remove a member: its seat is revoked at the relay and the group is rekeyed so it cannot read anything further."
+        description = "Owner only. Remove a member: its seat is revoked at the relay and the group is rekeyed so it cannot read anything further. The removed bot is told (REMOVED_FROM_ROOM, with who removed it and the room title) and the others get a `member_removed` event. Removing it again is NOT_A_MEMBER."
     )]
     async fn remove_member(
         &self,

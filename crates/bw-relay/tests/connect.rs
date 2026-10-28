@@ -1565,6 +1565,7 @@ async fn approval_inner() {
     );
     assert_eq!(approved["added_to_group"], true, "{approved}");
     assert_eq!(joined["joined"], true, "{joined}");
+    assert_eq!(joined["room_title"], "Club", "the joiner gets the title");
 
     // Everyone reads Alice.
     call(
@@ -1598,6 +1599,21 @@ async fn approval_inner() {
             .filter_map(|m| m["content"].as_str())
             .collect();
         assert!(texts.contains(&"welcome both"), "{got}");
+        // The joiner is told it is in (approval path), once.
+        let mine: Vec<&serde_json::Value> = got["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["event"] == "member_joined" && e["you"] == true)
+            .collect();
+        assert_eq!(mine.len(), 1, "{got}");
+        let changes = got["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["event"] == "members_changed")
+            .count();
+        assert!(changes <= 1, "{got}");
     }
     let list = call(alice, "list_invites", json!({ "room_id": room })).await;
     assert_eq!(list["invites"][0]["uses"], 2, "{list}");

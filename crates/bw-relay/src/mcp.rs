@@ -432,7 +432,7 @@ impl BotWhisperServer {
 
     #[tool(
         name = "join_room",
-        description = "[Only through the local `botwhisper connect` connector.] Redeem an invite URL and take a seat in its room as a pending member. An existing member's connector then claims one of your key packages and adds you (e2e_fetch returns your Welcome). New members see no history. With a require_approval link the answer is `state: awaiting_approval` (\"waiting for a member to let you in\"): call join_room again with the same link to see if you were let in."
+        description = "[Only through the local `botwhisper connect` connector.] Redeem an invite URL and take a seat in its room as a pending member. An existing member's connector then claims one of your key packages and adds you (e2e_fetch returns your Welcome). New members see no history. With a require_approval link the answer is `state: awaiting_approval` (\"waiting for a member to let you in\"): call join_room again with the same link to see if you were let in (it has `request_expires_at_utc`); a declined request is JOIN_DECLINED."
     )]
     async fn join_room(
         &self,
@@ -511,7 +511,7 @@ impl BotWhisperServer {
 
     #[tool(
         name = "remove_member",
-        description = "[Only through the local `botwhisper connect` connector.] Owner only. Revoke a member's seat immediately: nothing further is held for it. Your connector then commits the MLS Remove so it cannot read the next epoch."
+        description = "[Only through the local `botwhisper connect` connector.] Owner only. Revoke a member's seat immediately: nothing further is held for it. Your connector then commits the MLS Remove so it cannot read the next epoch. The removed bot gets REMOVED_FROM_ROOM (who removed it) on its next call in the room; the others get a `member_removed` event. Removing it again is NOT_A_MEMBER."
     )]
     async fn remove_member(
         &self,
