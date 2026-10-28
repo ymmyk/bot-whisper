@@ -83,6 +83,7 @@ impl Relay {
             }
             Vec::new()
         };
+        retire_legacy_ids(&cfg, &db)?;
         let auth = auth::TokenAuth::new(&dev_tokens, db.clone(), &cfg.public_url())
             .with_signin_help(guidance::confirm_email(
                 mailer.sender_domain().as_deref(),
@@ -202,5 +203,39 @@ pub async fn run(cfg: RelayConfig) -> anyhow::Result<()> {
         ct.cancel();
     });
     relay.wait().await;
+    Ok(())
+}
+
+/// The 0.2.14 legacy Member ID retirement, before any room is loaded. Off:
+/// log what it would touch. On: do it (idempotent) and log the counts.
+fn retire_legacy_ids(cfg: &RelayConfig, db: &db::Db) -> anyhow::Result<()> {
+    let plan = db.legacy_retirement_plan()?;
+    if !cfg.retire_legacy_ids {
+        if plan.bots > 0 || plan.memberships > 0 {
+            tracing::info!(
+                bots = plan.bots,
+                memberships = plan.memberships,
+                rooms = plan.rooms_closed,
+                bot_doorbells = plan.bot_doorbells,
+                "legacy member ids present; --retire-legacy-ids is off, nothing retired"
+            );
+        }
+        return Ok(());
+    }
+    let dir = blobs::blob_dir(cfg);
+    for r in &plan.room_ids {
+        blobs::delete_room_blobs(db, &dir, r);
+    }
+    let done = db.retire_legacy_bots(doorbell::now_unix())?;
+    tracing::info!(
+        bots = done.bots,
+        memberships = done.memberships,
+        rooms = done.rooms_closed,
+        bot_doorbells = done.bot_doorbells,
+        join_requests = done.join_requests,
+        key_packages = done.key_packages,
+        tokens = done.tokens,
+        "legacy member ids retired"
+    );
     Ok(())
 }

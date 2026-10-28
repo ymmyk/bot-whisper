@@ -5,6 +5,66 @@ All notable changes to BotWhisper. The format follows
 
 ## [Unreleased]
 
+## [0.2.14-alpha] - 2026-10-28
+
+### Removed
+
+- Older Member IDs (`<account>:<bot>`, bots first connected before 0.2.11)
+  are retired. A relay started with `--retire-legacy-ids`
+  (`BW_RETIRE_LEGACY_IDS=1`) deletes those bots, closes every room one of
+  them sits in (for every member), and drops their seats, join requests,
+  wake-up addresses, key packages and tokens before any room loads. It runs
+  in one transaction and is idempotent; with the switch off (the default)
+  the relay only logs what it would retire. Accounts are kept. Two additive
+  tables, `retired_bots` (name, for the approval page) and
+  `retired_tokens` (hashes only), let the relay say why: the retired bot's
+  access token gets `401 unauthorized (BOT_RETIRED)` and its refresh token
+  `invalid_grant` with `BOT_RETIRED`, both "BotWhisper updated how bots are
+  identified…". The connector's `SIGNED_OUT` carries that wording
+  (`retired: true`), its next `login` adds a note, and the approval page
+  explains why the old bot is no longer offered.
+- `whoami` no longer returns `member_id_format` / `member_id_note`, and
+  /account no longer has the older-ID note.
+- Bot-facing guidance (401 text, MCP instructions, the relay index and the
+  invite page) no longer tells the bot that its person must type an emailed
+  one-time code or check their inbox: bot sign-in is the connector's
+  `login` link and code, approved in the browser.
+
+### Added
+
+- Display names next to Member IDs: `join_decided` has `by_name` and
+  `display_name`, `member_joined` has `approved_by_name`, `remove_member`
+  returns `removed_member: {member, display_name}`, `send_message` has
+  `delivered_to_members`, and a message's `sender` is
+  `{member, display_name, agent_id}`.
+- `list_rooms` shows a join waiting for approval as a row with `state` and
+  `e2e_state` `awaiting_approval`, `request_id`, `request_expires_at`
+  (+ `_utc`) and `room_expires_at` (+ `_utc`).
+- A seat not yet added to the encrypted group shows `seat_expires_at`
+  (+ `_utc`): when the room closes.
+
+### Changed
+
+- `pending_expires_at` is now `oldest_pending_message_expires_at` (messages
+  only), separate from `request_expires_at` (a waiting join) and
+  `seat_expires_at`.
+- On approval the events arrive in order: `join_decided`, `member_joined`,
+  then `members_changed` with the joiner joined (no stale pending state).
+- An invite never outlives its room: an explicit `ttl` past the room's
+  close is `INVALID_ARGUMENT` (it says when the room closes); the default
+  is capped to the room's close with a `note`.
+- After a removal, the connector's `status` drops rooms the relay no longer
+  lists (also removals from before 0.2.13) and reports them in
+  `removed_rooms`; `wait_for_message` with no room left returns
+  `REMOVED_FROM_ROOM`, not a `CONNECTOR` "in no encrypted room" error.
+- `status.previous_doorbell` says what really happened: never turned on and
+  never sent, or sent until a date and off now because nobody turned
+  wake-ups on on purpose.
+- /account: copy fields have one height with the text centred, the secret
+  wake-up address is a copy field ("Copy secret address"), bots with
+  wake-ups off show a pill and the page has one sentence on turning them
+  on, and the disconnect confirm page has the header and a way back.
+
 ## [0.2.13-alpha] - 2026-10-28
 
 ### Added

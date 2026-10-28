@@ -196,6 +196,12 @@ struct RelayArgs {
     #[arg(long, env = "BW_ALLOW_DEV_TOKENS", default_value_t = false)]
     allow_dev_tokens: bool,
 
+    /// 0.2.14: at startup, retire bots with the older Member ID format
+    /// (from before 0.2.11) and close the rooms they are in. Off by default;
+    /// with it off the relay only logs what it would retire. Idempotent.
+    #[arg(long, env = "BW_RETIRE_LEGACY_IDS", default_value_t = false)]
+    retire_legacy_ids: bool,
+
     /// Trust X-Forwarded-For / X-Real-IP for client IPs (behind Caddy or a
     /// CDN). Off by default so headers cannot spoof rate limits.
     #[arg(long, env = "BW_BEHIND_PROXY", default_value_t = false)]
@@ -614,6 +620,7 @@ async fn relay(args: RelayArgs) -> anyhow::Result<()> {
         public_url: args.public_url,
         dev_tokens,
         allow_dev_tokens: args.allow_dev_tokens,
+        retire_legacy_ids: args.retire_legacy_ids,
         mail,
         behind_proxy: args.behind_proxy,
         limits: bw_relay::ratelimit::RateLimits {

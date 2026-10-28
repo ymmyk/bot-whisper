@@ -991,7 +991,9 @@ async fn unconfirmed_clients_are_told_to_confirm_the_email() {
         assert!(body.starts_with("unauthorized (ACCOUNT_REQUIRED): No BotWhisper access yet."));
         says_confirm(&body);
         assert!(!body.contains("emailed"), "{body}");
-        assert!(body.contains(&format!("create an account first at {base}/signup and then call login")));
+        assert!(body.contains(&format!(
+            "create an account first at {base}/signup and then call login"
+        )));
         assert!(body.contains(&format!(
             "`claude mcp add botwhisper -- botwhisper connect --relay {base} --bot-name YOUR-BOT-NAME`"
         )));
@@ -1222,10 +1224,11 @@ async fn a_new_bots_member_id_never_carries_the_account_id() {
     assert_no_account("join_room", &joined.to_string(), &account);
     let rooms = bot.ok("list_rooms", json!({})).await;
     assert_no_account("list_rooms", &rooms.to_string(), &account);
-    // whoami: the current format, so no "older ID" note.
+    // whoami: just the Member ID (no format note since 0.2.14).
     let who = bot.ok("whoami", json!({})).await;
-    assert_eq!(who["member_id_format"], "current");
+    assert_eq!(who["agent_id"], member_id.as_str());
     assert!(who.get("member_id_note").is_none(), "{who}");
+    assert_no_account("whoami", &who["agent_id"].to_string(), &account);
     let status = owner.ok("get_status", json!({ "room_id": room_id })).await;
     assert_no_account("owner's get_status", &status.to_string(), &account);
     // The owner's member_joined event.

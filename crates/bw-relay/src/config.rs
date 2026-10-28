@@ -22,6 +22,10 @@ pub struct RelayConfig {
     /// Accept `dev_tokens` as bearer tokens. Off by default: OAuth 2.1 is
     /// the normal way in.
     pub allow_dev_tokens: bool,
+    /// 0.2.14: at startup, retire every bot with the older Member ID
+    /// format (`<account>:<bot>`) and close the rooms they sit in. Off by
+    /// default; idempotent. With it off the relay only logs what it would do.
+    pub retire_legacy_ids: bool,
     /// How confirmation mail is sent.
     pub mail: MailConfig,
     /// Trust `X-Forwarded-For` / `X-Real-IP` for client IPs (behind Caddy,
@@ -102,6 +106,7 @@ impl Default for RelayConfig {
             public_url: None,
             dev_tokens: Vec::new(),
             allow_dev_tokens: false,
+            retire_legacy_ids: false,
             mail: MailConfig::Log,
             behind_proxy: false,
             limits: RateLimits::default(),

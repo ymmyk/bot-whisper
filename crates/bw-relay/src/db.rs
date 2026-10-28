@@ -212,7 +212,38 @@ CREATE TABLE IF NOT EXISTS bot_doorbells (
     status           TEXT NOT NULL DEFAULT 'never',
     last_delivery_at INTEGER
 );
+-- 0.2.14: bots with the older Member ID format (`<account>:<bot>`, from
+-- before 0.2.11) are retired once (`--retire-legacy-ids`). The bot row goes;
+-- this keeps its name (for the account's approval page) and the hashes of
+-- its tokens (so the connector is told why, not just "401"). Additive.
+CREATE TABLE IF NOT EXISTS retired_bots (
+    id            TEXT PRIMARY KEY,
+    account_id    TEXT NOT NULL,
+    name          TEXT NOT NULL,
+    agent_id      TEXT NOT NULL,
+    retired_at    INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS retired_tokens (
+    token_hash    TEXT PRIMARY KEY,
+    bot_id        TEXT NOT NULL,
+    expires_at    INTEGER NOT NULL
+);
 "#;
+
+/// What the legacy Member ID retirement touches (or touched).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct RetireCounts {
+    pub bots: u64,
+    pub memberships: u64,
+    pub rooms_closed: u64,
+    pub bot_doorbells: u64,
+    pub join_requests: u64,
+    pub key_packages: u64,
+    pub tokens: u64,
+    /// Not logged (room ids are not secret, but there is no need).
+    #[serde(skip)]
+    pub room_ids: Vec<String>,
+}
 
 /// A seat's place in the MLS group.
 #[derive(
@@ -2262,7 +2293,106 @@ impl Db {
                 params![n],
             )?;
             c.execute("DELETE FROM sessions WHERE expires_at <= ?1", params![n])?;
+            c.execute(
+                "DELETE FROM retired_tokens WHERE expires_at <= ?1",
+                params![n],
+            )?;
             Ok(())
+        })
+    }
+
+    // ----- legacy Member ID retirement (0.2.14) -----
+
+    /// What retiring the older-format bots would touch (nothing changes).
+    pub fn legacy_retirement_plan(&self) -> Result<RetireCounts> {
+        self.with(Self::legacy_counts)
+    }
+
+    fn legacy_counts(c: &Connection) -> rusqlite::Result<RetireCounts> {
+        let n = |sql: &str| {
+            c.query_row(sql, [], |r| r.get::<_, i64>(0))
+                .map(|v| v as u64)
+        };
+        let mut st = c.prepare(
+            "SELECT DISTINCT room_id FROM members WHERE instr(agent_id, ':') > 0 ORDER BY room_id",
+        )?;
+        let rooms = st
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(RetireCounts {
+            bots: n("SELECT COUNT(*) FROM bots WHERE instr(agent_id, ':') > 0")?,
+            memberships: n("SELECT COUNT(*) FROM members WHERE instr(agent_id, ':') > 0")?,
+            rooms_closed: rooms.len() as u64,
+            bot_doorbells: n("SELECT COUNT(*) FROM bot_doorbells WHERE instr(agent_id, ':') > 0")?,
+            join_requests: n("SELECT COUNT(*) FROM join_requests WHERE instr(agent_id, ':') > 0")?,
+            key_packages: n(
+                "SELECT COUNT(*) FROM e2e_key_packages WHERE instr(agent_id, ':') > 0",
+            )?,
+            tokens: n("SELECT COUNT(*) FROM oauth_tokens WHERE bot_id IN
+                       (SELECT id FROM bots WHERE instr(agent_id, ':') > 0)")?,
+            room_ids: rooms,
+        })
+    }
+
+    /// Retire every bot whose agent_id has the older format: close every
+    /// room one of them sits in (for everyone in it), drop their seats,
+    /// join requests, wake-up addresses, key packages, tokens and the bot
+    /// rows, and keep their names and token hashes in `retired_*`. One
+    /// transaction; running it again finds nothing. Accounts are kept.
+    /// File blobs on disk must be removed by the caller first (the rooms'
+    /// ids are in the plan).
+    pub fn retire_legacy_bots(&self, now: u64) -> Result<RetireCounts> {
+        self.with(|c| {
+            let tx = c.unchecked_transaction()?;
+            let counts = Self::legacy_counts(&tx)?;
+            tx.execute(
+                "INSERT OR IGNORE INTO retired_bots (id, account_id, name, agent_id, retired_at)
+                 SELECT id, account_id, name, agent_id, ?1 FROM bots WHERE instr(agent_id, ':') > 0",
+                params![now as i64],
+            )?;
+            tx.execute(
+                "INSERT OR IGNORE INTO retired_tokens (token_hash, bot_id, expires_at)
+                 SELECT token_hash, bot_id, expires_at FROM oauth_tokens WHERE bot_id IN
+                 (SELECT id FROM bots WHERE instr(agent_id, ':') > 0)",
+                [],
+            )?;
+            for r in &counts.room_ids {
+                tx.execute("DELETE FROM rooms WHERE id = ?1", params![r])?;
+            }
+            for sql in [
+                "DELETE FROM members WHERE instr(agent_id, ':') > 0",
+                "DELETE FROM join_requests WHERE instr(agent_id, ':') > 0",
+                "DELETE FROM bot_doorbells WHERE instr(agent_id, ':') > 0",
+                "DELETE FROM e2e_key_packages WHERE instr(agent_id, ':') > 0",
+                "DELETE FROM oauth_tokens WHERE bot_id IN (SELECT id FROM bots WHERE instr(agent_id, ':') > 0)",
+                "DELETE FROM oauth_codes WHERE bot_id IN (SELECT id FROM bots WHERE instr(agent_id, ':') > 0)",
+                "DELETE FROM device_codes WHERE bot_id IN (SELECT id FROM bots WHERE instr(agent_id, ':') > 0)",
+                "DELETE FROM bots WHERE instr(agent_id, ':') > 0",
+            ] {
+                tx.execute(sql, [])?;
+            }
+            tx.commit()?;
+            Ok(counts)
+        })
+    }
+
+    /// Was this (hashed) token issued to a bot that was retired?
+    pub fn is_retired_token(&self, token_hash: &str) -> bool {
+        self.with(|c| {
+            c.prepare("SELECT 1 FROM retired_tokens WHERE token_hash = ?1")?
+                .exists(params![token_hash])
+        })
+        .unwrap_or(false)
+    }
+
+    /// Names of the account's retired bots, oldest first.
+    pub fn retired_bot_names(&self, account_id: &str) -> Result<Vec<String>> {
+        self.with(|c| {
+            let mut st = c.prepare(
+                "SELECT name FROM retired_bots WHERE account_id = ?1 ORDER BY retired_at, name",
+            )?;
+            let rows = st.query_map(params![account_id], |r| r.get(0))?;
+            rows.collect()
         })
     }
 

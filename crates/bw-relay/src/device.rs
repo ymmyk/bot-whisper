@@ -434,6 +434,30 @@ fn approval_page(
             detail = esc(&detail),
         ));
     }
+    // 0.2.14: say why an older bot is not in the list any more.
+    let retired = st.db.retired_bot_names(&account.id).unwrap_or_default();
+    let retired_note = if retired.is_empty() {
+        String::new()
+    } else {
+        let names: Vec<String> = retired
+            .iter()
+            .map(|n| format!("<strong>“{}”</strong>", esc(n)))
+            .collect();
+        format!(
+            r#"<p class="muted retired-note">BotWhisper updated how bots are identified. Your older {what} {names} {verb} retired and the rooms {pron} {verb2} in were closed, so {pron2} no longer {verb3} here. Approving connects this AI as a new bot; ask for new invites to the rooms you still need.</p>"#,
+            what = if retired.len() == 1 { "bot" } else { "bots" },
+            names = names.join(", "),
+            verb = if retired.len() == 1 { "was" } else { "were" },
+            pron = if retired.len() == 1 { "it" } else { "they" },
+            verb2 = if retired.len() == 1 { "was" } else { "were" },
+            pron2 = if retired.len() == 1 { "it" } else { "they" },
+            verb3 = if retired.len() == 1 {
+                "appears"
+            } else {
+                "appear"
+            },
+        )
+    };
     let new_checked = if reconnect.is_none() { " checked" } else { "" };
     let options = format!(
         r#"<details><summary class="muted">Change the name{existing}</summary>
@@ -456,6 +480,7 @@ fn approval_page(
 <div class="bigcode">{token}<br>{copy}</div>
 <p style="text-align:center" class="muted">Make sure this is the code your AI just showed you.</p>
 <p><strong>{client}</strong> asked {age} to connect. {plan}</p>
+{retired_note}
 {err}
 <form method="post" action="/device"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="code" value="{code}">
 {options}

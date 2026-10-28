@@ -688,16 +688,11 @@ impl BotWhisperServer {
         Extension(parts): Extension<Parts>,
     ) -> Result<CallToolResult, ErrorData> {
         let agent = agent(&parts)?;
-        let mut v = json!({
+        respond(Ok(json!({
             "agent_id": agent.id,
-            "member_id_format": if crate::auth::legacy_member_id_note(&agent.id).is_some() { "older" } else { "current" },
             "bot_name": agent.name,
             "account": agent.account,
-        });
-        if let Some(n) = crate::auth::legacy_member_id_note(&agent.id) {
-            v["member_id_note"] = json!(n);
-        }
-        respond(Ok(v))
+        })))
     }
 
     #[tool(

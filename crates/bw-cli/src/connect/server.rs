@@ -2835,6 +2835,30 @@ mod invite_link_tests {
     }
 
     #[test]
+    fn a_retired_bot_is_told_why() {
+        let why = "unknown: HTTP 401 Unauthorized: unauthorized (BOT_RETIRED): BotWhisper updated how bots are identified. ...";
+        let r = super::super::gateway::signed_out_result(Some(why.into()));
+        let v = r.structured_content.unwrap();
+        assert_eq!(v["error"], "SIGNED_OUT");
+        assert_eq!(v["retired"], true);
+        let m = v["message"].as_str().unwrap();
+        assert!(
+            m.starts_with("SIGNED_OUT: BotWhisper updated how bots are identified."),
+            "{m}"
+        );
+        assert!(m.contains("login tool (force=true)"), "{m}");
+        assert!(v["reason"].as_str().unwrap().starts_with("BOT_RETIRED: "));
+        // Refresh path: the relay's error_description.
+        let shown = super::super::relay::SignedOut(
+            "BOT_RETIRED: BotWhisper updated how bots are identified.".into(),
+        )
+        .to_string();
+        assert!(shown.contains("BOT_RETIRED: BotWhisper updated"), "{shown}");
+        assert!(super::super::gateway::RETIRED_LOGIN_NOTE
+            .starts_with("BotWhisper updated how bots are identified"));
+    }
+
+    #[test]
     fn a_fresh_login_does_not_say_call_login_for_a_new_link() {
         use super::super::gateway::note_for_fresh_login;
         let n = note_for_fresh_login(

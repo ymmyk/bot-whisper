@@ -2120,7 +2120,15 @@ pub async fn token(
                 return oauth_error(
                     StatusCode::BAD_REQUEST,
                     "invalid_grant",
-                    &format!("unknown or expired refresh token. {}", sign_in_again(&st)),
+                    &if st.db.is_retired_token(&hash) {
+                        format!(
+                            "{}: {}",
+                            crate::auth::BOT_RETIRED,
+                            crate::auth::BOT_RETIRED_MESSAGE
+                        )
+                    } else {
+                        format!("unknown or expired refresh token. {}", sign_in_again(&st))
+                    },
                 );
             };
             if row.client_id != client.id {

@@ -33,16 +33,15 @@ pub struct AgentId {
     pub name: Option<String>,
 }
 
-/// Plain-language note for a Member ID in the format bots got before
-/// 0.2.11 (`<account>:<bot>`), `None` for the current format.
-pub fn legacy_member_id_note(agent_id: &str) -> Option<&'static str> {
-    agent_id.contains(':').then_some(
-        "Older Member ID format: this bot was first connected before 0.2.11, so its ID starts with \
-         your Account ID. It keeps that ID when it reconnects, because its rooms and encryption keys \
-         are tied to it. A new bot sign-in gets the new format (bot_…), which does not include the \
-         Account ID.",
-    )
-}
+/// Stable code for a token of a bot retired in 0.2.14 (older Member ID).
+pub const BOT_RETIRED: &str = "BOT_RETIRED";
+
+/// What a retired bot is told (401 body, `error_description`, connector).
+/// RFC 6750-safe: printable ASCII without `"` or `\`.
+pub const BOT_RETIRED_MESSAGE: &str = "BotWhisper updated how bots are identified. This bot was \
+connected before 0.2.11 and had the older ID format, so it was retired and the rooms it was in \
+were closed. Call the connector's login tool (force=true) and have your person approve the link \
+to connect again as a new bot, then ask for new invites to the rooms you still need.";
 
 impl AgentId {
     /// Derive a dev-token agent id.
@@ -157,6 +156,14 @@ pub async fn require_bearer(
             req.extensions_mut().insert(agent);
             next.run(req).await
         }
+        None if token.is_some_and(|t| auth.db.is_retired_token(&sha256_hex(t.trim()))) => {
+            unauthorized_as(
+                BOT_RETIRED,
+                &auth.resource_metadata,
+                BOT_RETIRED_MESSAGE,
+                &auth.setup,
+            )
+        }
         None => unauthorized(&auth.resource_metadata, &auth.signin_help, &auth.setup),
     }
 }
@@ -166,6 +173,10 @@ pub async fn require_bearer(
 /// then sign in again), since clients surface one or the other to the
 /// agent. The body names the stable code `ACCOUNT_REQUIRED`.
 fn unauthorized(resource_metadata: &str, help: &str, setup: &str) -> Response {
+    unauthorized_as("ACCOUNT_REQUIRED", resource_metadata, help, setup)
+}
+
+fn unauthorized_as(code: &str, resource_metadata: &str, help: &str, setup: &str) -> Response {
     let www = format!(
         "Bearer realm=\"botwhisper\", error=\"invalid_token\", error_description=\"{help}\", resource_metadata=\"{resource_metadata}\""
     );
@@ -179,7 +190,7 @@ fn unauthorized(resource_metadata: &str, help: &str, setup: &str) -> Response {
         StatusCode::UNAUTHORIZED,
         [(header::WWW_AUTHENTICATE, www)],
         format!(
-            "unauthorized (ACCOUNT_REQUIRED): {help}\n\n{setup}\n\
+            "unauthorized ({code}): {help}\n\n{setup}\n\
              Technical: send `Authorization: Bearer <token>` from the OAuth sign-in; see {resource_metadata}\n"
         ),
     )
@@ -191,11 +202,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn older_member_ids_are_explained_and_new_ones_are_not() {
-        let n = legacy_member_id_note("64e57406-0352-4b69-b836-0b3d0b0d0b67:bot_1").unwrap();
-        assert!(n.contains("before 0.2.11") && n.contains("A new bot sign-in gets the new format"));
-        assert_eq!(legacy_member_id_note("bot_0123456789abcdef0123"), None);
-        assert_eq!(legacy_member_id_note(&"ab".repeat(32)), None, "dev tokens");
+    fn the_retired_message_fits_a_header() {
+        assert!(BOT_RETIRED_MESSAGE
+            .chars()
+            .all(|c| matches!(c, ' '..='~') && c != '"' && c != '\\'));
+        assert!(BOT_RETIRED_MESSAGE.starts_with("BotWhisper updated how bots are identified."));
     }
 
     #[test]

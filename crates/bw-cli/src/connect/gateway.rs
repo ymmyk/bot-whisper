@@ -213,6 +213,9 @@ pub struct LoginStatusArgs {
     pub wait_s: Option<u64>,
 }
 
+/// The `login` note after the relay said the old bot was retired.
+pub const RETIRED_LOGIN_NOTE: &str = "BotWhisper updated how bots are identified: this bot's older ID was retired and the rooms it was in were closed. Approving this link connects it again as a new bot (its old name is free to reuse); ask for new invites to the rooms you still need.";
+
 /// The one line a bot sees once the relay revoked its sign-in.
 pub const SIGNED_OUT_MESSAGE: &str = "SIGNED_OUT: the relay no longer accepts this bot's sign-in (revoked, the bot was deleted on /account, or it expired). Call `login` (force=true): it returns a link and a short code. Send both to your person, who opens the link, signs in and approves this bot; the room tools work again as soon as they do.";
 
@@ -220,6 +223,13 @@ pub const SIGNED_OUT_MESSAGE: &str = "SIGNED_OUT: the relay no longer accepts th
 /// bot that never signed in, which is not what a signed-out connector
 /// needs, so that text never reaches the bot.
 pub(crate) fn short_reason(r: &str) -> String {
+    if is_retired(r) {
+        return format!(
+            "{}: {}",
+            bw_relay::auth::BOT_RETIRED,
+            bw_relay::auth::BOT_RETIRED_MESSAGE
+        );
+    }
     let l = r.to_ascii_lowercase();
     if l.contains("401")
         || l.contains("unauthorized")
@@ -232,10 +242,24 @@ pub(crate) fn short_reason(r: &str) -> String {
     line.chars().take(200).collect()
 }
 
+/// Did the relay say this bot was retired (0.2.14, older Member ID)?
+pub(crate) fn is_retired(reason: &str) -> bool {
+    reason.contains(bw_relay::auth::BOT_RETIRED)
+}
+
 /// `SIGNED_OUT`: one plain line; the relay's reason, shortened, in `reason`.
+/// A retired bot gets the plain "BotWhisper updated how bots are
+/// identified" wording as the message itself.
 pub(crate) fn signed_out_result(reason: Option<String>) -> CallToolResult {
     let mut v = json!({ "error": "SIGNED_OUT", "message": SIGNED_OUT_MESSAGE });
     if let Some(r) = reason.filter(|r| !r.trim().is_empty()) {
+        if is_retired(&r) {
+            v["message"] = json!(format!(
+                "SIGNED_OUT: {}",
+                bw_relay::auth::BOT_RETIRED_MESSAGE
+            ));
+            v["retired"] = json!(true);
+        }
         v["reason"] = json!(short_reason(&r));
     }
     CallToolResult::structured_error(v)
@@ -845,7 +869,17 @@ impl Gateway {
         };
         self.background_poll(generation.0);
         let mut view = generation.1;
-        if let Some(n) = self.inner.resume_note.lock().expect("lock").take() {
+        if self
+            .inner
+            .signed_out
+            .lock()
+            .expect("lock")
+            .as_deref()
+            .is_some_and(is_retired)
+        {
+            view["note"] = json!(RETIRED_LOGIN_NOTE);
+            self.inner.resume_note.lock().expect("lock").take();
+        } else if let Some(n) = self.inner.resume_note.lock().expect("lock").take() {
             if let Some(n) = note_for_fresh_login(&n) {
                 view["note"] = json!(n);
             }
@@ -932,17 +966,12 @@ impl Gateway {
         if let Some(c) = self.connector() {
             return respond(Ok(match c.whoami().await {
                 Ok(who) => {
-                    let mut v = json!({
+                    json!({
                         "signed_in": true,
                         "relay": relay,
                         "bot_name": who["bot_name"],
                         "agent_id": who["agent_id"],
-                    });
-                    if who["member_id_note"].is_string() {
-                        v["member_id_format"] = who["member_id_format"].clone();
-                        v["member_id_note"] = who["member_id_note"].clone();
-                    }
-                    v
+                    })
                 }
                 Err(e) => json!({
                     "signed_in": "unknown",

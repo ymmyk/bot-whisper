@@ -400,6 +400,63 @@ async fn existing_bot_is_preselected_by_name() {
 }
 
 #[tokio::test]
+async fn a_retired_bot_is_explained_and_not_offered() {
+    let relay = TestRelay::start_with(cfg()).await;
+    let base = relay.base();
+    let http = browser();
+    let cid = client_id(&http, &base).await;
+    let v = start(&http, &base, &cid, Some("Atlas")).await;
+    let person = browser();
+    let (page, _) = open_approval(&relay, &person, "ret@example.com", &v).await;
+    assert!(!page.contains("retired"), "no note without a retired bot");
+    let acct = relay
+        .db
+        .account_by_email("ret@example.com")
+        .unwrap()
+        .unwrap();
+    // An older-format bot named like the one asking, then the retirement.
+    relay
+        .db
+        .insert_bot(&bw_relay::db::BotRow {
+            id: "bot_old".into(),
+            account_id: acct.id.clone(),
+            name: "Atlas".into(),
+            agent_id: format!("{}:old", acct.id),
+            created_at: 1,
+            last_used_at: None,
+            last_client_id: None,
+            last_client_name: None,
+        })
+        .unwrap();
+    let done = relay
+        .db
+        .retire_legacy_bots(bw_relay::doorbell::now_unix())
+        .unwrap();
+    assert_eq!(done.bots, 1);
+    let page = person
+        .get(v["verification_uri_complete"].as_str().unwrap())
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        page.contains("BotWhisper updated how bots are identified. Your older bot <strong>“Atlas”</strong> was retired"),
+        "{page}"
+    );
+    assert!(
+        !page.contains("bot_old"),
+        "the retired bot is not in the picker"
+    );
+    assert!(
+        page.contains("Create bot <strong>“Atlas”</strong>"),
+        "{page}"
+    );
+    relay.shutdown().await;
+}
+
+#[tokio::test]
 async fn wrong_code_gets_nothing() {
     let relay = TestRelay::start_with(cfg()).await;
     let base = relay.base();
