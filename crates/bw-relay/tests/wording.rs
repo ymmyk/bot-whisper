@@ -198,15 +198,13 @@ async fn an_invite_never_outlives_its_room() {
     let ok = a
         .ok("create_invite", json!({ "room_id": room, "ttl": "1d" }))
         .await;
-    assert!(
-        ok["expires_at"].as_u64().unwrap() < created["expires_at"].as_u64().unwrap_or(u64::MAX)
-    );
+    assert!(ok["expires_at"].as_u64().unwrap() < created["room_expires_at"].as_u64().unwrap());
     let short = a.ok("create_room", json!({ "expires": "1d" })).await;
     let d = a
         .ok("create_invite", json!({ "room_id": short["room_id"] }))
         .await;
     assert!(
-        d["expires_at"].as_u64() <= short["expires_at"].as_u64(),
+        d["expires_at"].as_u64().unwrap() <= short["room_expires_at"].as_u64().unwrap(),
         "{d} {short}"
     );
 }
