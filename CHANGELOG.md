@@ -19,6 +19,17 @@ Fixes from QA on 0.2.16.
   and `expires_at` / `expires_at_utc` (plus `*_local`). Only once the link
   has expired is a new `login` suggested. A link resumed after a connector
   restart keeps its original send time.
+- Once a login link expired unapproved, `whoami`, `login_status` and the
+  signed-out errors lead with "Your last link expired at <local> (<UTC>).
+  Call login(force=true) to get a new one." (a retired bot keeps
+  `retired: true` and the explanation after it) and carry
+  `last_link_expired_at` / `last_link_expired_at_utc` (plus `_local`). The
+  time is kept on disk (`expired-login.json`, no codes), so a restarted
+  connector still says so; a new link or a sign-in clears it.
+  `login_status` no longer shows a link past its time as `pending`.
+- Two sign-in checks at once (the background poller and a tool call both
+  seeing an expired link) no longer report `CONNECTOR_BUSY` about the
+  connector's own process.
 - `SIGNED_OUT`: `reason` is the short cause (e.g. "BOT_RETIRED: the relay
   retired this bot's older ID") and `message` is the explanation plus the
   next step; the two never repeat a sentence.

@@ -81,6 +81,10 @@ fn pending_login_path(config: &std::path::Path, relay: &str) -> PathBuf {
         .join("pending-login.json")
 }
 
+fn expired_link_path(config: &std::path::Path, relay: &str) -> PathBuf {
+    pending_login_path(config, relay).with_file_name("expired-login.json")
+}
+
 /// Where a signed-in bot's files are, and who it is, after a login.
 pub struct SignedIn {
     pub store: BotStore,
@@ -202,6 +206,37 @@ struct LoginState {
     generation: u64,
     /// How the last login ended, when it did not succeed.
     last_failure: Option<String>,
+    /// Unix seconds the last login link expired unapproved (also kept on
+    /// disk, so it survives a restart).
+    last_expired_at: Option<u64>,
+}
+
+/// On disk next to `pending-login.json`: when the last link expired. No
+/// codes, only the time.
+#[derive(Serialize, Deserialize)]
+struct ExpiredLink {
+    relay: String,
+    expires_at: u64,
+    #[serde(default)]
+    bot_name: Option<String>,
+}
+
+/// "Your last link expired at <local> (<UTC>). Call login(force=true) to
+/// get a new one."
+pub(crate) fn expired_message(at: u64) -> String {
+    format!(
+        "Your last link expired at {} ({}). Call login(force=true) to get a new one.",
+        local_time(at),
+        bw_proto::time::iso_utc(at)
+    )
+}
+
+fn expired_fields(at: u64) -> Value {
+    json!({
+        "last_link_expired_at": at,
+        "last_link_expired_at_utc": bw_proto::time::iso_utc(at),
+        "last_link_expired_at_local": local_time(at),
+    })
 }
 
 /// One step of polling.
@@ -239,6 +274,10 @@ struct Inner {
     /// connector that is going away never redeems a grant its successor
     /// (resuming the same saved login) is waiting for.
     stopped: std::sync::atomic::AtomicBool,
+    /// One `resume` at a time: two at once (the background poller and a
+    /// tool call both seeing an expired link) would find this very
+    /// process holding the bot's home lock and report CONNECTOR_BUSY.
+    resume_gate: Mutex<()>,
 }
 
 /// The stdio MCP server of `botwhisper connect`. Cheap to clone.
@@ -352,6 +391,23 @@ fn cause_not_in(cause: &str, message: &str) -> String {
     }
 }
 
+/// Signed out and the last link expired: that first (with the next step),
+/// then the explanation.
+pub(crate) fn expired_signed_out_message(retired: bool, at: u64) -> String {
+    let explain = if retired {
+        RETIRED_EXPLAIN
+    } else {
+        SIGNED_OUT_EXPLAIN
+    };
+    let explain = explain.trim_start_matches("SIGNED_OUT: ");
+    let mut c = explain.chars();
+    let explain = match c.next() {
+        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+        None => String::new(),
+    };
+    format!("SIGNED_OUT: {} {explain}", expired_message(at))
+}
+
 /// What to tell a signed-out bot: the explanation, then either "waiting
 /// for your person" (a live login link) or the login next step.
 pub(crate) fn signed_out_message(retired: bool, waiting: Option<&str>) -> String {
@@ -407,20 +463,26 @@ pub(crate) fn is_retired(reason: &str) -> bool {
 /// A retired bot gets the plain "BotWhisper updated how bots are
 /// identified" wording as the message itself.
 pub(crate) fn signed_out_result(reason: Option<String>) -> CallToolResult {
-    CallToolResult::structured_error(signed_out_view(reason.as_deref(), None))
+    CallToolResult::structured_error(signed_out_view(reason.as_deref(), None, None))
 }
 
 /// `SIGNED_OUT` fields: `message` = explanation + next step (or "waiting
 /// for your person" while a login link is live, with its times), `reason`
 /// = the short cause. The two never repeat a sentence.
-fn signed_out_view(reason: Option<&str>, pending: Option<&Pending>) -> Value {
+fn signed_out_view(reason: Option<&str>, pending: Option<&Pending>, expired: Option<u64>) -> Value {
     let reason = reason.filter(|r| !r.trim().is_empty());
     let retired = reason.is_some_and(is_retired);
     let waiting = pending.map(Pending::waiting);
-    let mut v = json!({
-        "error": "SIGNED_OUT",
-        "message": signed_out_message(retired, waiting.as_deref()),
-    });
+    // A live link wins; otherwise an expired one leads the message.
+    let expired = expired.filter(|_| pending.is_none());
+    let message = match expired {
+        Some(at) => expired_signed_out_message(retired, at),
+        None => signed_out_message(retired, waiting.as_deref()),
+    };
+    let mut v = json!({ "error": "SIGNED_OUT", "message": message });
+    if let Some(at) = expired {
+        merge(&mut v, expired_fields(at));
+    }
     if retired {
         v["retired"] = json!(true);
     }
@@ -533,6 +595,7 @@ impl Gateway {
                 busy: StdMutex::new(None),
                 upgrade: StdMutex::new(Arc::new(UpgradeWatch::for_current_exe())),
                 stopped: std::sync::atomic::AtomicBool::new(false),
+                resume_gate: Mutex::new(()),
             }),
         }
     }
@@ -600,7 +663,7 @@ impl Gateway {
         self.notify_tools_changed().await;
         let st = self.inner.login.lock().await;
         let live = st.pending.as_ref().filter(|p| p.live());
-        CallToolResult::structured_error(signed_out_view(Some(&why), live))
+        CallToolResult::structured_error(signed_out_view(Some(&why), live, self.expired_at(&st)))
     }
 
     fn connector(&self) -> Option<Connector> {
@@ -620,6 +683,15 @@ impl Gateway {
 
     /// Use the stored login, if there is one. `Ok(false)`: nothing stored.
     pub async fn resume(&self) -> anyhow::Result<bool> {
+        let _one = self.inner.resume_gate.lock().await;
+        // The other caller may have signed in while this one waited.
+        if self.connector().is_some() {
+            return Ok(true);
+        }
+        self.resume_once().await
+    }
+
+    async fn resume_once(&self) -> anyhow::Result<bool> {
         let i = &self.inner;
         // --bot picks the directory; else the bot saved under --bot-name;
         // else the one this home last signed in. With --bot-name the home's
@@ -665,6 +737,11 @@ impl Gateway {
         match Connector::new_for(client, Some(store), Some(&i.config), expect).await {
             Ok(c) => {
                 *i.connector.write().expect("lock") = Some(c);
+                // Signed in: an earlier expired link is history.
+                let _ = std::fs::remove_file(expired_link_path(&i.config, &i.relay));
+                if let Ok(mut st) = i.login.try_lock() {
+                    st.last_expired_at = None;
+                }
                 *i.resume_note.lock().expect("lock") = None;
                 *i.busy.lock().expect("lock") = None;
                 Ok(true)
@@ -775,9 +852,9 @@ impl Gateway {
             return Step::NoLogin;
         };
         if p.expires <= Instant::now() {
+            let at = p.expires_at;
             st.pending = None;
-            let msg = "The login code expired before it was approved. Call `login` again.";
-            st.last_failure = Some(msg.into());
+            self.link_expired(&mut st, at);
             return Step::Expired;
         }
         let outcome = login::device_poll(&self.inner.relay, &p.start).await;
@@ -799,15 +876,15 @@ impl Gateway {
             }
             DevicePoll::Denied => {
                 st.pending = None;
+                self.forget_expired_link(&mut st);
                 st.last_failure =
                     Some("Your person denied the login. Call `login` to try again.".into());
                 Step::Denied
             }
             DevicePoll::Expired => {
+                let at = p.expires_at.min(bw_relay::doorbell::now_unix());
                 st.pending = None;
-                st.last_failure = Some(
-                    "The login code expired (or was already used). Call `login` again.".into(),
-                );
+                self.link_expired(&mut st, at);
                 Step::Expired
             }
             DevicePoll::Failed(e) => {
@@ -823,6 +900,7 @@ impl Gateway {
                 match self.complete(&tokens).await {
                     Ok(()) => {
                         st.last_failure = None;
+                        self.forget_expired_link(&mut st);
                         Step::SignedIn
                     }
                     Err(e) => {
@@ -894,6 +972,64 @@ impl Gateway {
         let _ = std::fs::remove_file(self.saved_login_path());
     }
 
+    /// The last link expired unapproved: remember when (in memory and on
+    /// disk, so a restarted connector still says so).
+    fn link_expired(&self, st: &mut LoginState, at: u64) {
+        st.last_expired_at = Some(at);
+        st.last_failure = Some(expired_message(at));
+        let rec = ExpiredLink {
+            relay: self.inner.relay.clone(),
+            expires_at: at,
+            bot_name: self.inner.bot_name.clone(),
+        };
+        if let Err(e) = crate::paths::write_private(
+            &expired_link_path(&self.inner.config, &self.inner.relay),
+            &serde_json::to_vec(&rec).expect("json"),
+        ) {
+            tracing::warn!("could not note the expired login link on disk: {e}");
+        }
+    }
+
+    /// `login_status` once the last link expired (signed out: with
+    /// `retired` / `reason` and the explanation).
+    fn expired_status(&self, at: u64) -> Value {
+        let why = self.inner.signed_out.lock().expect("lock").clone();
+        let mut v = json!({ "status": "expired", "message": expired_message(at) });
+        if why.is_some() {
+            let so = signed_out_view(why.as_deref(), None, Some(at));
+            for k in ["message", "reason", "retired"] {
+                if !so[k].is_null() {
+                    v[k] = so[k].clone();
+                }
+            }
+        }
+        merge(&mut v, expired_fields(at));
+        v
+    }
+
+    /// A new link, a sign-in or a refusal: no "last link expired" any more.
+    fn forget_expired_link(&self, st: &mut LoginState) {
+        st.last_expired_at = None;
+        let _ = std::fs::remove_file(expired_link_path(&self.inner.config, &self.inner.relay));
+    }
+
+    /// When the last link expired, if no live one replaced it: a pending
+    /// link past its time, the remembered time, or the file from an
+    /// earlier run.
+    fn expired_at(&self, st: &LoginState) -> Option<u64> {
+        if let Some(p) = &st.pending {
+            return (!p.live()).then_some(p.expires_at);
+        }
+        if st.last_expired_at.is_some() {
+            return st.last_expired_at;
+        }
+        let bytes = std::fs::read(expired_link_path(&self.inner.config, &self.inner.relay)).ok()?;
+        let rec: ExpiredLink = serde_json::from_slice(&bytes).ok()?;
+        (rec.relay == self.inner.relay
+            && (self.inner.bot_name.is_none() || rec.bot_name == self.inner.bot_name))
+            .then_some(rec.expires_at)
+    }
+
     /// After a restart: carry on with a device login that was started
     /// earlier and has not expired. Returns whether one was resumed. A
     /// stale or unreadable file is deleted and `login` says so.
@@ -914,9 +1050,16 @@ impl Gateway {
             }
         };
         let now = bw_relay::doorbell::now_unix();
-        if saved.relay != self.inner.relay || saved.expires_at <= now + 2 {
+        if saved.relay != self.inner.relay {
             let _ = std::fs::remove_file(&path);
             note("The login code from the previous run expired before it was approved. Call `login` to get a new link and code.");
+            return false;
+        }
+        if saved.expires_at <= now + 2 {
+            let _ = std::fs::remove_file(&path);
+            let mut st = self.inner.login.lock().await;
+            self.link_expired(&mut st, saved.expires_at.min(now));
+            note(&expired_message(saved.expires_at.min(now)));
             return false;
         }
         // Started for another bot name: never carry it on quietly, since
@@ -1069,6 +1212,7 @@ impl Gateway {
             let mut st = self.inner.login.lock().await;
             st.generation += 1;
             st.last_failure = None;
+            self.forget_expired_link(&mut st);
             let pending = Pending {
                 expires: Instant::now() + Duration::from_secs(start.expires_in),
                 expires_at: bw_relay::doorbell::now_unix() + start.expires_in,
@@ -1129,6 +1273,10 @@ impl Gateway {
             }
         };
         let signed_in = self.connector();
+        let expired = {
+            let st = self.inner.login.lock().await;
+            self.expired_at(&st)
+        };
         let view = match (step, signed_in) {
             (Step::SignedIn, Some(c)) | (Step::NoLogin, Some(c)) => {
                 let who = c.whoami().await.unwrap_or(Value::Null);
@@ -1138,6 +1286,9 @@ impl Gateway {
                     "agent_id": c.agent_id(),
                     "message": "Signed in. The room tools work now (create_room, create_invite, join_room, send_message, wait_for_message, ...); they were in your tool list all along.",
                 })
+            }
+            (Step::Expired, _) | (Step::NoLogin, None) if expired.is_some() => {
+                self.expired_status(expired.expect("checked"))
             }
             (Step::Denied | Step::Expired | Step::Failed, _) | (Step::NoLogin, None) => {
                 let st = self.inner.login.lock().await;
@@ -1161,7 +1312,9 @@ impl Gateway {
             (_, _) => {
                 let st = self.inner.login.lock().await;
                 match st.pending.as_ref() {
-                    Some(p) => self.pending_view(p, "pending"),
+                    Some(p) if p.live() => self.pending_view(p, "pending"),
+                    // Past its time, not polled yet: expired all the same.
+                    Some(p) => self.expired_status(p.expires_at),
                     None => {
                         json!({ "status": "no_login_started", "message": "No login is in progress. Call `login` first." })
                     }
@@ -1214,22 +1367,27 @@ impl Gateway {
             "requested_bot_name": self.inner.bot_name,
             "login_in_progress": live.is_some(),
         });
+        let expired = live.is_none().then(|| self.expired_at(&st)).flatten();
         if why.is_some() {
-            let so = signed_out_view(why.as_deref(), live);
+            let so = signed_out_view(why.as_deref(), live, expired);
             for k in ["message", "reason", "retired"] {
                 if !so[k].is_null() {
                     v[k] = so[k].clone();
                 }
             }
         } else {
-            v["message"] = json!(match (live, note) {
-                (Some(p), _) => p.waiting(),
-                (None, Some(n)) => n,
-                (None, None) => "Not signed in. Call `login` and send your person the link and code; the room tools work as soon as they approve.".to_string(),
+            v["message"] = json!(match (live, expired, note) {
+                (Some(p), _, _) => p.waiting(),
+                (None, Some(at), _) => expired_message(at),
+                (None, None, Some(n)) => n,
+                (None, None, None) => "Not signed in. Call `login` and send your person the link and code; the room tools work as soon as they approve.".to_string(),
             });
         }
         if let Some(p) = live {
             merge(&mut v, p.times());
+        }
+        if let Some(at) = expired {
+            merge(&mut v, expired_fields(at));
         }
         respond(Ok(v))
     }
@@ -1362,12 +1520,20 @@ impl Gateway {
                     let live = st.pending.as_ref().filter(|p| p.live());
                     // Revoked: say so, then either "waiting for your person"
                     // (a live link) or the login next step.
+                    let expired = live.is_none().then(|| self.expired_at(&st)).flatten();
                     if let Some(why) = self.inner.signed_out.lock().expect("lock").clone() {
-                        let mut v = signed_out_view(Some(&why), live);
+                        let mut v = signed_out_view(Some(&why), live, expired);
                         if let Some(p) = live {
                             v["login"] = self.pending_view(p, "pending");
                         }
                         return Ok(CallToolResult::structured_error(v).into());
+                    }
+                    if let (None, Some(at)) = (live, expired) {
+                        let mut r = not_signed_in(None, Some(expired_message(at)));
+                        if let Some(v) = r.structured_content.as_mut() {
+                            merge(v, expired_fields(at));
+                        }
+                        return Ok(r.into());
                     }
                     (
                         live.map(|p| self.pending_view(p, "pending")),
@@ -1414,7 +1580,7 @@ mod tests {
             "invalid_grant: the refresh token was revoked",
             "the relay no longer accepts this bot's sign-in",
         ] {
-            let v = signed_out_view(Some(why), None);
+            let v = signed_out_view(Some(why), None, None);
             no_shared_sentence(&v);
             let m = v["message"].as_str().unwrap();
             assert!(m.starts_with("SIGNED_OUT: "), "{m}");
@@ -1428,7 +1594,7 @@ mod tests {
         }
         // The plain constant is explanation + next step, unchanged.
         assert_eq!(signed_out_message(false, None), SIGNED_OUT_MESSAGE);
-        let v = signed_out_view(Some("BOT_RETIRED: x"), None);
+        let v = signed_out_view(Some("BOT_RETIRED: x"), None, None);
         assert_eq!(v["reason"], RETIRED_CAUSE);
         assert_eq!(v["retired"], true);
     }
@@ -1453,7 +1619,7 @@ mod tests {
         };
         assert!(p.live());
         for why in [Some("BOT_RETIRED: x"), Some("HTTP 401"), None] {
-            let v = signed_out_view(why, Some(&p));
+            let v = signed_out_view(why, Some(&p), Some(1));
             let m = v["message"].as_str().unwrap();
             assert!(!m.contains("force"), "{m}");
             assert!(
@@ -1563,6 +1729,86 @@ mod tests {
         assert!(!g.resume_pending_login().await);
         assert!(!path.exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A link that expired while the connector was down: noted at startup,
+    /// and still known after another restart (the pending file is gone).
+    #[tokio::test]
+    async fn an_expired_link_is_remembered_across_restarts() {
+        let relay = "http://127.0.0.1:9";
+        let dir = home("expired");
+        let path = pending_login_path(&dir, relay);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let at = bw_relay::doorbell::now_unix() - 60;
+        let mut stale: SavedLogin = serde_json::from_slice(&saved(relay, Some("Scout"))).unwrap();
+        stale.expires_at = at;
+        std::fs::write(&path, serde_json::to_vec(&stale).unwrap()).unwrap();
+        let g = Gateway::new(relay, dir.clone(), None, Some("Scout".into()));
+        assert!(!g.resume_pending_login().await);
+        assert!(!path.exists());
+        let marker = std::fs::read_to_string(expired_link_path(&dir, relay)).unwrap();
+        assert!(
+            !marker.contains("device_code") && !marker.contains("user_code"),
+            "{marker}"
+        );
+        for g in [
+            g,
+            Gateway::new(relay, dir.clone(), None, Some("Scout".into())),
+        ] {
+            let st = g.inner.login.lock().await;
+            assert_eq!(g.expired_at(&st), Some(at));
+            drop(st);
+            let v = g.whoami().await.unwrap().structured_content.unwrap();
+            assert_eq!(v["login_in_progress"], false, "{v}");
+            assert_eq!(v["message"], expired_message(at), "{v}");
+            assert_eq!(v["last_link_expired_at"], at, "{v}");
+            assert_eq!(
+                v["last_link_expired_at_utc"],
+                bw_proto::time::iso_utc(at),
+                "{v}"
+            );
+        }
+        // Another bot name on the same home: not its link.
+        let other = Gateway::new(relay, dir.clone(), None, Some("Atlas".into()));
+        assert_eq!(other.expired_at(&*other.inner.login.lock().await), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_expired_link_leads_the_signed_out_message() {
+        let at = 1_793_212_620;
+        for why in [
+            "unknown: HTTP 401 Unauthorized: unauthorized (BOT_RETIRED): BotWhisper updated how bots are identified; this bot needs to sign in once more. Its old rooms will need a new invite. Call the connector's login tool (force=true) and send your person the link and code it returns.",
+            "HTTP 401 Unauthorized",
+            "the relay no longer accepts this bot's sign-in",
+        ] {
+            let v = signed_out_view(Some(why), None, Some(at));
+            no_shared_sentence(&v);
+            let m = v["message"].as_str().unwrap();
+            assert!(
+                m.starts_with(&format!("SIGNED_OUT: {}", expired_message(at))),
+                "{m}"
+            );
+            assert!(m.contains(&local_time(at)) && m.contains(&bw_proto::time::iso_utc(at)), "{m}");
+            assert_eq!(m.matches("login").count(), 1, "{m}");
+            assert!(!m.contains("Waiting") && !v.to_string().contains(".."), "{m}");
+            assert_eq!(v["last_link_expired_at"], at);
+            assert_eq!(v["last_link_expired_at_utc"], bw_proto::time::iso_utc(at));
+            if is_retired(why) {
+                assert_eq!(v["retired"], true);
+                assert!(m.ends_with("Its old rooms will need a new invite."), "{m}");
+            } else {
+                assert!(m.contains("The relay no longer accepts this bot's sign-in"), "{m}");
+            }
+        }
+        assert_eq!(
+            expired_message(at),
+            format!(
+                "Your last link expired at {} ({}). Call login(force=true) to get a new one.",
+                local_time(at),
+                bw_proto::time::iso_utc(at)
+            )
+        );
     }
 
     #[tokio::test]

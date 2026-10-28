@@ -776,6 +776,41 @@ fn check_waiting(v: &Value, tool: &str, login: &Value) {
     assert!(!all.contains(".."), "{tool}: {all}");
 }
 
+/// The last link expired: say when, then login(force=true) once; a
+/// signed-out bot keeps `retired` and the explanation.
+fn check_expired(v: &Value, tool: &str, at: u64) {
+    const WHY: &str = "BotWhisper updated how bots are identified; this bot needs to sign in once more. Its old rooms will need a new invite.";
+    let m = v["message"].as_str().unwrap_or_default();
+    let utc = bw_proto::time::iso_utc(at);
+    assert!(
+        m.contains("Your last link expired at ")
+            && m.contains(&format!(
+                "({utc}). Call login(force=true) to get a new one."
+            )),
+        "{tool}: {v}"
+    );
+    assert_eq!(m.matches("login").count(), 1, "{tool}: {m}");
+    assert_eq!(v["last_link_expired_at"], at, "{tool}: {v}");
+    assert_eq!(v["last_link_expired_at_utc"], utc, "{tool}: {v}");
+    assert!(!m.contains("Waiting"), "{tool}: {m}");
+    if tool == "whoami" {
+        assert_eq!(v["login_in_progress"], false, "{v}");
+        assert!(v.get("sent_at").is_none(), "{v}");
+    }
+    if tool == "login_status" {
+        assert_eq!(v["status"], "expired", "{v}");
+    }
+    assert_eq!(v["retired"], true, "{tool}: {v}");
+    assert!(
+        m.starts_with("SIGNED_OUT: Your last link expired") && m.contains(WHY),
+        "{tool}: {m}"
+    );
+    if let Some(r) = v["reason"].as_str() {
+        assert!(!m.contains(r) && !r.contains("login"), "{tool}: {m} / {r}");
+    }
+    assert!(!v.to_string().contains(".."), "{tool}: {v}");
+}
+
 /// QA 0.2.16: while a login link waits for approval, whoami, login_status
 /// and the room tools say "waiting" (with sent/expiry times), never "call
 /// login (force=true)"; also after a restart that resumed the link. Once it
@@ -852,18 +887,28 @@ async fn pending_inner() {
     while bw_relay::doorbell::now_unix() <= left {
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
+    let at = l["expires_at"].as_u64().unwrap();
+    for tool in ["whoami", "login_status", "list_rooms", "status"] {
+        let r = raw(&svc, tool, json!({ "wait_s": 0 })).await;
+        check_expired(&r.structured_content.unwrap(), tool, at);
+    }
+    svc.cancel().await.ok();
+
+    // And after a restart: the pending file is gone, the expiry is not.
+    let gw = Gateway::new(&base, config.clone(), None, None);
+    assert!(gw.resume().await.is_err());
+    assert!(!gw.resume_pending_login().await);
+    let (svc, _) = serve(gw).await;
+    for tool in ["list_rooms", "whoami", "login_status"] {
+        let r = raw(&svc, tool, json!({ "wait_s": 0 })).await;
+        check_expired(&r.structured_content.unwrap(), tool, at);
+    }
+    // A new link replaces it: waiting again, no "expired".
+    let l2 = call(&svc, "login", json!({ "force": true })).await;
+    assert_eq!(l2["status"], "pending", "{l2}");
     let who = call(&svc, "whoami", json!({})).await;
-    assert_eq!(who["login_in_progress"], false, "{who}");
-    assert!(
-        who["message"].as_str().unwrap().contains("(force=true)"),
-        "{who}"
-    );
-    assert!(who.get("sent_at").is_none(), "{who}");
-    let r = raw(&svc, "list_rooms", json!({})).await;
-    let v = r.structured_content.unwrap();
-    assert_eq!(v["error"], "SIGNED_OUT", "{v}");
-    let m = v["message"].as_str().unwrap();
-    assert!(m.contains("(force=true)") && !m.contains("Waiting"), "{v}");
+    check_waiting(&who, "whoami after a new link", &l2);
+    assert!(who.get("last_link_expired_at").is_none(), "{who}");
     svc.cancel().await.ok();
     relay.shutdown().await;
     let _ = std::fs::remove_dir_all(&config);
