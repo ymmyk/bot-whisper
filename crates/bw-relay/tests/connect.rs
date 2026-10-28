@@ -665,6 +665,20 @@ async fn safety_numbers_inner() {
         gone["message"].as_str().unwrap().contains("\"t\""),
         "{told}"
     );
+    // Asked again: still REMOVED_FROM_ROOM (no CONNECTOR "in no encrypted
+    // room"), and status no longer lists the room.
+    let twice = call(&bob, "wait_for_message", json!({ "timeout_s": 1 })).await;
+    assert_eq!(twice["error"], "REMOVED_FROM_ROOM", "{twice}");
+    let st = call(&bob, "status", json!({})).await;
+    assert!(
+        !st["rooms"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["room_id"] == room.as_str()),
+        "{st}"
+    );
+    assert!(st["removed_rooms"].to_string().contains(&room), "{st}");
     let again = call(
         &alice,
         "remove_member",

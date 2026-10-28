@@ -872,6 +872,63 @@ impl Connector {
         v["room_status"] = json!("removed");
     }
 
+    /// Rooms held here that the relay no longer lists for this bot: ask
+    /// about each; a removal (REMOVED_FROM_ROOM, or NOT_A_MEMBER from a
+    /// removal before 0.2.13) or a closed room is forgotten here and
+    /// reported once.
+    async fn prune_stale_rooms(&self, listed: &[String]) -> Vec<Value> {
+        let held: Vec<String> = {
+            let st = self.state.lock().await;
+            st.rooms
+                .keys()
+                .filter(|r| !listed.contains(r))
+                .cloned()
+                .collect()
+        };
+        let mut out = Vec::new();
+        for r in held {
+            let Err(e) = self.relay.call("get_status", json!({ "room_id": r })).await else {
+                continue;
+            };
+            if let Some(entry) = self.removed_entry(&r, &e).await {
+                out.push(entry);
+                continue;
+            }
+            let code = e
+                .downcast_ref::<super::relay::ToolError>()
+                .and_then(|t| t.0["error"].as_str().map(str::to_string));
+            if matches!(
+                code.as_deref(),
+                Some("NOT_A_MEMBER" | "ROOM_CLOSED" | "NOT_FOUND" | "ROOM_NOT_FOUND")
+            ) {
+                let title = {
+                    let mut st = self.state.lock().await;
+                    let title = st.rooms.get(&r).and_then(|x| x.title.clone());
+                    self.forget_room(&mut st, &r);
+                    st.pending.remove(&r);
+                    st.removed.insert(r.clone(), title.clone());
+                    self.persist_rooms(&st);
+                    title
+                };
+                let closed = code.as_deref() == Some("ROOM_CLOSED");
+                out.push(json!({
+                    "room_id": r,
+                    "room_title": title,
+                    "room_status": if closed { "closed" } else { "removed" },
+                    "events": [{
+                        "event": if closed { "room_closed" } else { "removed_from_room" },
+                        "message": if closed {
+                            "this room is closed; this connector forgot it"
+                        } else {
+                            "you are no longer a member of this room (removed); this connector forgot it. To come back you need a new invite."
+                        },
+                    }],
+                }));
+            }
+        }
+        out
+    }
+
     /// `Some(entry)` when `e` is REMOVED_FROM_ROOM for `room_id`: the room
     /// as `wait_for_message` reports it (forgotten here).
     async fn removed_entry(&self, room_id: &str, e: &anyhow::Error) -> Option<Value> {
@@ -1526,6 +1583,12 @@ impl Connector {
         description = "This connector: which bot it is, the relay, the MLS key fingerprint, and the encrypted rooms it holds keys for."
     )]
     async fn status(&self) -> Result<CallToolResult, ErrorData> {
+        // Drop rooms the bot was removed from (or that closed), so status
+        // never lists a room it can no longer use.
+        let pruned = match self.my_e2e_rooms().await {
+            Ok(listed) => self.prune_stale_rooms(&listed).await,
+            Err(_) => Vec::new(),
+        };
         let st = self.state.lock().await;
         let rooms: Vec<Value> = st
             .rooms
@@ -1542,6 +1605,8 @@ impl Connector {
             "rooms": rooms,
             "pending_join": st.pending.keys().collect::<Vec<_>>(),
             "awaiting_approval": st.awaiting.keys().collect::<Vec<_>>(),
+            "removed_rooms": st.removed.iter().map(|(k, t)| json!({ "room_id": k, "room_title": t })).collect::<Vec<_>>(),
+            "just_forgotten": pruned.iter().map(|p| p["room_id"].clone()).collect::<Vec<_>>(),
             "config_dir": self.store.as_ref().map(|s| s.dir.display().to_string()),
         })))
     }
@@ -1887,21 +1952,28 @@ impl Connector {
                         }
                         // Held here but no longer listed: removed by the
                         // owner? Then say so once (and forget it).
-                        let held: Vec<String> = {
-                            let st = self.state.lock().await;
-                            st.rooms.keys().filter(|r| !v.contains(r)).cloned().collect()
-                        };
-                        for r in held {
-                            if let Err(e) = self.relay.call("get_status", json!({ "room_id": r })).await {
-                                if let Some(entry) = self.removed_entry(&r, &e).await {
-                                    removed_out.push(entry);
-                                }
-                            }
-                        }
+                        removed_out.extend(self.prune_stale_rooms(&v).await);
                         v
                     }
                 };
                 if rooms.is_empty() && awaiting_notes.is_empty() && removed_out.is_empty() {
+                    // Removed earlier (already reported once): keep saying
+                    // so, not a connector error.
+                    let gone: Vec<(String, Option<String>)> = {
+                        let st = self.state.lock().await;
+                        st.removed.iter().map(|(k, t)| (k.clone(), t.clone())).collect()
+                    };
+                    if let Some((room, title)) = gone.into_iter().next() {
+                        let what = title
+                            .map(|t| format!("\"{t}\" ({room})"))
+                            .unwrap_or_else(|| room.clone());
+                        return Err(super::relay::ToolError(json!({
+                            "error": "REMOVED_FROM_ROOM",
+                            "room_id": room,
+                            "message": format!("you were removed from {what} and are in no other room; to come back you need a new invite"),
+                        }))
+                        .into());
+                    }
                     anyhow::bail!("you are in no encrypted room");
                 }
                 // Rooms the relay calls active but this connector holds no
