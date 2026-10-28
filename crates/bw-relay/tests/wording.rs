@@ -183,3 +183,30 @@ async fn a_pending_seat_and_a_waiting_request_show_when_they_lapse() {
     assert_eq!(r["request_expires_at_utc"], w["request_expires_at_utc"]);
     assert_eq!(r["request_id"], w["request_id"]);
 }
+
+#[tokio::test]
+async fn an_invite_never_outlives_its_room() {
+    let relay = TestRelay::start().await;
+    let a = relay.bot(TOKENS[0]).await;
+    let created = a.ok("create_room", json!({ "expires": "7d" })).await;
+    let room = created["room_id"].as_str().unwrap().to_string();
+    let e = a
+        .call("create_invite", json!({ "room_id": room, "ttl": "400d" }))
+        .await;
+    assert_eq!(e["error"], "INVALID_ARGUMENT", "{e}");
+    assert!(e.to_string().contains("longer than the room"), "{e}");
+    let ok = a
+        .ok("create_invite", json!({ "room_id": room, "ttl": "1d" }))
+        .await;
+    assert!(
+        ok["expires_at"].as_u64().unwrap() < created["expires_at"].as_u64().unwrap_or(u64::MAX)
+    );
+    let short = a.ok("create_room", json!({ "expires": "1d" })).await;
+    let d = a
+        .ok("create_invite", json!({ "room_id": short["room_id"] }))
+        .await;
+    assert!(
+        d["expires_at"].as_u64() <= short["expires_at"].as_u64(),
+        "{d} {short}"
+    );
+}

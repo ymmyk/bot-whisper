@@ -740,7 +740,25 @@ impl Room {
         rand::rng().fill_bytes(&mut secret);
         let secret = hex::encode(secret);
         let id = uuid::Uuid::new_v4().simple().to_string();
-        let ttl = o.ttl.unwrap_or(self.cfg.default_invite_ttl);
+        let asked = o.ttl.is_some();
+        let mut ttl = o.ttl.unwrap_or(self.cfg.default_invite_ttl);
+        let mut capped = false;
+        // An invite never outlives its room: an explicit ttl past the room's
+        // close is refused, the default is shortened to it.
+        if let Some(close) = self.expires_at {
+            let left = close.saturating_sub(now);
+            if ttl.as_secs() > left {
+                if asked {
+                    return Err(RelayError::invalid(format!(
+                        "ttl is longer than the room: it closes at {} (in {}), so an invite can last at most that long; give a shorter ttl or leave it out to use the room's remaining time",
+                        crate::config::iso_utc(close),
+                        crate::config::ttl_words(std::time::Duration::from_secs(left)),
+                    )));
+                }
+                ttl = std::time::Duration::from_secs(left);
+                capped = true;
+            }
+        }
         let row = InviteRow {
             id: id.clone(),
             room_id: self.id.clone(),
@@ -757,6 +775,11 @@ impl Room {
         };
         self.db.insert_invite(&row)?;
         let mut v = row.public_json(now);
+        if capped {
+            v["note"] = json!(
+                "expires when the room closes (the default ttl is longer than the room has left)"
+            );
+        }
         v["invite_url"] = json!(format!("{}/i/{id}.{secret}", self.cfg.public_url()));
         Ok(v)
     }
