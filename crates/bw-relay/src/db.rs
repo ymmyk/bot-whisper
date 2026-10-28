@@ -1380,6 +1380,39 @@ impl Db {
         })
     }
 
+    /// Requests by one agent still waiting for approval, oldest first.
+    pub fn waiting_join_requests_for_agent(&self, agent_id: &str) -> Result<Vec<JoinRequest>> {
+        self.with(|c| {
+            let mut st = c.prepare(
+                "SELECT id FROM join_requests WHERE agent_id = ?1 AND status = 'waiting' ORDER BY created_at, id",
+            )?;
+            let ids = st.query_map(params![agent_id], |r| r.get::<_, String>(0))?;
+            let ids: Vec<String> = ids.collect::<rusqlite::Result<_>>()?;
+            let mut out = Vec::new();
+            for id in ids {
+                let mut q = c.prepare(
+                    "SELECT id, room_id, invite_id, agent_id, display_name, label, created_at, status, decided_by, member_id
+                     FROM join_requests WHERE id = ?1",
+                )?;
+                out.push(q.query_row(params![id], |r| {
+                    Ok(JoinRequest {
+                        id: r.get(0)?,
+                        room_id: r.get(1)?,
+                        invite_id: r.get(2)?,
+                        agent_id: r.get(3)?,
+                        display_name: r.get(4)?,
+                        label: r.get(5)?,
+                        created_at: r.get::<_, i64>(6)? as u64,
+                        status: r.get(7)?,
+                        decided_by: r.get(8)?,
+                        member_id: r.get(9)?,
+                    })
+                })?);
+            }
+            Ok(out)
+        })
+    }
+
     /// A room's join requests, oldest first.
     pub fn join_requests(&self, room_id: &str) -> Result<Vec<JoinRequest>> {
         self.with(|c| {

@@ -109,7 +109,7 @@ async fn e2e_room_lifecycle_through_the_relay() {
     assert_eq!(rooms["rooms"][0]["e2e_state"], "pending");
     assert_eq!(rooms["rooms"][0]["members"], 2);
     // The room's own expiry is `room_expires_at`, apart from the message
-    // `pending_expires_at`; the old ambiguous name is gone.
+    // `oldest_pending_message_expires_at`; the old ambiguous name is gone.
     assert!(
         rooms["rooms"][0].get("room_expires_at").is_some(),
         "{rooms}"
@@ -215,8 +215,18 @@ async fn e2e_room_lifecycle_through_the_relay() {
     assert_eq!(sent["retention"], "held until delivered, up to 7 days");
     // Bob's list_rooms says when his oldest waiting message goes away.
     let rooms = bob.ok("list_rooms", json!({})).await;
-    assert_eq!(rooms["rooms"][0]["pending_expires_at"], exp, "{rooms}");
-    assert_eq!(rooms["rooms"][0]["pending_expires_at_utc"], iso);
+    assert_eq!(
+        rooms["rooms"][0]["oldest_pending_message_expires_at"], exp,
+        "{rooms}"
+    );
+    assert_eq!(
+        rooms["rooms"][0]["oldest_pending_message_expires_at_utc"],
+        iso
+    );
+    assert!(
+        rooms["rooms"][0].get("pending_expires_at").is_none(),
+        "renamed"
+    );
     assert_eq!(
         rooms["message_retention"],
         "encrypted messages are held until delivered, up to 7 days"

@@ -263,20 +263,11 @@ impl Room {
             .map(|i| i.created_at + self.cfg.unacked_ttl.as_secs())
             .min();
         // A seat still waiting to be added (or to confirm its Welcome) lasts
-        // as long as the room does: its pending state ends then at the latest.
+        // as long as the room does.
         let waiting = self.member(member).is_ok_and(|m| !m.is_e2e_active());
         let seat_until = if waiting { self.expires_at } else { None };
-        let until = match (msg_until, seat_until) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        };
-        let reason = match (until, msg_until) {
-            (None, _) => None,
-            (Some(u), Some(m)) if u == m => Some("message"),
-            _ => Some("room_expires"),
-        };
         json!({
-            "pending_expires_reason": reason,
+            "seat_expires_at": seat_until,
             "epoch": self.e2e.epoch,
             "you": self.member(member).ok().map(|m| m.e2e_state),
             // The seats this caller's connector should add: the ones it
@@ -288,7 +279,7 @@ impl Room {
             "welcoming": self.members.iter().filter(|m| m.e2e_state == SeatState::Welcoming).map(|m| m.member.clone()).collect::<Vec<_>>(),
             "joined": self.joined_ids(),
             "pending_items_for_you": self.e2e.items.iter().filter(|i| i.pending.contains(member)).count(),
-            "pending_expires_at": until,
+            "oldest_pending_message_expires_at": msg_until,
         })
     }
 

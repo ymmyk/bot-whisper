@@ -136,7 +136,7 @@ async fn only_the_newest_members_changed_waits_in_a_queue() {
 }
 
 #[tokio::test]
-async fn a_pending_seat_shows_when_it_lapses() {
+async fn a_pending_seat_and_a_waiting_request_show_when_they_lapse() {
     let relay = TestRelay::start().await;
     let a = relay.bot(TOKENS[0]).await;
     let b = relay.bot(TOKENS[1]).await;
@@ -145,30 +145,19 @@ async fn a_pending_seat_shows_when_it_lapses() {
     let inv = a.ok("create_invite", json!({ "room_id": room })).await;
     b.ok("join_room", json!({ "invite_url": inv["invite_url"] }))
         .await;
-    // Seated, not added yet, nothing queued: it lapses with the room.
+    // Seated, not added yet, nothing queued: no message deadline, and the
+    // seat lasts as long as the room.
     let rooms = b.ok("list_rooms", json!({})).await;
     let r = &rooms["rooms"][0];
     assert_eq!(r["e2e_state"], "pending", "{r}");
-    assert!(r["pending_expires_at"].is_u64(), "{r}");
-    assert_eq!(r["pending_expires_at"], r["room_expires_at"], "{r}");
-    assert_eq!(r["pending_expires_at_utc"], r["room_expires_at_utc"], "{r}");
-    assert_eq!(r["pending_expires_reason"], "room_expires");
-    // Added and confirmed, nothing waiting: back to null.
-    a.ok(
-        "e2e_commit",
-        json!({ "room_id": room, "epoch": 0, "commit": b64("add"), "welcome": b64("w"),
-                "welcome_to": ["m2"], "added": ["m2"] }),
-    )
-    .await;
-    b.wait(&room, 0).await;
-    b.ok("e2e_confirm_joined", json!({ "room_id": room })).await;
-    let rooms = b.ok("list_rooms", json!({})).await;
-    let r = &rooms["rooms"][0];
-    assert_eq!(r["e2e_state"], "active", "{r}");
-    assert!(r["pending_expires_at"].is_null(), "{r}");
-    assert!(r.get("pending_expires_reason").is_none(), "{r}");
+    assert!(r["oldest_pending_message_expires_at"].is_null(), "{r}");
+    assert!(r.get("pending_expires_at").is_none(), "renamed: {r}");
+    assert_eq!(r["seat_expires_at"], r["room_expires_at"], "{r}");
+    assert_eq!(r["seat_expires_at_utc"], r["room_expires_at_utc"], "{r}");
+    assert!(r["seat_expires_at"].is_u64(), "{r}");
 
-    // A request waiting for approval: the same field, its request deadline.
+    // A fresh request waiting for approval shows in list_rooms with the
+    // same fields join_room returns.
     let c = relay.bot(TOKENS[2]).await;
     let inv = a
         .ok(
@@ -180,7 +169,17 @@ async fn a_pending_seat_shows_when_it_lapses() {
         .ok("join_room", json!({ "invite_url": inv["invite_url"] }))
         .await;
     assert_eq!(w["state"], "awaiting_approval", "{w}");
-    assert!(w["pending_expires_at"].is_u64(), "{w}");
-    assert_eq!(w["pending_expires_at"], w["request_expires_at"]);
-    assert_eq!(w["pending_expires_at_utc"], w["request_expires_at_utc"]);
+    assert!(w["request_expires_at"].is_u64(), "{w}");
+    assert!(w.get("pending_expires_at").is_none(), "{w}");
+    let rooms = c.ok("list_rooms", json!({})).await;
+    let r = rooms["rooms"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["room_id"] == room.as_str())
+        .unwrap_or_else(|| panic!("waiting room listed: {rooms}"));
+    assert_eq!(r["state"], "awaiting_approval", "{r}");
+    assert_eq!(r["request_expires_at"], w["request_expires_at"]);
+    assert_eq!(r["request_expires_at_utc"], w["request_expires_at_utc"]);
+    assert_eq!(r["request_id"], w["request_id"]);
 }

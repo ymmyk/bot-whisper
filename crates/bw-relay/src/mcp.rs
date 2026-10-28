@@ -584,13 +584,15 @@ impl BotWhisperServer {
                             "pending_items_for_you": s["e2e"]["pending_items_for_you"],
                             "room_expires_at": s["room_expires_at"],
                             "room_expires_at_utc": s["room_expires_at"].as_u64().map(crate::config::iso_utc),
-                            "pending_expires_at": s["e2e"]["pending_expires_at"],
-                            "pending_expires_at_utc": s["e2e"]["pending_expires_at"].as_u64().map(crate::config::iso_utc),
+                            // When the oldest message waiting for you is
+                            // deleted unfetched (null: none waiting).
+                            "oldest_pending_message_expires_at": s["e2e"]["oldest_pending_message_expires_at"],
+                            "oldest_pending_message_expires_at_utc": s["e2e"]["oldest_pending_message_expires_at"].as_u64().map(crate::config::iso_utc),
                         });
-                        // Why it lapses then: a message you have not fetched,
-                        // or your seat still waiting to join when the room ends.
-                        if let Some(r) = s["e2e"]["pending_expires_reason"].as_str() {
-                            row["pending_expires_reason"] = json!(r);
+                        // A seat not yet added: it lasts as long as the room.
+                        if let Some(t) = s["e2e"]["seat_expires_at"].as_u64() {
+                            row["seat_expires_at"] = json!(t);
+                            row["seat_expires_at_utc"] = json!(crate::config::iso_utc(t));
                         }
                         // Whose turn it is: only while a round-table thread
                         // is running (left out otherwise, never null).
@@ -599,6 +601,41 @@ impl BotWhisperServer {
                         }
                         out.push(row);
                     }
+                }
+                // Requests still waiting for a member's approval: the same
+                // fields join_room and the connector's status return.
+                let now = crate::doorbell::now_unix();
+                for req in self
+                    .registry
+                    .db
+                    .waiting_join_requests_for_agent(&agent.id)
+                    .unwrap_or_default()
+                {
+                    let Ok(room) = self.registry.get(&req.room_id).await else {
+                        continue;
+                    };
+                    let invite_id = req.invite_id.clone();
+                    let Ok((until, room_expires)) = room
+                        .with(move |r| (r.request_expires_at(&invite_id), r.expires_at))
+                        .await
+                    else {
+                        continue;
+                    };
+                    if until.is_some_and(|u| u <= now) {
+                        continue;
+                    }
+                    out.push(json!({
+                        "room_id": req.room_id,
+                        "state": "awaiting_approval",
+                        "e2e_state": "awaiting_approval",
+                        "request_id": req.id,
+                        "message": crate::room::WAITING_MESSAGE,
+                        "requested_at": req.created_at,
+                        "request_expires_at": until,
+                        "request_expires_at_utc": until.map(crate::config::iso_utc),
+                        "room_expires_at": room_expires,
+                        "room_expires_at_utc": room_expires.map(crate::config::iso_utc),
+                    }));
                 }
                 let ttl = self.registry.cfg.unacked_ttl;
                 Ok(json!({
@@ -974,9 +1011,6 @@ impl BotWhisperServer {
                     "requested_at": req.created_at,
                     "request_expires_at": until,
                     "request_expires_at_utc": until.map(crate::config::iso_utc),
-                    // The same deadline under list_rooms' name for it.
-                    "pending_expires_at": until,
-                    "pending_expires_at_utc": until.map(crate::config::iso_utc),
                     "max_members": max_members,
                     "room_expires_at": room_expires,
                     "room_expires_at_utc": room_expires.map(crate::config::iso_utc),
