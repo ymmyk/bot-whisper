@@ -85,7 +85,7 @@ impl std::fmt::Display for SignedOut {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "signed out: {} Call `login` (force=true) for a new sign-in link and code for your person",
+            "signed out: {} Call `login` (force=true) for a new sign-in link and code for your person.",
             sentence(&super::gateway::short_reason(&self.0))
         )
     }
@@ -529,7 +529,10 @@ mod retry_tests {
         assert_eq!(sentence("really?"), "really?");
         // The restart log line QA saw as "returns.. Call".
         let line = SignedOut(format!("BOT_RETIRED: {WHY}")).to_string();
-        assert!(line.contains("code it returns. Call `login`"), "{line}");
+        assert!(
+            line.contains("older ID. Call `login`") && line.matches("login").count() == 1,
+            "{line}"
+        );
         assert!(!line.contains(".."), "{line}");
         let line = SignedOut("HTTP 401: nope".into()).to_string();
         assert!(!line.contains(".."), "{line}");

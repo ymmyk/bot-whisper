@@ -2869,14 +2869,23 @@ mod invite_link_tests {
             m.starts_with("SIGNED_OUT: BotWhisper updated how bots are identified; this bot needs to sign in once more. Its old rooms will need a new invite."),
             "{m}"
         );
-        assert!(m.contains("login tool (force=true)"), "{m}");
-        assert!(v["reason"].as_str().unwrap().starts_with("BOT_RETIRED: "));
+        assert!(m.contains("Call `login` (force=true)"), "{m}");
+        assert_eq!(m.matches("login").count(), 1, "{m}");
+        let r = v["reason"].as_str().unwrap();
+        assert!(
+            r.starts_with("BOT_RETIRED: ") && !r.contains("BotWhisper updated"),
+            "{r}"
+        );
         // Refresh path: the relay's error_description.
         let shown = super::super::relay::SignedOut(
             "BOT_RETIRED: BotWhisper updated how bots are identified.".into(),
         )
         .to_string();
-        assert!(shown.contains("BOT_RETIRED: BotWhisper updated"), "{shown}");
+        assert!(
+            shown.contains(super::super::gateway::RETIRED_CAUSE),
+            "{shown}"
+        );
+        assert_eq!(shown.matches("login").count(), 1, "{shown}");
         assert!(super::super::gateway::RETIRED_LOGIN_NOTE.starts_with("BotWhisper updated how bots are identified; this bot needs to sign in once more. Its old rooms will need a new invite."));
     }
 

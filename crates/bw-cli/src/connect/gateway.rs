@@ -70,6 +70,9 @@ struct SavedLogin {
     /// The bot name this login was started for (`--bot-name`), if any.
     #[serde(default)]
     bot_name: Option<String>,
+    /// Unix seconds the link was handed out (0.2.17+; absent before).
+    #[serde(default)]
+    sent_at: Option<u64>,
 }
 
 fn pending_login_path(config: &std::path::Path, relay: &str) -> PathBuf {
@@ -141,7 +144,54 @@ struct Pending {
     expires: Instant,
     /// Unix seconds, for the file on disk.
     expires_at: u64,
+    /// Unix seconds: when the link was handed out.
+    sent_at: u64,
     next_poll: Instant,
+}
+
+impl Pending {
+    /// Still usable: the link has not expired.
+    fn live(&self) -> bool {
+        Instant::now() < self.expires
+    }
+
+    /// "Waiting for your person ..." with when the link was sent and when
+    /// it expires: the one thing to say while it is live (never "call
+    /// `login` (force=true)", which would replace the link they hold).
+    fn waiting(&self) -> String {
+        waiting_message(self.sent_at, self.expires_at)
+    }
+
+    fn times(&self) -> Value {
+        json!({
+            "sent_at": self.sent_at,
+            "sent_at_utc": bw_proto::time::iso_utc(self.sent_at),
+            "sent_at_local": local_time(self.sent_at),
+            "expires_at": self.expires_at,
+            "expires_at_utc": bw_proto::time::iso_utc(self.expires_at),
+            "expires_at_local": local_time(self.expires_at),
+        })
+    }
+}
+
+/// `secs` in this machine's time zone, e.g. "2026-10-28 13:57 (UTC-05:00)".
+pub(crate) fn local_time(secs: u64) -> String {
+    use chrono::TimeZone;
+    match chrono::Local.timestamp_opt(secs as i64, 0).single() {
+        Some(t) => t.format("%Y-%m-%d %H:%M (UTC%:z)").to_string(),
+        None => bw_proto::time::iso_utc(secs),
+    }
+}
+
+/// The answer while a login link waits for the person's approval.
+pub(crate) fn waiting_message(sent_at: u64, expires_at: u64) -> String {
+    format!(
+        "Waiting for your person to approve the link sent at {} ({}); it expires at {} ({}). Don't call login again unless it has expired.",
+        local_time(sent_at),
+        bw_proto::time::iso_utc(sent_at),
+        local_time(expires_at),
+        bw_proto::time::iso_utc(expires_at),
+    )
 }
 
 #[derive(Default)]
@@ -216,19 +266,113 @@ pub struct LoginStatusArgs {
 /// The `login` note after the relay said the old bot was retired.
 pub const RETIRED_LOGIN_NOTE: &str = "BotWhisper updated how bots are identified; this bot needs to sign in once more. Its old rooms will need a new invite. Approving this link signs it in as a new bot.";
 
-/// The one line a bot sees once the relay revoked its sign-in.
+/// Why a bot is signed out (the explanation part of `message`).
+pub const SIGNED_OUT_EXPLAIN: &str = "SIGNED_OUT: the relay no longer accepts this bot's sign-in (revoked, the bot was deleted on /account, or it expired).";
+
+/// The same for a bot whose older ID the relay retired.
+pub const RETIRED_EXPLAIN: &str = "SIGNED_OUT: BotWhisper updated how bots are identified; this bot needs to sign in once more. Its old rooms will need a new invite.";
+
+/// The next step once no login link is live.
+pub const LOGIN_NEXT_STEP: &str = "Call `login` (force=true): it returns a link and a short code. Send both to your person, who opens the link, signs in and approves this bot; the room tools work again as soon as they do.";
+
+/// The one line a bot sees once the relay revoked its sign-in (and no
+/// login is waiting): explanation, then next step.
 pub const SIGNED_OUT_MESSAGE: &str = "SIGNED_OUT: the relay no longer accepts this bot's sign-in (revoked, the bot was deleted on /account, or it expired). Call `login` (force=true): it returns a link and a short code. Send both to your person, who opens the link, signs in and approves this bot; the room tools work again as soon as they do.";
 
-/// The relay's refusal in one short line. Its 401 page is written for a
-/// bot that never signed in, which is not what a signed-out connector
-/// needs, so that text never reaches the bot.
+/// The short cause for a retired bot (`reason`; the explanation is in
+/// `message`).
+pub const RETIRED_CAUSE: &str = "BOT_RETIRED: the relay retired this bot's older ID";
+
+/// The connector's stderr line at startup when the relay refused the
+/// stored sign-in: the cause, then `login` named once (or not at all while
+/// a resumed login link still waits for approval).
+pub fn startup_signed_out_line(reason: &str, login_waiting: bool) -> String {
+    format!(
+        "botwhisper connect: signed out: {} {}",
+        super::relay::sentence(&short_reason(reason)),
+        if login_waiting {
+            "A login link is already waiting for your person's approval."
+        } else {
+            "Call the `login` tool (force=true) for a new sign-in link and code for your person."
+        }
+    )
+}
+
+/// Merge `extra`'s fields into `v`.
+fn merge(v: &mut Value, extra: Value) {
+    if let (Some(o), Value::Object(e)) = (v.as_object_mut(), extra) {
+        o.extend(e);
+    }
+}
+
+/// The sentences of `s` (split after `.`, `!`, `?` followed by a space).
+pub(crate) fn sentences(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        cur.push(c);
+        if matches!(c, '.' | '!' | '?') && chars.peek().is_none_or(|n| n.is_whitespace()) {
+            let t = cur.trim().to_string();
+            if !t.is_empty() {
+                out.push(t);
+            }
+            cur.clear();
+        }
+    }
+    let t = cur.trim().to_string();
+    if !t.is_empty() {
+        out.push(t);
+    }
+    out
+}
+
+/// `cause` without any sentence `message` already says (reason and message
+/// never repeat each other); a generic cause if nothing is left.
+fn cause_not_in(cause: &str, message: &str) -> String {
+    let norm = |s: &str| {
+        s.trim_start_matches("SIGNED_OUT: ")
+            .trim_end_matches(['.', ' '])
+            .to_ascii_lowercase()
+    };
+    let said: Vec<String> = sentences(message).iter().map(|s| norm(s)).collect();
+    let kept: Vec<String> = sentences(cause)
+        .into_iter()
+        .filter(|s| {
+            let n = norm(s);
+            !said
+                .iter()
+                .any(|x| x.contains(&n) || n.contains(x.as_str()))
+        })
+        .collect();
+    if kept.is_empty() {
+        "the relay refused this bot's stored sign-in".to_string()
+    } else {
+        kept.join(" ")
+    }
+}
+
+/// What to tell a signed-out bot: the explanation, then either "waiting
+/// for your person" (a live login link) or the login next step.
+pub(crate) fn signed_out_message(retired: bool, waiting: Option<&str>) -> String {
+    format!(
+        "{} {}",
+        if retired {
+            RETIRED_EXPLAIN
+        } else {
+            SIGNED_OUT_EXPLAIN
+        },
+        waiting.unwrap_or(LOGIN_NEXT_STEP)
+    )
+}
+
+/// The relay's refusal as a short cause (`reason`): no explanation and no
+/// next step, which `message` carries. Its 401 page is written for a bot
+/// that never signed in, so that text never reaches the bot. Never cut
+/// mid-sentence: whole sentences are kept or dropped.
 pub(crate) fn short_reason(r: &str) -> String {
     if is_retired(r) {
-        return format!(
-            "{}: {}",
-            bw_relay::auth::BOT_RETIRED,
-            bw_relay::auth::BOT_RETIRED_MESSAGE
-        );
+        return RETIRED_CAUSE.to_string();
     }
     let l = r.to_ascii_lowercase();
     if l.contains("401")
@@ -238,8 +382,20 @@ pub(crate) fn short_reason(r: &str) -> String {
     {
         return "the relay refused this bot's stored sign-in (HTTP 401)".to_string();
     }
-    // Whole, never cut: a reason cut mid-sentence is worse than a long one.
-    r.lines().next().unwrap_or_default().trim().to_string()
+    let first = r.lines().next().unwrap_or_default().trim();
+    // Advice about signing in again is the message's job, not the cause's.
+    let kept: Vec<String> = sentences(first)
+        .into_iter()
+        .filter(|s| {
+            let l = s.to_ascii_lowercase();
+            !l.contains("login") && !l.contains("sign in again")
+        })
+        .collect();
+    if kept.is_empty() {
+        "the relay refused this bot's stored sign-in".to_string()
+    } else {
+        kept.join(" ").trim_end_matches('.').to_string()
+    }
 }
 
 /// Did the relay say this bot was retired (0.2.14, older Member ID)?
@@ -251,18 +407,34 @@ pub(crate) fn is_retired(reason: &str) -> bool {
 /// A retired bot gets the plain "BotWhisper updated how bots are
 /// identified" wording as the message itself.
 pub(crate) fn signed_out_result(reason: Option<String>) -> CallToolResult {
-    let mut v = json!({ "error": "SIGNED_OUT", "message": SIGNED_OUT_MESSAGE });
-    if let Some(r) = reason.filter(|r| !r.trim().is_empty()) {
-        if is_retired(&r) {
-            v["message"] = json!(format!(
-                "SIGNED_OUT: {}",
-                bw_relay::auth::BOT_RETIRED_MESSAGE
-            ));
-            v["retired"] = json!(true);
-        }
-        v["reason"] = json!(short_reason(&r));
+    CallToolResult::structured_error(signed_out_view(reason.as_deref(), None))
+}
+
+/// `SIGNED_OUT` fields: `message` = explanation + next step (or "waiting
+/// for your person" while a login link is live, with its times), `reason`
+/// = the short cause. The two never repeat a sentence.
+fn signed_out_view(reason: Option<&str>, pending: Option<&Pending>) -> Value {
+    let reason = reason.filter(|r| !r.trim().is_empty());
+    let retired = reason.is_some_and(is_retired);
+    let waiting = pending.map(Pending::waiting);
+    let mut v = json!({
+        "error": "SIGNED_OUT",
+        "message": signed_out_message(retired, waiting.as_deref()),
+    });
+    if retired {
+        v["retired"] = json!(true);
     }
-    CallToolResult::structured_error(v)
+    if let Some(r) = reason {
+        v["reason"] = json!(cause_not_in(
+            &short_reason(r),
+            v["message"].as_str().unwrap_or_default()
+        ));
+    }
+    if let Some(p) = pending {
+        v["login_in_progress"] = json!(true);
+        merge(&mut v, p.times());
+    }
+    v
 }
 
 /// A note from before this login, without its "call `login`" advice (the
@@ -283,7 +455,10 @@ fn not_signed_in(detail: Option<Value>, note: Option<String>) -> CallToolResult 
     let mut v = json!({
         "error": "NOT_SIGNED_IN",
         "message": match (&detail, &note) {
-            (Some(_), _) => "This connector is not signed in yet, but a login is waiting for your person's approval. Send them the link and code in `login` (shown below); the connector keeps checking by itself, so once they approve, just call this tool again. `login_status` is an optional check.".to_string(),
+            (Some(d), _) => format!(
+                "This connector is not signed in yet. {} If you have not sent your person the link and code yet, they are in `login` below; the connector keeps checking by itself, so once they approve, just call this tool again.",
+                d["message"].as_str().unwrap_or_default()
+            ),
             (None, Some(n)) => format!("This connector is not signed in to BotWhisper. {n}"),
             (None, None) => "This connector is not signed in to BotWhisper yet. Call the `login` tool and send your person the link and code it returns; the room tools work as soon as they approve (no polling needed).".to_string(),
         },
@@ -423,7 +598,9 @@ impl Gateway {
         *self.inner.resume_note.lock().expect("lock") = None;
         *self.inner.signed_out.lock().expect("lock") = Some(why.clone());
         self.notify_tools_changed().await;
-        signed_out_result(Some(why))
+        let st = self.inner.login.lock().await;
+        let live = st.pending.as_ref().filter(|p| p.live());
+        CallToolResult::structured_error(signed_out_view(Some(&why), live))
     }
 
     fn connector(&self) -> Option<Connector> {
@@ -536,18 +713,19 @@ impl Gateway {
         let url = &p.start.verification_uri_complete;
         let code = &p.start.user_code;
         let left = minutes_left(p.expires);
-        json!({
+        let mut v = json!({
             "status": status,
             "verification_url": url,
             "user_code": code,
             "expires_in_s": left,
-            "expires_at": p.expires_at,
-            "expires_at_utc": bw_proto::time::iso_utc(p.expires_at),
+            "message": p.waiting(),
             "instruction": format!(
                 "Tell your person: open {url} (code {code}), sign in with your email, check the code matches, and approve this bot. The link expires in {}. Only your person should open it. You do not need to poll: the connector keeps checking by itself, and the room tools work as soon as they approve (`login_status` is an optional check).",
                 expires_in_words(left)
             ),
-        })
+        });
+        merge(&mut v, p.times());
+        v
     }
 
     /// Poll the token endpoint once, if the interval allows; otherwise
@@ -701,6 +879,7 @@ impl Gateway {
             interval: p.start.interval,
             expires_at: p.expires_at,
             bot_name: self.inner.bot_name.clone(),
+            sent_at: Some(p.sent_at),
         };
         if let Err(e) = crate::paths::write_private(
             &self.saved_login_path(),
@@ -776,6 +955,10 @@ impl Gateway {
                 },
                 expires: Instant::now() + Duration::from_secs(left),
                 expires_at: saved.expires_at,
+                // Older files: the relay's 15-minute codes, counted back.
+                sent_at: saved
+                    .sent_at
+                    .unwrap_or_else(|| saved.expires_at.saturating_sub(15 * 60).min(now)),
                 next_poll: Instant::now(),
             });
             st.generation
@@ -889,6 +1072,7 @@ impl Gateway {
             let pending = Pending {
                 expires: Instant::now() + Duration::from_secs(start.expires_in),
                 expires_at: bw_relay::doorbell::now_unix() + start.expires_in,
+                sent_at: bw_relay::doorbell::now_unix(),
                 next_poll: Instant::now() + Duration::from_secs(start.interval),
                 start,
             };
@@ -1019,23 +1203,33 @@ impl Gateway {
             }
         }
         let note = self.inner.resume_note.lock().expect("lock").clone();
-        let pending = self.inner.login.lock().await.pending.is_some();
         let why = self.inner.signed_out.lock().expect("lock").clone();
+        let st = self.inner.login.lock().await;
+        // A link that expired is no longer "in progress": then (and only
+        // then) the next step is a new `login`.
+        let live = st.pending.as_ref().filter(|p| p.live());
         let mut v = json!({
             "signed_in": false,
             "relay": relay,
             "requested_bot_name": self.inner.bot_name,
-            "login_in_progress": pending,
-            "message": note.unwrap_or_else(|| "Not signed in. Call `login` and send your person the link and code; the room tools work as soon as they approve.".into()),
+            "login_in_progress": live.is_some(),
         });
-        if let Some(why) = why {
-            if is_retired(&why) {
-                v["retired"] = json!(true);
-                v["message"] = json!(bw_relay::auth::BOT_RETIRED_MESSAGE);
-            } else {
-                v["message"] = json!(SIGNED_OUT_MESSAGE);
+        if why.is_some() {
+            let so = signed_out_view(why.as_deref(), live);
+            for k in ["message", "reason", "retired"] {
+                if !so[k].is_null() {
+                    v[k] = so[k].clone();
+                }
             }
-            v["reason"] = json!(short_reason(&why));
+        } else {
+            v["message"] = json!(match (live, note) {
+                (Some(p), _) => p.waiting(),
+                (None, Some(n)) => n,
+                (None, None) => "Not signed in. Call `login` and send your person the link and code; the room tools work as soon as they approve.".to_string(),
+            });
+        }
+        if let Some(p) = live {
+            merge(&mut v, p.times());
         }
         respond(Ok(v))
     }
@@ -1165,14 +1359,18 @@ impl Gateway {
                 }
                 let (detail, note) = {
                     let st = self.inner.login.lock().await;
-                    // Revoked, and no new login started yet: one line.
-                    if st.pending.is_none() {
-                        if let Some(why) = self.inner.signed_out.lock().expect("lock").clone() {
-                            return Ok(signed_out_result(Some(why)).into());
+                    let live = st.pending.as_ref().filter(|p| p.live());
+                    // Revoked: say so, then either "waiting for your person"
+                    // (a live link) or the login next step.
+                    if let Some(why) = self.inner.signed_out.lock().expect("lock").clone() {
+                        let mut v = signed_out_view(Some(&why), live);
+                        if let Some(p) = live {
+                            v["login"] = self.pending_view(p, "pending");
                         }
+                        return Ok(CallToolResult::structured_error(v).into());
                     }
                     (
-                        st.pending.as_ref().map(|p| self.pending_view(p, "pending")),
+                        live.map(|p| self.pending_view(p, "pending")),
                         st.last_failure
                             .clone()
                             .or_else(|| self.inner.resume_note.lock().expect("lock").clone()),
@@ -1186,6 +1384,130 @@ impl Gateway {
 
 #[cfg(test)]
 mod tests {
+    /// No sentence of `reason` appears in `message`.
+    fn no_shared_sentence(v: &serde_json::Value) {
+        let m = v["message"].as_str().unwrap();
+        let r = v["reason"].as_str().unwrap();
+        let norm = |s: &str| {
+            s.trim_start_matches("SIGNED_OUT: ")
+                .trim_end_matches(['.', ' '])
+                .to_ascii_lowercase()
+        };
+        let ms: Vec<String> = super::sentences(m).iter().map(|s| norm(s)).collect();
+        for s in super::sentences(r) {
+            let s = norm(&s);
+            assert!(
+                !ms.iter().any(|x| x.contains(&s) || s.contains(x.as_str())),
+                "reason repeats the message: {s:?}\n  message: {m}\n  reason: {r}"
+            );
+        }
+        assert!(!r.contains("login"), "the reason is the cause only: {r}");
+    }
+
+    #[test]
+    fn signed_out_message_and_reason_never_repeat_a_sentence() {
+        for why in [
+            "unknown: HTTP 401 Unauthorized: unauthorized (BOT_RETIRED): BotWhisper updated how bots are identified; this bot needs to sign in once more. Its old rooms will need a new invite. Call the connector's login tool (force=true) and send your person the link and code it returns.",
+            "BOT_RETIRED: BotWhisper updated how bots are identified; this bot needs to sign in once more.",
+            "HTTP 401 Unauthorized: Sign in with your email first",
+            "invalid_grant: the refresh token was revoked. Call `login` (force=true) to sign in again.",
+            "invalid_grant: the refresh token was revoked",
+            "the relay no longer accepts this bot's sign-in",
+        ] {
+            let v = signed_out_view(Some(why), None);
+            no_shared_sentence(&v);
+            let m = v["message"].as_str().unwrap();
+            assert!(m.starts_with("SIGNED_OUT: "), "{m}");
+            assert_eq!(
+                m.matches("login").count(),
+                1,
+                "the next step names login once: {m}"
+            );
+            assert!(m.ends_with(LOGIN_NEXT_STEP), "explanation, then next step: {m}");
+            assert!(!v.to_string().contains(".."), "{v}");
+        }
+        // The plain constant is explanation + next step, unchanged.
+        assert_eq!(signed_out_message(false, None), SIGNED_OUT_MESSAGE);
+        let v = signed_out_view(Some("BOT_RETIRED: x"), None);
+        assert_eq!(v["reason"], RETIRED_CAUSE);
+        assert_eq!(v["retired"], true);
+    }
+
+    #[test]
+    fn a_live_login_link_means_wait_not_login_again() {
+        let now = bw_relay::doorbell::now_unix();
+        let p = Pending {
+            start: DeviceStart {
+                client_id: "c".into(),
+                device_code: "d".into(),
+                user_code: "u".into(),
+                verification_uri: "https://x/device".into(),
+                verification_uri_complete: "https://x/device?c=u".into(),
+                expires_in: 900,
+                interval: 5,
+            },
+            expires: Instant::now() + Duration::from_secs(900),
+            expires_at: now + 900,
+            sent_at: now,
+            next_poll: Instant::now(),
+        };
+        assert!(p.live());
+        for why in [Some("BOT_RETIRED: x"), Some("HTTP 401"), None] {
+            let v = signed_out_view(why, Some(&p));
+            let m = v["message"].as_str().unwrap();
+            assert!(!m.contains("force"), "{m}");
+            assert!(
+                m.contains("Waiting for your person to approve the link sent at ")
+                    && m.ends_with("Don't call login again unless it has expired."),
+                "{m}"
+            );
+            assert!(m.contains(&bw_proto::time::iso_utc(now)), "{m}");
+            assert!(m.contains(&bw_proto::time::iso_utc(now + 900)), "{m}");
+            assert!(m.contains(&local_time(now)), "{m}");
+            assert_eq!(v["sent_at"], now);
+            assert_eq!(v["expires_at"], now + 900);
+            assert_eq!(v["sent_at_utc"], bw_proto::time::iso_utc(now));
+            assert_eq!(v["expires_at_utc"], bw_proto::time::iso_utc(now + 900));
+            assert_eq!(v["login_in_progress"], true);
+            if why.is_some() {
+                no_shared_sentence(&v);
+            }
+        }
+        let expired = Pending {
+            expires: Instant::now() - Duration::from_secs(1),
+            ..p
+        };
+        assert!(!expired.live());
+    }
+
+    #[test]
+    fn the_startup_line_names_login_once() {
+        for why in [
+            "BOT_RETIRED: BotWhisper updated how bots are identified; this bot needs to sign in once more. Call the connector's login tool (force=true) and send your person the link and code it returns.",
+            "HTTP 401 Unauthorized",
+            "invalid_grant: revoked. Call `login` (force=true) to sign in again.",
+        ] {
+            let l = startup_signed_out_line(why, false);
+            assert_eq!(l.matches("login").count(), 1, "{l}");
+            assert!(l.contains("(force=true)") && !l.contains(".."), "{l}");
+            let l = startup_signed_out_line(why, true);
+            assert!(!l.contains("force") && !l.contains("Call"), "{l}");
+            let shown = super::super::relay::SignedOut(why.into()).to_string();
+            assert_eq!(shown.matches("login").count(), 1, "{shown}");
+        }
+    }
+
+    #[test]
+    fn local_time_names_its_offset() {
+        let l = local_time(1_793_212_620);
+        assert!(
+            l.starts_with("2026-") && l.contains(" (UTC") && l.ends_with(')'),
+            "{l}"
+        );
+        let m = waiting_message(1_793_212_620, 1_793_213_520);
+        assert!(m.contains(&bw_proto::time::iso_utc(1_793_213_520)), "{m}");
+    }
+
     #[test]
     fn expiry_in_words_comes_from_the_value() {
         assert_eq!(super::expires_in_words(900), "15 minutes");
@@ -1210,6 +1532,7 @@ mod tests {
             interval: 5,
             expires_at: bw_relay::doorbell::now_unix() + 600,
             bot_name: bot_name.map(str::to_string),
+            sent_at: None,
         })
         .unwrap()
     }

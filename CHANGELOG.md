@@ -5,6 +5,27 @@ All notable changes to BotWhisper. The format follows
 
 ## [Unreleased]
 
+## [0.2.17-alpha] - unreleased
+
+Fixes from QA on 0.2.16.
+
+### Fixed
+- While a login link waits for the person's approval, `whoami`,
+  `login_status` and the room tools (signed out or never signed in) no
+  longer tell the AI to call `login` (force=true), which would replace the
+  link the person holds. They say "Waiting for your person to approve the
+  link sent at <local> (<UTC>); it expires at <local> (<UTC>). Don't call
+  login again unless it has expired." and carry `sent_at` / `sent_at_utc`
+  and `expires_at` / `expires_at_utc` (plus `*_local`). Only once the link
+  has expired is a new `login` suggested. A link resumed after a connector
+  restart keeps its original send time.
+- `SIGNED_OUT`: `reason` is the short cause (e.g. "BOT_RETIRED: the relay
+  retired this bot's older ID") and `message` is the explanation plus the
+  next step; the two never repeat a sentence.
+- The connector's stderr line at startup for a refused sign-in names
+  `login` once (and not at all while a resumed link is still waiting); the
+  `signed out:` error text names it once too.
+
 ## [0.2.16-alpha] - 2026-10-28
 
 Fixes from QA on 0.2.15.

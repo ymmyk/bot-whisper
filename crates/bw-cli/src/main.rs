@@ -469,6 +469,17 @@ async fn connect(args: ConnectArgs) -> anyhow::Result<()> {
                                 // it signed out or as that bot.
                                 eprintln!("botwhisper connect: not starting: {w}");
                                 std::process::exit(4);
+                            } else if let Some(so) = botwhisper::connect::relay::signed_out(&e) {
+                                // One line, one mention of `login` (none
+                                // while a link already waits for approval).
+                                let why = so.0.clone();
+                                let waiting = gateway.resume_pending_login().await;
+                                tracing::warn!(
+                                    "{}",
+                                    botwhisper::connect::gateway::startup_signed_out_line(
+                                        &why, waiting
+                                    )
+                                );
                             } else {
                                 tracing::warn!(
                                     "botwhisper connect: the stored sign-in is not usable ({e}); the `login` tool starts a new one"

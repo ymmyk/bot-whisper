@@ -746,6 +746,129 @@ async fn a_retired_bot_is_told_why_everywhere_and_signs_in_again() {
         .expect("no hang");
 }
 
+/// A live login link: wait for the person, never "login (force=true)",
+/// with when the link was sent and when it expires (unix and UTC).
+fn check_waiting(v: &Value, tool: &str, login: &Value) {
+    let all = v.to_string();
+    assert!(!all.contains("force"), "{tool}: {all}");
+    let m = v["message"].as_str().unwrap_or_default();
+    assert!(
+        m.contains("Waiting for your person to approve the link sent at ")
+            && m.contains("Don't call login again unless it has expired."),
+        "{tool}: {v}"
+    );
+    let sent = v["sent_at"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("{tool}: {v}"));
+    let exp = v["expires_at"].as_u64().unwrap();
+    assert_eq!(exp, login["expires_at"].as_u64().unwrap(), "{tool}");
+    assert_eq!(sent, login["sent_at"].as_u64().unwrap(), "{tool}");
+    assert_eq!(v["sent_at_utc"], bw_proto::time::iso_utc(sent), "{tool}");
+    assert_eq!(v["expires_at_utc"], bw_proto::time::iso_utc(exp), "{tool}");
+    assert!(m.contains(&bw_proto::time::iso_utc(sent)), "{tool}: {m}");
+    assert!(m.contains(&bw_proto::time::iso_utc(exp)), "{tool}: {m}");
+    if tool == "whoami" {
+        assert_eq!(v["login_in_progress"], true, "{v}");
+    }
+    if let Some(r) = v["reason"].as_str() {
+        assert!(!m.contains(r) && !r.contains("login"), "{tool}: {m} / {r}");
+    }
+    assert!(!all.contains(".."), "{tool}: {all}");
+}
+
+/// QA 0.2.16: while a login link waits for approval, whoami, login_status
+/// and the room tools say "waiting" (with sent/expiry times), never "call
+/// login (force=true)"; also after a restart that resumed the link. Once it
+/// expires, the next step is `login` again.
+#[tokio::test]
+async fn a_pending_login_says_wait_until_it_expires() {
+    tokio::time::timeout(Duration::from_secs(180), pending_inner())
+        .await
+        .expect("no hang");
+}
+
+async fn pending_inner() {
+    let relay = TestRelay::start_with(cfg()).await;
+    let base = relay.base();
+    let (access, refresh) = legacy_bot(&relay.db, "acct1", "c1", "Atlas");
+    let config = tmp_dir("pending-wait");
+    let store = BotStore::new(&config, &base, "acct1:c1");
+    store
+        .save_tokens(&botwhisper::connect::store::Tokens {
+            access_token: access,
+            refresh_token: Some(refresh),
+            expires_at: bw_relay::doorbell::now_unix() + 3600,
+            client_id: Some("c1".into()),
+        })
+        .unwrap();
+    store.save_bot_name("Atlas").unwrap();
+    store.set_current().unwrap();
+    // Retirement on, and short-lived login codes.
+    let (c, db) = relay.shutdown().await;
+    let mut on = (*c).clone();
+    on.retire_legacy_ids = true;
+    // Room tools hold up to 12 s for approval while a link is live.
+    on.device_code_ttl = Duration::from_secs(40);
+    let relay = TestRelay::start_on(Arc::new(on), db).await;
+
+    let gw = Gateway::new(&base, config.clone(), None, None);
+    assert!(gw.resume().await.is_err());
+    let (svc, _) = serve(gw).await;
+    let r = raw(&svc, "list_rooms", json!({})).await;
+    let v = r.structured_content.unwrap();
+    assert_eq!(v["error"], "SIGNED_OUT", "{v}");
+    assert!(
+        v["message"].as_str().unwrap().contains("(force=true)"),
+        "{v}"
+    );
+
+    let l = call(&svc, "login", json!({})).await;
+    assert_eq!(l["status"], "pending", "{l}");
+    let sent = l["sent_at"].as_u64().unwrap();
+    let now = bw_relay::doorbell::now_unix();
+    assert!(sent <= now && sent + 2 >= now, "{l}");
+    assert_eq!(l["expires_at"].as_u64().unwrap(), sent + 40, "{l}");
+    assert_eq!(l["sent_at_utc"], bw_proto::time::iso_utc(sent));
+    for tool in ["whoami", "login_status", "status"] {
+        let r = raw(&svc, tool, json!({ "title": "x", "wait_s": 0 })).await;
+        check_waiting(&r.structured_content.unwrap(), tool, &l);
+    }
+    svc.cancel().await.ok();
+
+    // A restarted connector picks the same link back up: still "waiting".
+    let gw = Gateway::new(&base, config.clone(), None, None);
+    assert!(gw.resume().await.is_err());
+    assert!(gw.resume_pending_login().await, "the live link resumes");
+    let line = botwhisper::connect::gateway::startup_signed_out_line("BOT_RETIRED: x", true);
+    assert!(!line.contains("force"), "{line}");
+    let (svc, _) = serve(gw).await;
+    for tool in ["list_rooms", "whoami", "login_status"] {
+        let r = raw(&svc, tool, json!({ "wait_s": 0 })).await;
+        check_waiting(&r.structured_content.unwrap(), tool, &l);
+    }
+
+    // Expired: now (and only now) the next step is `login` again.
+    let left = l["expires_at"].as_u64().unwrap() + 1;
+    while bw_relay::doorbell::now_unix() <= left {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    let who = call(&svc, "whoami", json!({})).await;
+    assert_eq!(who["login_in_progress"], false, "{who}");
+    assert!(
+        who["message"].as_str().unwrap().contains("(force=true)"),
+        "{who}"
+    );
+    assert!(who.get("sent_at").is_none(), "{who}");
+    let r = raw(&svc, "list_rooms", json!({})).await;
+    let v = r.structured_content.unwrap();
+    assert_eq!(v["error"], "SIGNED_OUT", "{v}");
+    let m = v["message"].as_str().unwrap();
+    assert!(m.contains("(force=true)") && !m.contains("Waiting"), "{v}");
+    svc.cancel().await.ok();
+    relay.shutdown().await;
+    let _ = std::fs::remove_dir_all(&config);
+}
+
 async fn retired_inner() {
     const WHY: &str = "BotWhisper updated how bots are identified; this bot needs to sign in once more. Its old rooms will need a new invite.";
     let relay = TestRelay::start_with(cfg()).await;
@@ -785,15 +908,13 @@ async fn retired_inner() {
             m.contains(WHY),
             "{tool}: the explanation is the message: {m}"
         );
+        assert!(m.contains("Call `login` (force=true)"), "{tool}: {m}");
         let r = v["reason"].as_str().unwrap();
         assert!(
-            r.starts_with("BOT_RETIRED: ") && r.contains(WHY),
-            "{tool}: {r}"
+            r.starts_with("BOT_RETIRED: ") && !r.contains(WHY) && !r.contains("login"),
+            "{tool}: the reason is the short cause: {r}"
         );
-        assert!(
-            r.ends_with("send your person the link and code it returns."),
-            "{tool}: whole, not cut: {r}"
-        );
+        assert!(!m.contains(r), "{tool}: no repeat: {m} / {r}");
         let all = v.to_string();
         assert!(
             !all.contains("UNREACHABLE") && !all.contains("Transport"),
@@ -809,7 +930,8 @@ async fn retired_inner() {
     let who = call(&svc, "whoami", json!({})).await;
     assert_eq!(who["signed_in"], false, "{who}");
     assert_eq!(who["retired"], true, "{who}");
-    assert!(who["message"].as_str().unwrap().starts_with(WHY), "{who}");
+    assert!(who["message"].as_str().unwrap().contains(WHY), "{who}");
+    assert_eq!(who["login_in_progress"], false, "{who}");
     assert!(!who.to_string().contains(".."), "{who}");
 
     // login (not forced) in the same process: no CONNECTOR_BUSY, the note,
@@ -830,6 +952,12 @@ async fn retired_inner() {
         "{l}"
     );
     assert!(!l.to_string().contains(".."), "{l}");
+    // While that link is live, nothing says "login again".
+    for tool in ["whoami", "login_status", "list_rooms"] {
+        let r = raw(&svc, tool, json!({ "wait_s": 0 })).await;
+        let v = r.structured_content.unwrap();
+        check_waiting(&v, tool, &l);
+    }
     svc.cancel().await.ok();
 
     // A restarted connector on the same home: the same story, from startup.
