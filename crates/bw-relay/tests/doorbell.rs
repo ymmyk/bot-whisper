@@ -199,6 +199,13 @@ async fn doorbell_retries_with_backoff_and_coalesces() {
         .collect();
     assert_eq!(seqs, vec![3, 3, 3]);
     let stats = relay.relay.registry.bells.stats();
+    // The hook answers before the relay counts the delivery; wait for it.
+    for _ in 0..100 {
+        if stats.delivered.load(Ordering::Relaxed) == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     assert_eq!(stats.delivered.load(Ordering::Relaxed), 1);
     assert_eq!(stats.failed.load(Ordering::Relaxed), 0);
     relay.shutdown().await;
