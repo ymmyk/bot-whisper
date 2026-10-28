@@ -53,6 +53,12 @@ async fn a_reusable_link_seats_several_bots_until_max_uses() {
     assert_eq!(inv["state"], "active");
     let url = inv["invite_url"].as_str().unwrap().to_string();
     let secret = secret_of(&url);
+    // Expiry in both forms, like messages and rooms.
+    let exp = inv["expires_at"].as_u64().unwrap();
+    assert_eq!(
+        inv["expires_at_utc"].as_str().unwrap(),
+        bw_relay::config::iso_utc(exp)
+    );
 
     // Each joiner brings its own name.
     let jb = b
@@ -191,6 +197,15 @@ async fn require_approval_waits_until_a_member_lets_the_bot_in() {
         .await;
     assert_eq!(w["state"], "awaiting_approval");
     assert_eq!(w["message"], "waiting for a member to let you in");
+    // How long the request stays open: until the invite (7d) or the room
+    // (7d) expires, whichever is first; and the room's size and expiry.
+    assert_eq!(w["request_expires_at"], inv["expires_at"], "{w}");
+    assert_eq!(w["request_expires_at_utc"], inv["expires_at_utc"]);
+    assert_eq!(w["max_members"], 50);
+    assert!(
+        w["room_expires_at_utc"].as_str().unwrap().ends_with('Z'),
+        "{w}"
+    );
     let req = w["request_id"].as_str().unwrap().to_string();
     let w2 = b.ok("join_room", json!({ "invite_url": url })).await;
     assert_eq!(w2["request_id"], req.as_str());
@@ -387,4 +402,60 @@ async fn fifty_members_fan_out_through_one_link() {
         "PERF relay: 49 joins + confirm in {joined:?}; one message to 49 members fetched in {fanout:?}"
     );
     assert!(fanout < Duration::from_secs(20), "fan-out took {fanout:?}");
+}
+
+#[tokio::test]
+async fn join_room_says_the_room_size_and_expiry() {
+    let relay = TestRelay::start().await;
+    let a = relay.bot(TOKENS[0]).await;
+    let b = relay.bot(TOKENS[1]).await;
+    let created = a
+        .ok(
+            "create_room",
+            json!({ "max_members": 12, "expires": "30d" }),
+        )
+        .await;
+    let room = created["room_id"].as_str().unwrap().to_string();
+    let inv = a.ok("create_invite", json!({ "room_id": room })).await;
+    let list = a.ok("list_invites", json!({ "room_id": room })).await;
+    assert_eq!(list["invites"][0]["expires_at_utc"], inv["expires_at_utc"]);
+    let j = b
+        .ok("join_room", json!({ "invite_url": inv["invite_url"] }))
+        .await;
+    assert_eq!(j["max_members"], 12, "{j}");
+    assert_eq!(j["room_expires_at"], created["room_expires_at"]);
+    assert_eq!(j["room_expires_at_utc"], created["room_expires_at_utc"]);
+    relay.shutdown().await;
+}
+
+#[tokio::test]
+async fn create_room_schema_states_the_configured_room_limit() {
+    for (cfg_max, want) in [(None, 50u32), (Some(20u32), 20)] {
+        let mut cfg = test_config();
+        if let Some(m) = cfg_max {
+            cfg.max_members = m;
+        }
+        let relay = TestRelay::start_with(cfg).await;
+        let a = relay.bot(TOKENS[0]).await;
+        let tools = a.svc.list_all_tools().await.unwrap();
+        let t = tools.iter().find(|t| t.name == "create_room").unwrap();
+        let schema = serde_json::to_value(&*t.input_schema).unwrap();
+        let d = schema["properties"]["max_members"]["description"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            d.contains(&format!("2..={want}")) && d.contains(&format!("Default {want}")),
+            "{d}"
+        );
+        assert!(!d.contains("2..=8"), "{d}");
+        if cfg_max.is_some() {
+            assert_eq!(
+                a.err("create_room", json!({ "max_members": want + 1 }))
+                    .await,
+                "INVALID_ARGUMENT"
+            );
+        }
+        relay.shutdown().await;
+    }
 }

@@ -272,6 +272,30 @@ async fn two_connectors_inner() {
     assert_eq!(joined["joined"], true, "{joined}");
     assert_eq!(joined["epoch"], 1);
     assert_eq!(waited["added_members"], json!(["m2"]));
+    // Like create_room: the room's size and expiry.
+    assert_eq!(joined["max_members"], created["max_members"], "{joined}");
+    assert_eq!(
+        joined["room_expires_at_utc"],
+        created["room_expires_at_utc"]
+    );
+    assert!(joined["room_expires_at_utc"].is_string());
+    // Single-use: one join. Reusable: keep waiting, one event per joiner.
+    assert_eq!(
+        inv["expires_at_utc"].as_str().map(|s| s.ends_with('Z')),
+        Some(true)
+    );
+    assert!(!inv["note"].as_str().unwrap().contains("keep calling"));
+    let reusable = call(
+        &alice,
+        "create_invite",
+        json!({ "room_id": room, "reusable": true }),
+    )
+    .await;
+    let note = reusable["note"].as_str().unwrap();
+    assert!(
+        note.contains("keep calling wait_for_message") && note.contains("member_joined"),
+        "{note}"
+    );
 
     // Messages both ways; the title reached Bob inside the ciphertext.
     let secret = "SECRET-e2e-plaintext-3c9a";

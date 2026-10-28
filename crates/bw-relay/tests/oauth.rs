@@ -1156,3 +1156,92 @@ async fn bot_signin_never_accepts_a_link() {
         .is_none());
     relay.shutdown().await;
 }
+
+/// No text the bot or its person sees carries the Account ID, or a
+/// recognisable prefix of it, inside a new bot's Member ID.
+fn assert_no_account(what: &str, text: &str, account: &str) {
+    assert!(!text.contains(account), "{what} contains the Account ID");
+    for n in 6..account.len() {
+        assert!(
+            !text.contains(&account[..n]),
+            "{what} contains a {n}-char prefix of the Account ID"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_new_bots_member_id_never_carries_the_account_id() {
+    let relay = TestRelay::start().await;
+    let base = relay.base();
+    // Owner on one account, the new bot on another.
+    let owner_http = client();
+    let owner_client = register(&owner_http, &base).await;
+    let o = sign_in(&relay, &owner_http, &owner_client, "owner@example.com").await;
+    let http = client();
+    let client_id = register(&http, &base).await;
+    let b = sign_in(&relay, &http, &client_id, "joiner@example.com").await;
+    let account = relay
+        .db
+        .account_by_email("joiner@example.com")
+        .unwrap()
+        .unwrap()
+        .id;
+    let bots = relay.db.account_bots(&account).unwrap();
+    assert_eq!(bots.len(), 1);
+    let member_id = bots[0].agent_id.clone();
+    assert_eq!(member_id, bots[0].id, "new bots: Member ID is the bot id");
+    assert!(member_id.starts_with("bot_"), "{member_id}");
+    assert_no_account("Member ID", &member_id, &account);
+
+    let owner = relay.bot(o["access_token"].as_str().unwrap()).await;
+    let bot = relay.bot(b["access_token"].as_str().unwrap()).await;
+    let room = owner.ok("create_room", json!({})).await;
+    let room_id = room["room_id"].as_str().unwrap().to_string();
+    let inv = owner
+        .ok(
+            "create_invite",
+            json!({ "room_id": room_id, "reusable": true }),
+        )
+        .await;
+    let joined = bot
+        .ok("join_room", json!({ "invite_url": inv["invite_url"] }))
+        .await;
+    // join_room's members list the bot under its Member ID.
+    assert!(
+        joined["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["agent_id"] == member_id.as_str()),
+        "{joined}"
+    );
+    assert_no_account("join_room", &joined.to_string(), &account);
+    let rooms = bot.ok("list_rooms", json!({})).await;
+    assert_no_account("list_rooms", &rooms.to_string(), &account);
+    let status = owner.ok("get_status", json!({ "room_id": room_id })).await;
+    assert_no_account("owner's get_status", &status.to_string(), &account);
+    // The owner's member_joined event.
+    let fetched = owner.wait(&room_id, 1).await;
+    assert!(fetched.to_string().contains("member_joined"), "{fetched}");
+    assert_no_account("events", &fetched.to_string(), &account);
+    // /account shows the Member ID (and the Account ID only under Support).
+    let page = http
+        .get(format!("{base}/account"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(page.contains(&member_id), "Member ID shown");
+    let bots_section = page
+        .split(r#"<h2 id="bots">"#)
+        .nth(1)
+        .unwrap()
+        .split("</section>")
+        .next()
+        .unwrap();
+    assert!(bots_section.contains(&member_id));
+    assert_no_account("/account bot card", bots_section, &account);
+    relay.shutdown().await;
+}

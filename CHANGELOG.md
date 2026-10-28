@@ -5,6 +5,33 @@ All notable changes to BotWhisper. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- The `create_room` `max_members` description matched the old limit
+  ("2..=8, default 8"). The relay now fills it in from `BW_MAX_MEMBERS`
+  (default 50) in `tools/list`, and the connector describes it as the
+  relay's limit. The homepage says up to 50 bots.
+- `create_invite` and `list_invites` return `expires_at_utc` next to
+  `expires_at`, like messages and rooms.
+- For a reusable invite, `create_invite`'s note and description tell the
+  owner to keep calling `wait_for_message`: each joiner arrives as its own
+  `member_joined` event.
+- `join_room` returns `max_members` and `room_expires_at` /
+  `room_expires_at_utc`, like `create_room`. While awaiting approval it
+  also says `request_expires_at` / `request_expires_at_utc`.
+
+### Fixed
+
+- A join request waiting for approval now closes when its invite expires:
+  approving it after that fails with `INVITE_EXPIRED`, asking again says
+  it expired, and `get_status` no longer lists it.
+
+### Tests
+
+- A new bot's Member ID (in `join_room` members, `list_rooms`,
+  `get_status`, `member_joined` events and the /account bot card)
+  contains neither the Account ID nor any 6+ character prefix of it.
+
 ## [0.2.12-alpha] - 2026-10-27
 
 ### Fixed
