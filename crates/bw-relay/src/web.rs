@@ -340,7 +340,7 @@ fn signed_in_banner(st: &OauthState) -> String {
 // ----- account -----
 
 /// `bw-3dd31e…59c1`: recognisable, not usable.
-fn mask_topic(t: &str) -> String {
+pub(crate) fn mask_topic(t: &str) -> String {
     let c: Vec<char> = t.chars().collect();
     if c.len() <= 12 {
         return "…".into();
@@ -579,6 +579,23 @@ fn account_confirm(title: &str, body: &str) -> axum::response::Html<String> {
     )
 }
 
+/// The app every connected bot uses, when there are two or more and they
+/// all use the same one.
+fn shared_client(clients: &[Option<String>]) -> Option<String> {
+    let live: Vec<&String> = clients.iter().flatten().collect();
+    match live.first() {
+        Some(first) if live.len() > 1 && live.iter().all(|n| n == first) => Some((*first).clone()),
+        _ => None,
+    }
+}
+
+/// Add a wake-up sentence unless the card already says exactly that.
+fn push_once(out: &mut String, sentence: &str) {
+    if !out.contains(sentence) {
+        out.push_str(sentence);
+    }
+}
+
 fn account_html(st: &OauthState, acct: &AccountRow, csrf: &str, banner: &str) -> String {
     let now = now_unix();
     let db = &st.db;
@@ -592,6 +609,25 @@ fn account_html(st: &OauthState, acct: &AccountRow, csrf: &str, banner: &str) ->
     let mut bots = String::new();
     let mut danger_rows = String::new();
     let mut any_waiting = false;
+    // An app every connected bot uses is named once above the cards, not
+    // repeated on each one.
+    let clients: Vec<Option<String>> = all_bots
+        .iter()
+        .map(|b| {
+            match (
+                bot_status(db, b, now),
+                db.bot_live_client(&b.id, now).ok().flatten(),
+            ) {
+                (BotStatus::Connected, Some((_, n))) => {
+                    Some(n.unwrap_or_else(|| "an MCP client".into()))
+                }
+                _ => None,
+            }
+        })
+        .collect();
+    let shared_client = shared_client(&clients);
+    // "Ask your AI to turn on wake-ups" once, on the first card that is off.
+    let mut off_said = false;
     for b in &all_bots {
         let my_seats: Vec<&AccountSeat> = bot_seats(b, &seats).collect();
         let status = bot_status(db, b, now);
@@ -603,6 +639,7 @@ fn account_html(st: &OauthState, acct: &AccountRow, csrf: &str, banner: &str) ->
                 any_waiting = true;
                 "Approved. Your AI should finish connecting in a few seconds; this page refreshes by itself.".to_string()
             }
+            (BotStatus::Connected, Some(_)) if shared_client.is_some() => "Connected.".to_string(),
             (BotStatus::Connected, Some((_, n))) => {
                 format!("Using {}.", esc(n.as_deref().unwrap_or("an MCP client")))
             }
@@ -626,7 +663,7 @@ fn account_html(st: &OauthState, acct: &AccountRow, csrf: &str, banner: &str) ->
         if let Ok(Some((cfg, bell))) = db.bot_doorbell(&b.agent_id) {
             // Made at sign-in and never set up on purpose: not "on".
             if !cfg.is_automatic() {
-                sentences.push_str(&doorbell_sentence("all rooms", &cfg, &bell));
+                push_once(&mut sentences, &doorbell_sentence("all rooms", &cfg, &bell));
                 setup.push_str(&doorbell_setup(st, "All rooms", &cfg));
             }
         }
@@ -637,7 +674,7 @@ fn account_html(st: &OauthState, acct: &AccountRow, csrf: &str, banner: &str) ->
                     continue;
                 }
                 let scope = format!("room {}", short(&s.room_id));
-                sentences.push_str(&doorbell_sentence(&scope, &cfg, &bell));
+                push_once(&mut sentences, &doorbell_sentence(&scope, &cfg, &bell));
                 setup.push_str(&doorbell_setup(
                     st,
                     &format!("Room {}", short(&s.room_id)),
@@ -646,7 +683,15 @@ fn account_html(st: &OauthState, acct: &AccountRow, csrf: &str, banner: &str) ->
             }
         }
         let wake = if sentences.is_empty() {
-            r#"<div class="wake"><span class="pill off">Off</span><div><p><strong>Wake-ups are off.</strong> Ask your AI to turn on wake-ups.</p></div></div>"#.to_string()
+            let ask = if off_said {
+                ""
+            } else {
+                " Ask your AI to turn on wake-ups."
+            };
+            off_said = true;
+            format!(
+                r#"<div class="wake"><span class="pill off">Off</span><div><p><strong>Wake-ups are off.</strong>{ask}</p></div></div>"#
+            )
         } else {
             let setup = if setup.is_empty() {
                 String::new()
@@ -694,13 +739,18 @@ fn account_html(st: &OauthState, acct: &AccountRow, csrf: &str, banner: &str) ->
         bots.push_str(&format!(
             r#"<article class="card bot" aria-labelledby="bot-{id}"><div class="body">
 <div class="bot-head"><span class="avatar" aria-hidden="true">{initial}</span><div class="bot-title"><h3 id="bot-{id}">{name}</h3><p class="meta">{detail} Added {created}.</p></div>{seen}</div>
-<dl class="kv"><dt>Member ID</dt><dd>{member}</dd><dt>Wake-ups</dt><dd>{wake}</dd><dt>Rooms</dt><dd>{rooms_dd}</dd></dl>{reconnect}
+<dl class="kv"><dt>Member ID</dt><dd>{member}{legacy}</dd><dt>Wake-ups</dt><dd>{wake}</dd><dt>Rooms</dt><dd>{rooms_dd}</dd></dl>{reconnect}
 </div><div class="foot"><details class="manage"><summary>Manage {name}</summary><div class="manage-body"><form class="rename" method="post" action="/account/bots/rename">{csrf_input}<input type="hidden" name="bot_id" value="{id}"><label for="name-{id}" class="sr-only">Name for {name}</label><input id="name-{id}" name="name" type="text" maxlength="60" value="{name}"><button type="submit" class="small">Rename</button></form>{disconnect}</div></details></div></article>
 "#,
             initial = esc(&initial(&b.name)),
             seen = seen_html(&status, b.last_used_at, now),
             created = time_html(b.created_at),
             member = id_chip(&b.agent_id, &format!("Member ID for {}", b.name)),
+            legacy = if crate::auth::legacy_member_id_note(&b.agent_id).is_some() {
+                r#"<p class="meta legacy-id">Older ID format: this bot was first connected before 0.2.11, so its ID starts with your Account ID. It keeps it when it reconnects (its rooms and encryption keys depend on it). A new bot sign-in gets the new format.</p>"#
+            } else {
+                ""
+            },
         ));
         let leaves = match my_seats.len() {
             0 => "It is not in any room; deleting it ends its connection.".to_string(),
@@ -848,11 +898,18 @@ fn account_html(st: &OauthState, acct: &AccountRow, csrf: &str, banner: &str) ->
         },
     );
 
+    let shared_line = match &shared_client {
+        Some(n) => format!(
+            r#"<p class="meta shared-client">Your connected bots all use {}.</p>"#,
+            esc(n)
+        ),
+        None => String::new(),
+    };
     format!(
         r##"{top}<div class="wrap">{rail}<main id="main">
 {banner}<div class="page-head"><h1>Your account</h1><p class="meta">Signed in as <strong>{email}</strong> · account created {created}</p></div>
 <section class="sec" aria-labelledby="bots"><div class="sec-head"><div><h2 id="bots">Your bots</h2><p class="lead">Each bot is its own member in rooms, with one live connection at a time. A bot's Member ID is its identity in every room it joins: share it to show someone which bot is yours. Not a password.</p></div><a class="btn primary" href="#add-bot">Add a bot</a></div>
-<div class="stack" data-autorefresh>{bots}</div>
+{shared_line}<div class="stack" data-autorefresh>{bots}</div>
 {wakeups_help}</section>
 {add_bot}
 {rooms_section}
@@ -997,6 +1054,8 @@ details.help p{color:var(--muted);font-size:.9rem;margin-top:8px}
 button,.btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;font:inherit;font-size:.9rem;font-weight:600;line-height:1.2;padding:9px 16px;border-radius:9px;border:1px solid var(--border-strong);background:var(--surface);color:var(--text);cursor:pointer;text-decoration:none;white-space:nowrap}
 button:hover,.btn:hover{background:var(--surface-2);color:var(--text);border-color:var(--muted)}
 button.small{padding:6px 12px;font-size:.85rem}
+/* Desktop: every button at least 40px tall (44px on touch screens, below). */
+button,.btn,button.small,button.copy{min-height:40px}
 button.primary,.btn.primary{background:var(--accent);border-color:transparent;color:var(--accent-ink)}
 button.primary:hover,.btn.primary:hover{background:var(--accent-hover);color:var(--accent-ink)}
 button.danger{background:var(--surface);border-color:var(--danger-border);color:var(--danger)}
@@ -1440,5 +1499,36 @@ mod tests {
         assert_eq!(fmt_utc(0), "1970-01-01 00:00 UTC");
         assert_eq!(fmt_utc(1_792_693_800), "2026-10-22 18:30 UTC");
         assert_eq!(fmt_utc(951_782_400), "2000-02-29 00:00 UTC");
+    }
+}
+
+#[cfg(test)]
+mod account_card_tests {
+    use super::{push_once, shared_client};
+
+    #[test]
+    fn a_shared_app_is_named_once() {
+        let c = "botwhisper connect (this computer)".to_string();
+        assert_eq!(
+            shared_client(&[Some(c.clone()), None, Some(c.clone())]),
+            Some(c.clone())
+        );
+        // One bot, or bots on different apps: each card names its own.
+        assert_eq!(shared_client(&[Some(c.clone()), None]), None);
+        assert_eq!(shared_client(&[Some(c), Some("Claude".into())]), None);
+    }
+
+    #[test]
+    fn identical_wakeup_sentences_appear_once() {
+        let mut out = String::new();
+        push_once(&mut out, "<p>Wake-ups are on.</p>");
+        push_once(&mut out, "<p>Wake-ups are on.</p>");
+        assert_eq!(out.matches("Wake-ups are on.").count(), 1);
+    }
+    #[test]
+    fn desktop_buttons_are_at_least_40px_tall() {
+        assert!(
+            super::ACCOUNT_CSS.contains("button,.btn,button.small,button.copy{min-height:40px}")
+        );
     }
 }

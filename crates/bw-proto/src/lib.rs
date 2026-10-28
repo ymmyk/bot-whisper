@@ -12,6 +12,7 @@
 //! reads them on the bot's machine).
 
 pub mod error;
+pub mod time;
 pub mod turn;
 
 /// Protocol version carried in doorbell payloads (`v`).

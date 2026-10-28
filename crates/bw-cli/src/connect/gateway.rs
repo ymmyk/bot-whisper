@@ -214,15 +214,45 @@ pub struct LoginStatusArgs {
 }
 
 /// The one line a bot sees once the relay revoked its sign-in.
-pub const SIGNED_OUT_MESSAGE: &str = "SIGNED_OUT: this bot's sign-in was revoked; call `login` (force=true) and send your person the new link.";
+pub const SIGNED_OUT_MESSAGE: &str = "SIGNED_OUT: the relay no longer accepts this bot's sign-in (revoked, the bot was deleted on /account, or it expired). Call `login` (force=true): it returns a link and a short code. Send both to your person, who opens the link, signs in and approves this bot; the room tools work again as soon as they do.";
 
-/// `SIGNED_OUT`: one plain line; the relay's own words go in `reason`.
+/// The relay's refusal in one short line. Its 401 page is written for a
+/// first sign-in (an emailed code to type), which is not what a signed-out
+/// connector does, so that text never reaches the bot.
+pub(crate) fn short_reason(r: &str) -> String {
+    let l = r.to_ascii_lowercase();
+    if l.contains("401")
+        || l.contains("unauthorized")
+        || l.contains("email")
+        || l.contains("account_required")
+    {
+        return "the relay refused this bot's stored sign-in (HTTP 401)".to_string();
+    }
+    let line = r.lines().next().unwrap_or_default().trim();
+    line.chars().take(200).collect()
+}
+
+/// `SIGNED_OUT`: one plain line; the relay's reason, shortened, in `reason`.
 pub(crate) fn signed_out_result(reason: Option<String>) -> CallToolResult {
     let mut v = json!({ "error": "SIGNED_OUT", "message": SIGNED_OUT_MESSAGE });
     if let Some(r) = reason.filter(|r| !r.trim().is_empty()) {
-        v["reason"] = json!(r);
+        v["reason"] = json!(short_reason(&r));
     }
     CallToolResult::structured_error(v)
+}
+
+/// A note from before this login, without its "call `login`" advice (the
+/// response it rides on is the new login). `None` when nothing is left.
+pub(crate) fn note_for_fresh_login(note: &str) -> Option<String> {
+    let kept: Vec<&str> = note
+        .split_inclusive(". ")
+        .filter(|s| !s.contains("`login`"))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    let s = kept.join(" ");
+    let s = s.trim().trim_end_matches('.').trim().to_string();
+    (!s.is_empty()).then(|| format!("{s}; this is a new link."))
 }
 
 fn not_signed_in(detail: Option<Value>, note: Option<String>) -> CallToolResult {
@@ -816,7 +846,9 @@ impl Gateway {
         self.background_poll(generation.0);
         let mut view = generation.1;
         if let Some(n) = self.inner.resume_note.lock().expect("lock").take() {
-            view["note"] = json!(n);
+            if let Some(n) = note_for_fresh_login(&n) {
+                view["note"] = json!(n);
+            }
         }
         respond(Ok(view))
     }
@@ -899,12 +931,19 @@ impl Gateway {
         let relay = &self.inner.relay;
         if let Some(c) = self.connector() {
             return respond(Ok(match c.whoami().await {
-                Ok(who) => json!({
-                    "signed_in": true,
-                    "relay": relay,
-                    "bot_name": who["bot_name"],
-                    "agent_id": who["agent_id"],
-                }),
+                Ok(who) => {
+                    let mut v = json!({
+                        "signed_in": true,
+                        "relay": relay,
+                        "bot_name": who["bot_name"],
+                        "agent_id": who["agent_id"],
+                    });
+                    if who["member_id_note"].is_string() {
+                        v["member_id_format"] = who["member_id_format"].clone();
+                        v["member_id_note"] = who["member_id_note"].clone();
+                    }
+                    v
+                }
                 Err(e) => json!({
                     "signed_in": "unknown",
                     "relay": relay,
@@ -1016,10 +1055,24 @@ impl Gateway {
         }
         match self.connector() {
             Some(c) => {
-                let response = c.call_tool(request, context).await?;
-                if let CallToolResponse::Complete(r) = &response {
+                let room_id = request
+                    .arguments
+                    .as_ref()
+                    .and_then(|a| a.get("room_id"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let mut response = c.call_tool(request, context).await?;
+                if let CallToolResponse::Complete(r) = &mut response {
                     if let Some(why) = revoked(r) {
                         return Ok(self.signed_out_by_relay(why).await.into());
+                    }
+                    // Removed by the owner: name the room, forget it here.
+                    if let (Some(room), Some(v)) = (room_id, r.structured_content.as_mut()) {
+                        if r.is_error == Some(true) && v["error"] == "REMOVED_FROM_ROOM" {
+                            c.note_removed(&room, v).await;
+                            let fixed = v.clone();
+                            *r = CallToolResult::structured_error(fixed);
+                        }
                     }
                 }
                 Ok(response)

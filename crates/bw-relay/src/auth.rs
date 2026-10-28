@@ -33,6 +33,17 @@ pub struct AgentId {
     pub name: Option<String>,
 }
 
+/// Plain-language note for a Member ID in the format bots got before
+/// 0.2.11 (`<account>:<bot>`), `None` for the current format.
+pub fn legacy_member_id_note(agent_id: &str) -> Option<&'static str> {
+    agent_id.contains(':').then_some(
+        "Older Member ID format: this bot was first connected before 0.2.11, so its ID starts with \
+         your Account ID. It keeps that ID when it reconnects, because its rooms and encryption keys \
+         are tied to it. A new bot sign-in gets the new format (bot_…), which does not include the \
+         Account ID.",
+    )
+}
+
 impl AgentId {
     /// Derive a dev-token agent id.
     pub fn from_token(token: &str) -> Self {
@@ -178,6 +189,14 @@ fn unauthorized(resource_metadata: &str, help: &str, setup: &str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn older_member_ids_are_explained_and_new_ones_are_not() {
+        let n = legacy_member_id_note("64e57406-0352-4b69-b836-0b3d0b0d0b67:bot_1").unwrap();
+        assert!(n.contains("before 0.2.11") && n.contains("A new bot sign-in gets the new format"));
+        assert_eq!(legacy_member_id_note("bot_0123456789abcdef0123"), None);
+        assert_eq!(legacy_member_id_note(&"ab".repeat(32)), None, "dev tokens");
+    }
 
     #[test]
     fn distinct_tokens_are_distinct_agents() {

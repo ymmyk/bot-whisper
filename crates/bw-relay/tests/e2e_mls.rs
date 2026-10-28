@@ -229,7 +229,7 @@ async fn mls_group_over_the_relay() {
     assert_eq!(
         b.err("e2e_fetch", json!({ "room_id": room, "timeout_s": 1 }))
             .await,
-        "NOT_A_MEMBER"
+        "REMOVED_FROM_ROOM"
     );
     assert!(
         g_bob.process(&bob, &ct).is_err(),

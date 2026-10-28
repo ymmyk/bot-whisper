@@ -130,7 +130,59 @@ struct State {
     pending: HashMap<String, Pending>,
     awaiting: HashMap<String, Awaiting>,
     files: HashMap<String, ReceivedFile>,
+    /// Rooms the owner removed this bot from (title, if known), so a
+    /// later call can still name the room.
+    removed: HashMap<String, Option<String>>,
 }
+
+/// A request that will not be let in any more: the relay's code as its own
+/// field (`JOIN_DECLINED`, `INVITE_EXPIRED`, ...) next to the sentence.
+fn awaiting_error_note(room: &str, e: &anyhow::Error) -> Value {
+    let code = super::relay::tool_error_code(e);
+    let message = e
+        .downcast_ref::<super::relay::ToolError>()
+        .and_then(|t| t.0["message"].as_str().map(str::to_string))
+        .unwrap_or_else(|| one_line(e));
+    let state = if code.as_deref() == Some("JOIN_DECLINED") {
+        "declined"
+    } else {
+        "not_joined"
+    };
+    json!({
+        "room_id": room,
+        "state": state,
+        "error": code.unwrap_or_else(|| "CONNECTOR".into()),
+        "message": message,
+    })
+}
+
+/// Queue events, keeping only the newest `members_changed`: an older one
+/// still unread would show a stale member list after a newer change.
+fn add_events(queue: &mut Vec<Value>, new: Vec<Value>) {
+    for ev in new {
+        if ev["event"] == "members_changed" {
+            queue.retain(|e| e["event"] != "members_changed");
+        }
+        queue.push(ev);
+    }
+}
+
+/// The relay's notes on members still joining, onto a send result.
+fn copy_delivery_notes(sent: &Value, out: &mut Value) {
+    for k in [
+        "pending_delivery",
+        "pending_delivery_note",
+        "not_yet_in_group",
+        "not_yet_in_group_note",
+    ] {
+        if !sent[k].is_null() {
+            out[k] = sent[k].clone();
+        }
+    }
+}
+
+/// How long `join_room` waits for the room's title after the Welcome.
+const TITLE_WAIT: Duration = Duration::from_secs(3);
 
 /// The text for a Welcome this connector cannot open.
 fn join_failure(detail: &str) -> String {
@@ -411,7 +463,11 @@ pub struct GetFileArgs {
 
 pub(crate) fn respond(result: anyhow::Result<Value>) -> Result<CallToolResult, ErrorData> {
     Ok(match result {
-        Ok(v) => CallToolResult::structured(v),
+        Ok(mut v) => {
+            // Times the connector adds itself get their `_utc` too.
+            bw_proto::time::add_utc_siblings(&mut v);
+            CallToolResult::structured(v)
+        }
         Err(e) => match e.downcast_ref::<super::relay::ToolError>() {
             Some(t) => CallToolResult::structured_error(t.0.clone()),
             // Signed out (401/403, a refused refresh) is never "unreachable".
@@ -768,6 +824,70 @@ impl Connector {
     }
 
     /// Forget a room's keys here (left or closed).
+    /// The relay said the owner removed this bot from `room_id`
+    /// (REMOVED_FROM_ROOM): forget the room here and name it in the error.
+    pub(crate) async fn note_removed(&self, room_id: &str, v: &mut Value) {
+        if v["error"] != "REMOVED_FROM_ROOM" {
+            return;
+        }
+        let mut st = self.state.lock().await;
+        let title = match st.rooms.get(room_id) {
+            Some(r) => r.title.clone(),
+            None => st.removed.get(room_id).cloned().flatten(),
+        };
+        if st.rooms.contains_key(room_id) {
+            self.forget_room(&mut st, room_id);
+        }
+        st.pending.remove(room_id);
+        st.removed.insert(room_id.to_string(), title.clone());
+        if let Some(t) = &title {
+            let by = v["removed_by"]["display_name"]
+                .as_str()
+                .map(|n| {
+                    format!(
+                        "{n} ({})",
+                        v["removed_by"]["member"].as_str().unwrap_or("the owner")
+                    )
+                })
+                .unwrap_or_else(|| {
+                    v["removed_by"]["member"]
+                        .as_str()
+                        .unwrap_or("the owner")
+                        .to_string()
+                });
+            v["message"] = json!(format!(
+                "{by}, the room owner, removed you from \"{t}\"; the room is gone for you and this connector forgot it. To come back you need a new invite."
+            ));
+        }
+        v["room_title"] = json!(title);
+        v["room_status"] = json!("removed");
+    }
+
+    /// `Some(entry)` when `e` is REMOVED_FROM_ROOM for `room_id`: the room
+    /// as `wait_for_message` reports it (forgotten here).
+    async fn removed_entry(&self, room_id: &str, e: &anyhow::Error) -> Option<Value> {
+        let t = e.downcast_ref::<super::relay::ToolError>()?;
+        if t.0["error"] != "REMOVED_FROM_ROOM" {
+            return None;
+        }
+        let mut v = t.0.clone();
+        self.note_removed(room_id, &mut v).await;
+        let mut ev = v.clone();
+        ev["event"] = json!("removed_from_room");
+        if let Some(o) = ev.as_object_mut() {
+            o.remove("error");
+        }
+        Some(json!({
+            "room_id": room_id,
+            "room_title": v["room_title"],
+            "removed": true,
+            "closed": false,
+            "messages": [],
+            "events": [ev],
+            "message": v["message"],
+        }))
+    }
+
     fn forget_room(&self, st: &mut State, room_id: &str) {
         if let Some(mut r) = st.rooms.remove(room_id) {
             self.identity.forget_group(&mut r.group);
@@ -841,7 +961,7 @@ impl Connector {
             )
             .await?;
         let closed = fetched["closed"] == true;
-        let events = fetched["events"].as_array().cloned().unwrap_or_default();
+        let mut events = fetched["events"].as_array().cloned().unwrap_or_default();
         let turn = fetched["turn"].clone();
         let mode = fetched["mode"].clone();
         let seats = fetched["members"].clone();
@@ -919,12 +1039,22 @@ impl Connector {
                     );
                     self.persist_rooms(&st);
                     // The Welcome opened: only now does the relay count us as joined.
-                    if let Err(e) = self
+                    match self
                         .relay
                         .call("e2e_confirm_joined", json!({ "room_id": room_id }))
                         .await
                     {
-                        tracing::warn!("could not confirm joining {room_id}: {e}");
+                        // Tell this bot too (after an approval it may not be
+                        // waiting in join_room any more).
+                        Ok(v) => events.push(json!({
+                            "event": "member_joined",
+                            "you": true,
+                            "member": st.rooms.get(room_id).map(|r| r.me.clone()),
+                            "members": v["joined"],
+                            "pending": v["pending"],
+                            "message": "You are in the room now: its encrypted group opened on this computer.",
+                        })),
+                        Err(e) => tracing::warn!("could not confirm joining {room_id}: {e}"),
                     }
                     self.top_up_key_packages(false).await?;
                     self.persist_keys();
@@ -1027,7 +1157,7 @@ impl Connector {
         if !messages.is_empty() || !events.is_empty() || had_items {
             let ri = st.inbox.rooms.entry(room_id.to_string()).or_default();
             ri.items.extend(messages);
-            ri.events.extend(events);
+            add_events(&mut ri.events, events);
             self.persist_inbox(&st);
         }
         if had_items {
@@ -1176,6 +1306,21 @@ impl Connector {
                 .min(Duration::from_secs(20));
             self.drain(room_id, left).await?;
         }
+        // The title travels encrypted right after the Welcome (a `meta`
+        // message from the member who added us): wait a moment for it, so
+        // the joiner learns the room's title instead of `null`.
+        let title_by = Instant::now() + TITLE_WAIT;
+        loop {
+            let has_title = match self.state.lock().await.rooms.get(room_id) {
+                Some(r) => r.title.is_some(),
+                None => true,
+            };
+            let left = title_by.saturating_duration_since(Instant::now());
+            if has_title || left.is_zero() {
+                break;
+            }
+            self.drain(room_id, left).await?;
+        }
         let st = self.state.lock().await;
         Ok(match st.rooms.get(room_id) {
             Some(r) => json!({
@@ -1236,9 +1381,7 @@ impl Connector {
                 Err(e) if super::relay::is_unreachable(&e) => {}
                 Err(e) => {
                     self.state.lock().await.awaiting.remove(&room);
-                    notes.push(
-                        json!({ "room_id": room, "state": "not_joined", "error": one_line(&e) }),
-                    );
+                    notes.push(awaiting_error_note(&room, &e));
                 }
             }
         }
@@ -1579,13 +1722,15 @@ impl Connector {
                     args["interrupt"] = json!(true);
                 }
                 let sent = self.relay.call("e2e_send", args).await?;
-                Ok(json!({
+                let mut out = json!({
                     "seq": sent["seq"], "epoch": epoch, "delivered_to": sent["delivered_to"],
                     "encryption": "mls (end-to-end)", "thread": sent["thread"], "turn": sent["turn"],
                     "counted_toward_cap": sent["counted_toward_cap"], "interrupt": sent["interrupt"],
                     "expires_at": sent["expires_at"], "expires_at_utc": sent["expires_at_utc"],
                     "retention": sent["retention"],
-                }))
+                });
+                copy_delivery_notes(&sent, &mut out);
+                Ok(out)
             }
             .await,
         )
@@ -1707,6 +1852,7 @@ impl Connector {
         let room_arg = a.room_id.clone();
         respond_read(
             async {
+                let mut removed_out: Vec<Value> = Vec::new();
                 let timeout = Duration::from_secs(a.timeout_s.unwrap_or(DEFAULT_WAIT_S).min(MAX_WAIT_S));
                 // Join requests waiting for approval: let in yet?
                 let (seated, mut awaiting_notes) = self.check_awaiting().await;
@@ -1728,17 +1874,31 @@ impl Connector {
                                 v.push(r);
                             }
                         }
+                        // Held here but no longer listed: removed by the
+                        // owner? Then say so once (and forget it).
+                        let held: Vec<String> = {
+                            let st = self.state.lock().await;
+                            st.rooms.keys().filter(|r| !v.contains(r)).cloned().collect()
+                        };
+                        for r in held {
+                            if let Err(e) = self.relay.call("get_status", json!({ "room_id": r })).await {
+                                if let Some(entry) = self.removed_entry(&r, &e).await {
+                                    removed_out.push(entry);
+                                }
+                            }
+                        }
                         v
                     }
                 };
-                if rooms.is_empty() && awaiting_notes.is_empty() {
+                if rooms.is_empty() && awaiting_notes.is_empty() && removed_out.is_empty() {
                     anyhow::bail!("you are in no encrypted room");
                 }
                 // Rooms the relay calls active but this connector holds no
                 // group for can never be read here: say so instead of
                 // returning an empty, healthy-looking result.
-                let mut any = !awaiting_notes.is_empty() && rooms.is_empty();
+                let mut any = (!awaiting_notes.is_empty() && rooms.is_empty()) || !removed_out.is_empty();
                 let mut out: Vec<Value> = std::mem::take(&mut awaiting_notes);
+                out.append(&mut removed_out);
                 let mut rooms = rooms;
                 let missing: Vec<String> = {
                     let st = self.state.lock().await;
@@ -1766,9 +1926,21 @@ impl Connector {
                     }
                 }
                 let mut added_all = Vec::new();
+                let mut gone = Vec::new();
                 for r in &rooms {
-                    added_all.extend(self.add_pending_joiners(r).await?);
+                    match self.add_pending_joiners(r).await {
+                        Ok(a) => added_all.extend(a),
+                        Err(e) => match self.removed_entry(r, &e).await {
+                            Some(entry) => {
+                                gone.push(r.clone());
+                                any = true;
+                                out.push(entry);
+                            }
+                            None => return Err(e),
+                        },
+                    }
                 }
+                rooms.retain(|r| !gone.contains(r));
                 // Something already waiting here (fetched by another call,
                 // or before a restart)? Then do not block.
                 let mut waiting = false;
@@ -1795,7 +1967,14 @@ impl Connector {
                             out.push(json!({ "room_id": room, "messages": messages, "events": events, "closed": false, "relay_reconnecting": true }));
                             continue;
                         }
-                        Err(e) => return Err(e),
+                        Err(e) => match self.removed_entry(&room, &e).await {
+                            Some(entry) => {
+                                any = true;
+                                out.push(entry);
+                                continue;
+                            }
+                            None => return Err(e),
+                        },
                     };
                     let (messages, events) = self.take_inbox(&room).await;
                     any |= !messages.is_empty() || !events.is_empty() || d.closed || !d.warnings.is_empty();
@@ -2058,8 +2237,14 @@ impl Connector {
                 let target_agent = status["members"]
                     .as_array()
                     .and_then(|ms| ms.iter().find(|m| m["member"] == a.member_id))
-                    .and_then(|m| m["agent_id"].as_str().map(str::to_string))
-                    .ok_or_else(|| anyhow::anyhow!("no such member in this room"))?;
+                    .and_then(|m| m["agent_id"].as_str().map(str::to_string));
+                let Some(target_agent) = target_agent else {
+                    // Let the relay say why (already removed, never here).
+                    return self
+                        .relay
+                        .call("remove_member", json!({ "room_id": a.room_id, "member_id": a.member_id }))
+                        .await;
+                };
                 let removed = self
                     .relay
                     .call("remove_member", json!({ "room_id": a.room_id, "member_id": a.member_id }))
@@ -2311,6 +2496,10 @@ impl Connector {
             "message_expires_at_utc": sent["expires_at_utc"],
             "encryption": "aes-256-gcm inside mls (end-to-end)",
         }))
+        .map(|mut out| {
+            copy_delivery_notes(&sent, &mut out);
+            out
+        })
     }
 
     async fn do_get_file(&self, a: GetFileArgs) -> anyhow::Result<Value> {
@@ -2536,11 +2725,48 @@ mod invite_link_tests {
         let v = r.structured_content.unwrap();
         assert_eq!(v["error"], "SIGNED_OUT");
         let m = v["message"].as_str().unwrap();
+        assert!(m.starts_with("SIGNED_OUT: the relay no longer accepts this bot's sign-in"));
+        assert!(m.contains("returns a link and a short code"), "{m}");
         assert!(
-            m.starts_with("SIGNED_OUT: this bot's sign-in was revoked; call `login` (force=true)")
+            !m.to_lowercase().contains("email"),
+            "link-based sign-in, no emailed code: {m}"
         );
         assert!(!m.contains('\n'));
         assert_eq!(v["reason"], "refused");
+        // The relay's 401 page (a first-sign-in "type the emailed code") is
+        // never passed through as the reason.
+        let r = super::super::gateway::signed_out_result(Some(
+            "HTTP 401 Unauthorized: unauthorized (ACCOUNT_REQUIRED): No BotWhisper access yet. type the one-time code from the email".into(),
+        ));
+        let v = r.structured_content.unwrap();
+        assert_eq!(
+            v["reason"],
+            "the relay refused this bot's stored sign-in (HTTP 401)"
+        );
+        let shown =
+            super::super::relay::SignedOut("401 unauthorized: emailed code".into()).to_string();
+        assert!(
+            !shown.contains("email") && shown.contains("sign-in link"),
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn a_fresh_login_does_not_say_call_login_for_a_new_link() {
+        use super::super::gateway::note_for_fresh_login;
+        let n = note_for_fresh_login(
+            "The login code from the previous run expired before it was approved. Call `login` to get a new link and code.",
+        )
+        .unwrap();
+        assert!(!n.contains("`login`") && !n.contains("Call"), "{n}");
+        assert!(
+            n.contains("expired") && n.ends_with("this is a new link."),
+            "{n}"
+        );
+        assert_eq!(
+            note_for_fresh_login("Call `login` to start a new one."),
+            None
+        );
     }
 }
 
@@ -2560,5 +2786,48 @@ mod mask_tests {
         let a: super::SendArgs =
             serde_json::from_value(serde_json::json!({ "room_id": "r" })).unwrap();
         assert!(a.text.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod awaiting_note_tests {
+    use super::awaiting_error_note;
+    use serde_json::json;
+
+    #[test]
+    fn a_declined_request_has_its_code_as_a_field() {
+        let e: anyhow::Error = crate::connect::relay::ToolError(json!({
+            "error": "JOIN_DECLINED",
+            "message": "a member declined this bot's request to join; ask the owner",
+        }))
+        .into();
+        let n = awaiting_error_note("r1", &e);
+        assert_eq!(n["error"], "JOIN_DECLINED");
+        assert_eq!(n["state"], "declined");
+        assert!(!n["message"].as_str().unwrap().contains("JOIN_DECLINED"));
+        let n = awaiting_error_note("r1", &anyhow::anyhow!("boom"));
+        assert_eq!(n["error"], "CONNECTOR");
+        assert_eq!(n["state"], "not_joined");
+    }
+}
+
+#[cfg(test)]
+mod event_queue_tests {
+    use super::add_events;
+    use serde_json::json;
+
+    #[test]
+    fn only_the_newest_members_changed_is_kept() {
+        let mut q = vec![
+            json!({ "event": "members_changed", "members": ["m1"], "pending": ["m2"] }),
+            json!({ "event": "member_joined", "member": "m2" }),
+        ];
+        add_events(
+            &mut q,
+            vec![json!({ "event": "members_changed", "members": ["m1", "m2"], "pending": [] })],
+        );
+        assert_eq!(q.len(), 2);
+        assert_eq!(q[0]["event"], "member_joined");
+        assert_eq!(q[1]["members"], json!(["m1", "m2"]));
     }
 }

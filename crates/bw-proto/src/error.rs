@@ -22,6 +22,8 @@ pub enum ErrorCode {
     InviteRevoked,
     /// A member declined this bot's request to join.
     JoinDeclined,
+    /// The owner removed this bot from the room.
+    RemovedFromRoom,
     BodyTooLarge,
     InvalidArgument,
     InterruptUsed,
@@ -54,6 +56,7 @@ impl ErrorCode {
             ErrorCode::InviteInvalid => "INVITE_INVALID",
             ErrorCode::InviteRevoked => "INVITE_REVOKED",
             ErrorCode::JoinDeclined => "JOIN_DECLINED",
+            ErrorCode::RemovedFromRoom => "REMOVED_FROM_ROOM",
             ErrorCode::BodyTooLarge => "BODY_TOO_LARGE",
             ErrorCode::InvalidArgument => "INVALID_ARGUMENT",
             ErrorCode::InterruptUsed => "INTERRUPT_USED",
@@ -85,6 +88,7 @@ mod tests {
             ErrorCode::TurnCap,
             ErrorCode::RoomClosed,
             ErrorCode::InviteUsed,
+            ErrorCode::RemovedFromRoom,
         ] {
             let json = serde_json::to_string(&code).unwrap();
             assert_eq!(json, format!("\"{}\"", code.as_str()));

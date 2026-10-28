@@ -190,24 +190,7 @@ impl RelayConfig {
 
 /// `2026-10-27T14:35:33Z` (UTC, seconds).
 pub fn iso_utc(secs: u64) -> String {
-    let days = (secs / 86_400) as i64;
-    let rem = secs % 86_400;
-    // Howard Hinnant's civil_from_days.
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = yoe + era * 400 + i64::from(m <= 2);
-    format!(
-        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
-        rem / 3600,
-        (rem % 3600) / 60,
-        rem % 60
-    )
+    bw_proto::time::iso_utc(secs)
 }
 
 /// A retention period in words: `7 days`, `1 day`, `36 hours`, `1 hour`.
@@ -228,23 +211,39 @@ pub fn ttl_words(ttl: Duration) -> String {
 /// Parse a human duration such as `1h`, `7d`, `30m`, `90s`, or `never`.
 /// Returns `Ok(None)` for `never`.
 pub fn parse_expiry(s: &str) -> Result<Option<Duration>, String> {
+    parse_expiry_with(s, "e.g. 1h, 7d or never")
+}
+
+/// `parse_expiry` with the valid examples for where the value is used
+/// (an invite cannot be `never`, a room can), so an error never suggests
+/// something the same place then rejects.
+pub fn parse_expiry_with(s: &str, examples: &str) -> Result<Option<Duration>, String> {
     let s = s.trim();
     if s.eq_ignore_ascii_case("never") {
         return Ok(None);
     }
     let (num, unit) = s.split_at(s.len().saturating_sub(1));
-    let n: u64 = num
-        .parse()
-        .map_err(|_| format!("invalid duration `{s}` (use e.g. 1h, 7d, never)"))?;
+    let n: u64 = num.parse().map_err(|_| {
+        format!("invalid duration `{s}`: use a number and a unit (s, m, h, d), {examples}")
+    })?;
     let secs = match unit {
         "s" => n,
         "m" => n * 60,
         "h" => n * 3600,
         "d" => n * 86_400,
-        _ => return Err(format!("invalid duration unit in `{s}` (use s, m, h, d)")),
+        _ => {
+            return Err(format!(
+                "invalid duration unit in `{s}`: use s, m, h or d, {examples}"
+            ))
+        }
     };
     Ok(Some(Duration::from_secs(secs)))
 }
+
+/// Valid `ttl` values for an invite (never `never`).
+pub const INVITE_TTL_EXAMPLES: &str = "e.g. 30m, 1h, 24h or 7d (an invite always expires)";
+/// Valid `expires` values for a room.
+pub const ROOM_EXPIRY_EXAMPLES: &str = "e.g. 1h, 7d, 365d or never";
 
 #[cfg(test)]
 mod tests {
@@ -268,6 +267,13 @@ mod tests {
             Some(Duration::from_secs(365 * 86_400))
         );
         assert!(parse_expiry("1w").is_err());
+        // Each place suggests only what it accepts.
+        let e = parse_expiry_with("soon", INVITE_TTL_EXAMPLES).unwrap_err();
+        assert!(e.contains("24h") && !e.contains("never"), "{e}");
+        let e = parse_expiry_with("2w", INVITE_TTL_EXAMPLES).unwrap_err();
+        assert!(!e.contains("never"), "{e}");
+        let e = parse_expiry_with("soon", ROOM_EXPIRY_EXAMPLES).unwrap_err();
+        assert!(e.contains("never"), "{e}");
         assert!(parse_expiry("").is_err());
     }
 }

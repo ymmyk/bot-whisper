@@ -178,6 +178,9 @@ pub enum MemberEvent {
         invite_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         label: Option<String>,
+        /// When the request lapses unanswered (with its invite or the room).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_expires_at: Option<u64>,
     },
     /// A join request was decided (by `by`).
     JoinDecided {
@@ -193,11 +196,30 @@ pub enum MemberEvent {
         #[serde(default)]
         pending: Vec<MemberId>,
     },
+    /// The owner removed a member (`by`). `members` is who is left.
+    MemberRemoved {
+        member: MemberId,
+        display_name: Option<String>,
+        by: MemberId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        by_name: Option<String>,
+        members: Vec<MemberId>,
+    },
     /// The room was closed (owner closed it, left, or it expired). Every
     /// call after this returns `ROOM_CLOSED`.
     RoomClosed {
         reason: String,
     },
+}
+
+/// A bot the owner removed (see `Room::removed`).
+#[derive(Debug, Clone)]
+struct Removed {
+    member: MemberId,
+    display_name: Option<String>,
+    by: MemberId,
+    by_name: Option<String>,
+    at: u64,
 }
 
 /// What `leave` / `remove` did.
@@ -233,6 +255,10 @@ pub struct Room {
     closed_at: Option<Instant>,
     /// Former members who have not yet collected their `room_closed` event.
     closed_pending: HashSet<MemberId>,
+    /// Bots the owner removed (by agent id), so their next call says so
+    /// (REMOVED_FROM_ROOM) instead of a bare NOT_A_MEMBER. In memory only:
+    /// after a relay restart they get NOT_A_MEMBER.
+    removed: HashMap<String, Removed>,
     member_msgs: Limiter,
     room_msgs: Limiter,
     bells_per_member: Limiter,
@@ -367,6 +393,7 @@ impl Room {
             closed: false,
             closed_at: None,
             closed_pending: HashSet::new(),
+            removed: HashMap::new(),
             member_msgs: Limiter::new(limits.msgs_per_member_per_min, Duration::from_secs(60)),
             room_msgs: Limiter::new(limits.msgs_per_room_per_min, Duration::from_secs(60)),
             bells_per_member: Limiter::new(
@@ -481,10 +508,80 @@ impl Room {
     }
 
     fn member(&self, id: &str) -> Result<&Member, RelayError> {
-        self.members
+        self.members.iter().find(|m| m.member == id).ok_or_else(|| {
+            self.removed
+                .values()
+                .find(|r| r.member == id)
+                .map(|r| self.removed_error(r))
+                .unwrap_or_else(RelayError::not_a_member)
+        })
+    }
+
+    /// Why `agent_id` has no seat here, when the owner removed it.
+    pub fn removed_error_for_agent(&self, agent_id: &str) -> Option<RelayError> {
+        self.removed.get(agent_id).map(|r| self.removed_error(r))
+    }
+
+    fn removed_error(&self, r: &Removed) -> RelayError {
+        let who = match &r.by_name {
+            Some(n) => format!("{n} ({})", r.by),
+            None => r.by.clone(),
+        };
+        RelayError::new(
+            ErrorCode::RemovedFromRoom,
+            format!("{who}, the room owner, removed you from this room; it is gone for you. To come back you need a new invite."),
+        )
+        .with_data(json!({
+            "room_id": self.id,
+            "removed_by": { "member": r.by, "display_name": r.by_name },
+            "removed_at": r.at,
+            "removed_at_utc": crate::config::iso_utc(r.at),
+            "your_former_member_id": r.member,
+        }))
+    }
+
+    /// A display name with the member id, for messages: `Atlas (m2)`.
+    pub fn who(&self, id: &str) -> String {
+        match self
+            .members
             .iter()
             .find(|m| m.member == id)
-            .ok_or_else(RelayError::not_a_member)
+            .and_then(|m| m.display_name.as_deref())
+        {
+            Some(n) => format!("{n} ({id})"),
+            None => id.to_string(),
+        }
+    }
+
+    /// A turn error with members named the way people see them: the
+    /// holder's display name first, its Member ID in brackets.
+    pub(crate) fn turn_error(&self, e: bw_proto::TurnError) -> RelayError {
+        let holder = match &e {
+            bw_proto::TurnError::NotYourTurn { holder, .. } => holder.clone(),
+            _ => None,
+        };
+        let mut err = RelayError::from(e);
+        if let Some(h) = holder {
+            err.message = format!(
+                "not your turn: {} has the floor; wait for your turn or use your one interrupt",
+                self.who(&h)
+            );
+            if let Some(o) = err.data.as_object_mut() {
+                let names: Vec<String> = o
+                    .get("order")
+                    .and_then(Value::as_array)
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(Value::as_str)
+                            .map(|m| self.who(m))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                o.insert("holder_name".into(), json!(self.who(&h)));
+                o.insert("order_names".into(), json!(names));
+            }
+        }
+        err
     }
 
     fn require_open(&self) -> Result<(), RelayError> {
@@ -505,7 +602,13 @@ impl Room {
     }
 
     fn push_event(&mut self, member: &str, ev: MemberEvent) {
-        self.events.entry(member.to_string()).or_default().push(ev);
+        let q = self.events.entry(member.to_string()).or_default();
+        // Only the newest member list is worth reading: an older, not yet
+        // fetched `members_changed` would show a stale state after it.
+        if matches!(ev, MemberEvent::MembersChanged { .. }) {
+            q.retain(|e| !matches!(e, MemberEvent::MembersChanged { .. }));
+        }
+        q.push(ev);
     }
 
     fn broadcast_event(&mut self, ev: MemberEvent, except: Option<&str>) {
@@ -785,11 +888,13 @@ impl Room {
                 member_id: None,
             };
             self.db.insert_join_request(&req)?;
+            let request_expires_at = self.request_expires_at(&invite.id);
             self.broadcast_joined_only(MemberEvent::JoinRequested {
                 request_id: req.id.clone(),
                 display_name,
                 invite_id: invite.id.clone(),
                 label: invite.label.clone(),
+                request_expires_at,
             });
             self.ring_all("members_changed", None, now);
             self.touch();
@@ -825,6 +930,7 @@ impl Room {
         self.db.set_next_member_n(&self.id, self.next_member_n)?;
         self.db.insert_member(&self.id, &member_row(&member))?;
         self.members.push(member.clone());
+        self.removed.remove(&member.agent_id);
         let joined = MemberEvent::MemberJoined {
             member: member.member.clone(),
             display_name: member.display_name.clone(),
@@ -1009,8 +1115,48 @@ impl Room {
                 "the owner cannot be removed; use leave_room or close_room",
             ));
         }
-        self.member(target)
-            .map_err(|_| RelayError::invalid(format!("no such member: {target}")))?;
+        let Some(gone) = self.members.iter().find(|m| m.member == target).cloned() else {
+            let gone = self.removed.values().find(|r| r.member == target);
+            let was = gone.is_some();
+            let target = match gone.and_then(|r| r.display_name.as_deref()) {
+                Some(n) => format!("{n} ({target})"),
+                None => target.to_string(),
+            };
+            return Err(RelayError::new(
+                ErrorCode::NotAMember,
+                if was {
+                    format!("{target} is not a member of this room any more (already removed)")
+                } else {
+                    format!("{target} is not a member of this room")
+                },
+            )
+            .with_data(json!({ "member_id": target, "already_removed": was })));
+        };
+        let by_name = self.member(by)?.display_name.clone();
+        self.removed.insert(
+            gone.agent_id.clone(),
+            Removed {
+                member: gone.member.clone(),
+                display_name: gone.display_name.clone(),
+                by: by.to_string(),
+                by_name: by_name.clone(),
+                at: now,
+            },
+        );
+        let remaining: Vec<MemberId> = self
+            .member_ids()
+            .into_iter()
+            .filter(|m| m != target)
+            .collect();
+        // Before drop_member: the removed seat's queue goes with it.
+        let ev = MemberEvent::MemberRemoved {
+            member: gone.member.clone(),
+            display_name: gone.display_name.clone(),
+            by: by.to_string(),
+            by_name,
+            members: remaining,
+        };
+        self.broadcast_event(ev, Some(target));
         self.drop_member(target, now)
     }
 
@@ -1187,12 +1333,27 @@ impl Room {
             "pending_events_for_you": self.events.get(member).map(Vec::len).unwrap_or(0),
             // Joins through require_approval links, for members to decide.
             "join_requests": if me.is_e2e_active() { json!(self.waiting_joins()) } else { json!([]) },
+            // The same on/off as get_doorbell and /account. Off shows only
+            // the state; on shows the details with the secret topic masked
+            // (get_doorbell is where the connector reads it).
             "doorbell": self.doorbell_for(member).map(|(d, key)| {
+                let scope = match key { DoorbellKey::Room { .. } => "room", DoorbellKey::Bot { .. } => "bot_default" };
+                if d.is_automatic() {
+                    return json!({
+                        "state": "off",
+                        "scope": scope,
+                        "hint": "wake-ups are off; call set_doorbell (no arguments) to turn them on",
+                    });
+                }
                 let mut v = d.bot_view(self.bells.ntfy_base_url());
-                v["scope"] = json!(match key { DoorbellKey::Room { .. } => "room", DoorbellKey::Bot { .. } => "bot_default" });
+                if let Some(t) = v["topic"].as_str() {
+                    v["topic"] = json!(crate::web::mask_topic(t));
+                }
+                v["state"] = json!("on");
+                v["scope"] = json!(scope);
                 v["dead"] = json!(self.bells.is_dead(&key));
                 v
-            }),
+            }).unwrap_or_else(|| json!({ "state": "off", "scope": "none", "hint": "wake-ups are off; call set_doorbell (no arguments) to turn them on" })),
         }))
     }
 

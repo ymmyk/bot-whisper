@@ -184,6 +184,14 @@ async fn ntfy_is_the_default_with_a_generated_private_topic() {
     let st = b.ok("get_status", json!({ "room_id": room })).await;
     assert_eq!(st["doorbell"]["type"], "ntfy");
     assert_eq!(st["doorbell"]["scope"], "room");
+    assert_eq!(st["doorbell"]["state"], "on");
+    // The topic is a secret: masked in status (get_doorbell is where the
+    // connector reads it).
+    assert!(!st.to_string().contains(topic.as_str()), "{st}");
+    assert!(
+        st["doorbell"]["topic"].as_str().unwrap().contains('…'),
+        "{st}"
+    );
 
     // A bot-supplied topic, own server (the same mock), own token: the bot
     // token wins over the relay token and is never echoed.

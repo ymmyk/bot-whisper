@@ -309,7 +309,7 @@ impl Room {
             })),
             None => Err(RelayError::new(
                 ErrorCode::E2eNoKeyPackage,
-                format!("{target} has no unused key package on the relay; it publishes them with e2e_publish_key_packages when its connector logs in"),
+                format!("{} has no unused key package on the relay; it publishes them with e2e_publish_key_packages when its connector logs in", self.who(target)),
             )),
         }
     }
@@ -530,13 +530,18 @@ impl Room {
             now,
         };
         let thread = self.thread.as_ref().expect("ensure_thread");
-        thread.check(&roster, &intent)?;
+        thread
+            .check(&roster, &intent)
+            .map_err(|e| self.turn_error(e))?;
         if has_content {
             self.check_send_limits(by)?;
         }
         let thread = self.thread.as_mut().expect("ensure_thread");
         let thread_id = thread.id.clone();
-        let outcome = thread.apply(&roster, &intent)?;
+        let outcome = match thread.apply(&roster, &intent) {
+            Ok(o) => o,
+            Err(e) => return Err(self.turn_error(e)),
+        };
         let enforced = thread.mode.enforces_turns();
         // The view as of this send (a completed thread is dropped below).
         let turn_view = self.view_for(by);
@@ -600,10 +605,27 @@ impl Room {
             _ => {}
         }
         self.touch();
-        Ok(json!({
+        // Seats that are still joining: added (their Welcome is out) get it
+        // once they finish; not yet added cannot read anything sent before
+        // they are in the group.
+        let (mut welcoming, mut not_added) = (Vec::new(), Vec::new());
+        if has_content {
+            for m in self
+                .members
+                .iter()
+                .filter(|m| m.member != by && !m.is_e2e_active())
+            {
+                if m.e2e_state == SeatState::Pending {
+                    not_added.push(self.who(&m.member));
+                } else {
+                    welcoming.push(self.who(&m.member));
+                }
+            }
+        }
+        let mut out = json!({
             "seq": seq,
             "epoch": self.e2e.epoch,
-            "delivered_to": if has_content { recipients.into_iter().collect() } else { Vec::<MemberId>::new() },
+            "delivered_to": if has_content { recipients.iter().cloned().collect() } else { Vec::<MemberId>::new() },
             "thread": thread_id,
             "counted_toward_cap": outcome.counted,
             "interrupt": outcome.interrupt,
@@ -611,7 +633,22 @@ impl Room {
             "expires_at": seq.map(|_| self.message_expiry(now).0),
             "expires_at_utc": seq.map(|_| self.message_expiry(now).1),
             "retention": format!("held until delivered, up to {}", crate::config::ttl_words(self.cfg.unacked_ttl)),
-        }))
+        });
+        if !welcoming.is_empty() {
+            out["pending_delivery"] = json!(welcoming);
+            out["pending_delivery_note"] = json!(format!(
+                "{} still joining; it will be delivered when their join completes.",
+                welcoming.join(", ")
+            ));
+        }
+        if !not_added.is_empty() {
+            out["not_yet_in_group"] = json!(not_added);
+            out["not_yet_in_group_note"] = json!(format!(
+                "{} not added to the encrypted group yet; they cannot read messages sent before they are added (a member's connector adds them on its next wait_for_message or send).",
+                not_added.join(", ")
+            ));
+        }
+        Ok(out)
     }
 
     /// Everything pending for a member, in seq order. Acks on return unless

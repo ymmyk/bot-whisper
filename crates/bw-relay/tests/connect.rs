@@ -650,6 +650,28 @@ async fn safety_numbers_inner() {
         json!({ "room_id": room, "member_id": "m2" }),
     )
     .await;
+    // The removed connector is told once, with the room's title, and
+    // forgets the room; a second remove is NOT_A_MEMBER, not CONNECTOR.
+    let told = call(&bob, "wait_for_message", json!({ "timeout_s": 1 })).await;
+    let gone = told["rooms"]
+        .as_array()
+        .and_then(|rs| rs.iter().find(|r| r["room_id"] == room.as_str()))
+        .cloned()
+        .unwrap_or_else(|| told.clone());
+    assert_eq!(gone["removed"], true, "{told}");
+    assert_eq!(gone["room_title"], "t", "{told}");
+    assert_eq!(gone["events"][0]["event"], "removed_from_room", "{told}");
+    assert!(
+        gone["message"].as_str().unwrap().contains("\"t\""),
+        "{told}"
+    );
+    let again = call(
+        &alice,
+        "remove_member",
+        json!({ "room_id": room, "member_id": "m2" }),
+    )
+    .await;
+    assert_eq!(again["error"], "NOT_A_MEMBER", "{again}");
     let b2 = Connector::new(
         RelayClient::with_token(&relay.base(), TOKENS[1]),
         None,

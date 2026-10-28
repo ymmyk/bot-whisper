@@ -112,9 +112,13 @@ impl Registry {
         let handle = self.get(room_id).await?;
         let id = agent.id.clone();
         let member = handle
-            .with(move |room| room.member_for_agent(&id).cloned())
-            .await?
-            .ok_or_else(RelayError::not_a_member)?;
+            .with(move |room| {
+                room.member_for_agent(&id).cloned().ok_or_else(|| {
+                    room.removed_error_for_agent(&id)
+                        .unwrap_or_else(RelayError::not_a_member)
+                })
+            })
+            .await??;
         Ok((handle, member))
     }
 

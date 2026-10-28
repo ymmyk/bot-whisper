@@ -1218,6 +1218,10 @@ async fn a_new_bots_member_id_never_carries_the_account_id() {
     assert_no_account("join_room", &joined.to_string(), &account);
     let rooms = bot.ok("list_rooms", json!({})).await;
     assert_no_account("list_rooms", &rooms.to_string(), &account);
+    // whoami: the current format, so no "older ID" note.
+    let who = bot.ok("whoami", json!({})).await;
+    assert_eq!(who["member_id_format"], "current");
+    assert!(who.get("member_id_note").is_none(), "{who}");
     let status = owner.ok("get_status", json!({ "room_id": room_id })).await;
     assert_no_account("owner's get_status", &status.to_string(), &account);
     // The owner's member_joined event.

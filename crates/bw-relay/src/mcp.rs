@@ -20,7 +20,6 @@ use serde_json::{json, Value};
 
 use crate::{
     auth::AgentId,
-    config::parse_expiry,
     db::ThreadStart,
     doorbell::{self, DoorbellConfig, DoorbellTarget, ALL_EVENTS, DEFAULT_EVENTS},
     error::RelayError,
@@ -329,19 +328,32 @@ fn agent(parts: &Parts) -> Result<AgentId, ErrorData> {
 }
 
 fn respond(result: Result<Value, RelayError>) -> Result<CallToolResult, ErrorData> {
+    // Every Unix time also as UTC text (`<key>_utc`).
     Ok(match result {
-        Ok(v) => CallToolResult::structured(v),
-        Err(e) => CallToolResult::structured_error(e.to_json()),
+        Ok(mut v) => {
+            bw_proto::time::add_utc_siblings(&mut v);
+            CallToolResult::structured(v)
+        }
+        Err(e) => {
+            let mut v = e.to_json();
+            bw_proto::time::add_utc_siblings(&mut v);
+            CallToolResult::structured_error(v)
+        }
     })
 }
 
 fn parse_ttl(s: Option<&str>) -> Result<Option<Duration>, RelayError> {
     match s {
         None => Ok(None),
-        Some(s) => parse_expiry(s)
+        Some(s) => crate::config::parse_expiry_with(s, crate::config::INVITE_TTL_EXAMPLES)
             .map_err(RelayError::invalid)?
             .map(Some)
-            .ok_or_else(|| RelayError::invalid("invite ttl cannot be `never`")),
+            .ok_or_else(|| {
+                RelayError::invalid(format!(
+                    "an invite cannot be `never`: give its ttl as a duration, {}",
+                    crate::config::INVITE_TTL_EXAMPLES
+                ))
+            }),
     }
 }
 
@@ -629,11 +641,16 @@ impl BotWhisperServer {
         Extension(parts): Extension<Parts>,
     ) -> Result<CallToolResult, ErrorData> {
         let agent = agent(&parts)?;
-        respond(Ok(json!({
+        let mut v = json!({
             "agent_id": agent.id,
+            "member_id_format": if crate::auth::legacy_member_id_note(&agent.id).is_some() { "older" } else { "current" },
             "bot_name": agent.name,
             "account": agent.account,
-        })))
+        });
+        if let Some(n) = crate::auth::legacy_member_id_note(&agent.id) {
+            v["member_id_note"] = json!(n);
+        }
+        respond(Ok(v))
     }
 
     #[tool(
@@ -1009,11 +1026,12 @@ impl BotWhisperServer {
         let expires_in = match a.expires.as_deref() {
             None => Some(self.registry.cfg.default_room_expiry),
             Some(s) => {
-                let d = parse_expiry(s).map_err(RelayError::invalid)?;
+                let d = crate::config::parse_expiry_with(s, crate::config::ROOM_EXPIRY_EXAMPLES)
+                    .map_err(RelayError::invalid)?;
                 if let Some(d) = d {
                     if d < Duration::from_secs(3600) || d > Duration::from_secs(365 * 86_400) {
                         return Err(RelayError::invalid(
-                            "expires must be between 1h and 365d, or never",
+                            "a room's expires must be between 1h and 365d, or never (e.g. 1h, 7d, 365d)",
                         ));
                     }
                 }
@@ -1302,11 +1320,14 @@ impl BotWhisperServer {
                     o.remove("recipes");
                     o.remove("notes");
                 }
-                d["made"] = json!(if cfg.as_ref().is_some_and(|c| c.is_automatic()) {
-                    "automatically at sign-in"
-                } else {
-                    "on purpose"
-                });
+                // Only an automatic address is ever off: say what it is
+                // without implying anyone turned wake-ups on.
+                d["made_by"] = json!("connector");
+                d["note"] = json!(
+                    "An address your connector reserved for this bot (set_doorbell auto: true, done when it \
+                     signs in and finds no wake-up). Wake-ups were never turned on for it, so nothing \
+                     wakes your AI app yet. Call set_doorbell (no arguments) to turn wake-ups on."
+                );
                 out["previous_doorbell"] = d;
             }
             None => {}

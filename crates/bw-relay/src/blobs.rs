@@ -64,7 +64,9 @@ fn problem(status: StatusCode, e: RelayError) -> Response {
 
 fn status_for(e: &RelayError) -> StatusCode {
     match e.code {
-        ErrorCode::NotAMember | ErrorCode::Unauthorized => StatusCode::FORBIDDEN,
+        ErrorCode::NotAMember | ErrorCode::RemovedFromRoom | ErrorCode::Unauthorized => {
+            StatusCode::FORBIDDEN
+        }
         ErrorCode::RoomClosed => StatusCode::NOT_FOUND,
         ErrorCode::BodyTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
         ErrorCode::InvalidArgument => StatusCode::BAD_REQUEST,

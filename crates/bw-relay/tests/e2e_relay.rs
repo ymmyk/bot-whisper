@@ -405,7 +405,7 @@ async fn e2e_room_lifecycle_through_the_relay() {
     assert_eq!(
         bob.err("e2e_fetch", json!({ "room_id": room, "timeout_s": 1 }))
             .await,
-        "NOT_A_MEMBER"
+        "REMOVED_FROM_ROOM"
     );
     let f = carol
         .ok("e2e_fetch", json!({ "room_id": room, "timeout_s": 1 }))
@@ -666,6 +666,13 @@ async fn unconfirmed_welcomes_are_not_joined_and_meta_is_not_a_turn() {
         json!([]),
         "m2 has not confirmed its Welcome"
     );
+    // ...but the sender is told it is on its way, not lost.
+    assert_eq!(sent["pending_delivery"], json!(["m2"]));
+    assert!(sent["pending_delivery_note"]
+        .as_str()
+        .unwrap()
+        .contains("will be delivered when their join completes"));
+    assert!(sent["not_yet_in_group"].is_null());
     // A second real message inside the loop-guard window is still refused.
     let again = alice
         .call(

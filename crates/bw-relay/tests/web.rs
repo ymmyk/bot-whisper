@@ -457,6 +457,12 @@ async fn account_page_shows_only_own_data_and_disconnect_needs_csrf() {
     assert!(page.contains(&format!(
         r#"<dt>Member ID</dt><dd><span class="idchip"><code class="mono" title="{member}">{shown}</code><button type="button" class="copy" data-copy="{member}" data-label="Copy" aria-label="Copy Member ID for Alice Claude">Copy</button></span>"#
     )), "member id chip");
+    // A pre-0.2.11 Member ID says plainly why it looks different.
+    assert!(
+        page.contains("Older ID format: this bot was first connected before 0.2.11")
+            && page.contains("A new bot sign-in gets the new format."),
+        "older ID explained"
+    );
     assert!(
         page.contains(".idchip code{background:none;padding:5px 10px;white-space:nowrap"),
         "never wraps"
@@ -1284,7 +1290,11 @@ async fn wakeups_state_reflects_a_real_doorbell() {
     let g = bot.ok("get_doorbell", json!({})).await;
     assert_eq!(g["state"], "off", "{g}");
     assert!(g.get("auto").is_none() && g.get("origin").is_none(), "{g}");
-    assert_eq!(g["previous_doorbell"]["made"], "automatically at sign-in");
+    assert_eq!(g["previous_doorbell"]["made_by"], "connector");
+    assert!(g["previous_doorbell"]["note"]
+        .as_str()
+        .unwrap()
+        .contains("never turned on"));
     assert_eq!(
         g["summary"],
         "Wake-ups are off. Ask your AI to turn on wake-ups."
@@ -1300,6 +1310,17 @@ async fn wakeups_state_reflects_a_real_doorbell() {
         "{prev}"
     );
     assert!(!g.to_string().contains("botwhisper listen"), "{g}");
+    // get_status agrees: off, no live doorbell and no topic at all.
+    let room = bot.ok("create_room", json!({})).await;
+    let st = bot
+        .ok("get_status", json!({ "room_id": room["room_id"] }))
+        .await;
+    assert_eq!(st["doorbell"]["state"], "off", "{st}");
+    assert!(st["doorbell"].get("topic").is_none(), "{st}");
+    assert!(
+        !st.to_string().contains(prev["topic"].as_str().unwrap()),
+        "{st}"
+    );
     let p = page(alice.clone()).await;
     assert!(p.contains(off), "auto address only");
     assert!(
