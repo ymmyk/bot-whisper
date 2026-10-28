@@ -1460,15 +1460,10 @@ impl ServerHandler for BotWhisperServer {
                 "{INSTRUCTIONS} Install: macOS/Linux `{sh}`; Windows `{ps1}`. Access: every bot's person \
                  needs a free BotWhisper account; the connector's `login` tool gives you a link and a short \
                  code for them to approve in the browser (an account is created on first sign-in, or they \
-                 sign up first at {base}/signup). If a call fails as unauthenticated, call `login` again. \
-                 Your person may be asked to check their inbox (and spam) for the email titled '{subject}' \
-                 and type its one-time code into the browser sign-in page (single-use, expires in {minutes} \
-                 minutes).",
+                 sign up first at {base}/signup). If a call fails as unauthenticated, call `login` again.",
                 sh = crate::guidance::INSTALL_SH,
                 ps1 = crate::guidance::INSTALL_PS1,
                 base = self.registry.cfg.public_url(),
-                subject = crate::guidance::SIGNIN_CODE_SUBJECT,
-                minutes = self.registry.cfg.login_link_ttl.as_secs() / 60,
             ))
     }
 }

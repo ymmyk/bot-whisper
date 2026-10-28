@@ -237,7 +237,7 @@ pub(crate) fn hostname() -> String {
 /// Best-effort "open this URL in the default browser".
 pub fn open_browser(url: &str) {
     eprintln!("Open this URL to sign in (it should open by itself):\n\n  {url}\n");
-    eprintln!("Sign in with your email; type the one-time code we email you into that page.\n");
+    eprintln!("Sign in there and approve this bot.\n");
     let result = if cfg!(target_os = "macos") {
         std::process::Command::new("open").arg(url).spawn()
     } else if cfg!(windows) {

@@ -936,14 +936,15 @@ async fn unconfirmed_clients_are_told_to_confirm_the_email() {
     };
     let says_confirm = |s: &str| {
         for want in [
-            "Ask your user to check their inbox (and spam folder)",
-            "'Your BotWhisper sign-in code'",
-            "type the one-time code from it into the sign-in page",
-            "expires in 15 minutes",
-            "Then retry, or reconnect the BotWhisper connector",
-            "start the connect again",
+            "call the BotWhisper connector's login tool",
+            "signs in and approves this bot",
+            "ACCOUNT_REQUIRED",
         ] {
             assert!(s.contains(want), "missing {want:?} in {s}");
+        }
+        // Bot sign-in has no emailed code any more: none of that wording.
+        for dead in ["inbox", "spam", "emailed", "one-time code"] {
+            assert!(!s.contains(dead), "dead wording {dead:?} in {s}");
         }
     };
 
@@ -989,8 +990,8 @@ async fn unconfirmed_clients_are_told_to_confirm_the_email() {
         let body = r.text().await.unwrap();
         assert!(body.starts_with("unauthorized (ACCOUNT_REQUIRED): No BotWhisper access yet."));
         says_confirm(&body);
-        assert!(body.contains("from this BotWhisper relay"));
-        assert!(body.contains(&format!("create an account first at {base}/signup")));
+        assert!(!body.contains("emailed"), "{body}");
+        assert!(body.contains(&format!("create an account first at {base}/signup and then call login")));
         assert!(body.contains(&format!(
             "`claude mcp add botwhisper -- botwhisper connect --relay {base} --bot-name YOUR-BOT-NAME`"
         )));
@@ -1006,8 +1007,8 @@ async fn unconfirmed_clients_are_told_to_confirm_the_email() {
     let v: Value = r.json().await.unwrap();
     assert_eq!(v["error"], "invalid_grant");
     let d = v["error_description"].as_str().unwrap();
-    assert!(d.contains("reconnect the BotWhisper connector"), "{d}");
-    assert!(d.contains("'Your BotWhisper sign-in code'") && d.contains("check spam"));
+    assert!(d.contains("call the connector's login tool"), "{d}");
+    assert!(!d.contains("spam") && !d.contains("one-time code"), "{d}");
     no_secrets(d);
 
     let r = http
@@ -1031,8 +1032,10 @@ async fn unconfirmed_clients_are_told_to_confirm_the_email() {
     let idx = http.get(&base).send().await.unwrap().text().await.unwrap();
     assert!(idx.contains(&format!("create a free account at {base}/signup")));
     assert!(idx.contains("Every bot's person needs an account"));
-    assert!(idx.contains("'Your BotWhisper sign-in code'") && idx.contains("check spam"));
-    assert!(idx.contains("type its one-time code into the browser sign-in page"));
+    assert!(
+        !idx.contains("spam") && !idx.contains("one-time code"),
+        "{idx}"
+    );
 
     // The invite landing page an agent may fetch before it has the connector.
     let page = http
@@ -1081,9 +1084,10 @@ async fn mcp_instructions_explain_email_confirmation() {
     assert!(ins.contains("--bot-name YOUR-BOT-NAME"));
     assert!(ins.contains("no tool here that reads or writes message text"));
     assert!(ins.contains(&format!("{}/signup", relay.base())));
-    assert!(ins.contains("check their inbox (and spam)"));
-    assert!(ins.contains("'Your BotWhisper sign-in code'") && ins.contains("one-time code"));
-    assert!(ins.contains("expires in 15 minutes"));
+    assert!(
+        !ins.contains("inbox") && !ins.contains("one-time code"),
+        "{ins}"
+    );
     bot.close().await;
     relay.shutdown().await;
 }

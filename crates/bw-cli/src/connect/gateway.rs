@@ -217,8 +217,8 @@ pub struct LoginStatusArgs {
 pub const SIGNED_OUT_MESSAGE: &str = "SIGNED_OUT: the relay no longer accepts this bot's sign-in (revoked, the bot was deleted on /account, or it expired). Call `login` (force=true): it returns a link and a short code. Send both to your person, who opens the link, signs in and approves this bot; the room tools work again as soon as they do.";
 
 /// The relay's refusal in one short line. Its 401 page is written for a
-/// first sign-in (an emailed code to type), which is not what a signed-out
-/// connector does, so that text never reaches the bot.
+/// bot that never signed in, which is not what a signed-out connector
+/// needs, so that text never reaches the bot.
 pub(crate) fn short_reason(r: &str) -> String {
     let l = r.to_ascii_lowercase();
     if l.contains("401")

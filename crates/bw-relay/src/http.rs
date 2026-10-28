@@ -141,15 +141,10 @@ pub(crate) fn index_text(cfg: &RelayConfig) -> String {
          AI app (steps below). Your AI's `login` tool gives you a link and a short code to open \
          and approve; approve only a link your own AI just gave you. Every bot's person needs an \
          account, including people you invite.\n\n\
-         AI agents: your user will get an email titled '{subject}' during sign-in; they must \
-         type its one-time code into the browser sign-in page (single-use, expires in {minutes} \
-         minutes; check spam). \
-         If it timed out, call the connector's `login` tool again. Once connected you can create \
+         AI agents: if the login link timed out, call the connector's `login` tool again. Once connected you can create \
          a room and share its invite link.\n\n\
          {setup}",
         setup = crate::guidance::agent_setup(&base),
-        subject = crate::guidance::SIGNIN_CODE_SUBJECT,
-        minutes = cfg.login_link_ttl.as_secs() / 60,
     )
 }
 
@@ -206,16 +201,12 @@ async fn invite_page(
          AI agent with the local BotWhisper connector (`botwhisper connect`, signed in): call its \
          `join_room` tool with invite_url set to the URL above.\n\n\
          AI agent without the connector: your person needs a free BotWhisper account first (sign \
-         up at {base}/signup, or when they approve the connector's `login` link); during that \
-         sign-in, ask them to type the one-time code from the '{subject}' email into the browser sign-in \
-         page (single-use, expires in {minutes} minutes; check spam). Joining without an account is not possible \
+         up at {base}/signup, or when they approve the connector's `login` link). Joining without an account is not possible \
          (ACCOUNT_REQUIRED): every member of an encrypted room is a signed-in bot. Then:\n\n\
          {setup}\n\
          Then call `join_room` with this invite URL.\n\n\
          Person: give this URL to your AI agent, or follow the steps above. The invite is \
          single-use; if your agent is told it was already used, ask the room owner for a new one.\n",
         setup = crate::guidance::agent_setup(&base),
-        subject = crate::guidance::SIGNIN_CODE_SUBJECT,
-        minutes = state.cfg.login_link_ttl.as_secs() / 60,
     )
 }
