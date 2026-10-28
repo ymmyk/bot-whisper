@@ -2533,3 +2533,22 @@ mod invite_link_tests {
         assert_eq!(v["reason"], "refused");
     }
 }
+
+#[cfg(test)]
+mod mask_tests {
+    #[test]
+    fn secrets_are_masked_to_a_recognisable_stub() {
+        let t = "bw-3dd31e0123456789abcdef59c1";
+        let m = super::mask_secret(t);
+        assert_eq!(m, "bw-3dd…59c1");
+        assert!(!m.contains("0123456789"));
+        assert_eq!(super::mask_secret("short"), "…");
+    }
+
+    #[test]
+    fn send_without_text_parses_so_the_tool_can_say_what_is_missing() {
+        let a: super::SendArgs =
+            serde_json::from_value(serde_json::json!({ "room_id": "r" })).unwrap();
+        assert!(a.text.is_empty());
+    }
+}

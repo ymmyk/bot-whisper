@@ -297,6 +297,11 @@ pub fn proxy_env() -> Vec<&'static str> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn certificate_counts_read_right() {
+        assert_eq!(super::certificates(1), "1 certificate");
+        assert_eq!(super::certificates(3), "3 certificates");
+    }
     use super::*;
 
     #[test]

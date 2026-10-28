@@ -1053,3 +1053,66 @@ impl Gateway {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn saved(relay: &str, bot_name: Option<&str>) -> Vec<u8> {
+        serde_json::to_vec(&SavedLogin {
+            relay: relay.into(),
+            client_id: "c".into(),
+            device_code: "d".into(),
+            user_code: "u".into(),
+            verification_uri: "https://x/device".into(),
+            verification_uri_complete: "https://x/device?c=u".into(),
+            interval: 5,
+            expires_at: bw_relay::doorbell::now_unix() + 600,
+            bot_name: bot_name.map(str::to_string),
+        })
+        .unwrap()
+    }
+
+    fn home(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("bw-gw-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    }
+
+    #[tokio::test]
+    async fn a_pending_login_for_another_bot_name_is_dropped_not_resumed() {
+        let relay = "http://127.0.0.1:9";
+        let dir = home("other");
+        let path = pending_login_path(&dir, relay);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, saved(relay, Some("Atlas"))).unwrap();
+        let g = Gateway::new(relay, dir.clone(), None, Some("Scout".into()));
+        assert!(!g.resume_pending_login().await);
+        assert!(!path.exists(), "the stale login is deleted");
+        let note = g.inner.resume_note.lock().unwrap().clone().unwrap();
+        assert!(
+            note.contains("bot \"Atlas\"") && note.contains("now bot \"Scout\""),
+            "{note}"
+        );
+        // Started before names were saved: also not carried on.
+        std::fs::write(&path, saved(relay, None)).unwrap();
+        assert!(!g.resume_pending_login().await);
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_pending_login_for_the_same_bot_name_resumes() {
+        let relay = "http://127.0.0.1:9";
+        let dir = home("same");
+        let path = pending_login_path(&dir, relay);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, saved(relay, Some("Scout"))).unwrap();
+        let g = Gateway::new(relay, dir.clone(), None, Some("Scout".into()));
+        assert!(g.resume_pending_login().await);
+        g.inner
+            .stopped
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

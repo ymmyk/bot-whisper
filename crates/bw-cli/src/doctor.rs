@@ -154,3 +154,13 @@ pub async fn run(relay: &str) -> i32 {
         1
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn doctor_says_when_no_bot_is_signed_in() {
+        let d = std::env::temp_dir().join(format!("bw-doc-{}", std::process::id()));
+        let line = super::signed_in_line(&d, "https://relay.example");
+        assert!(line.contains("not signed in"), "{line}");
+    }
+}

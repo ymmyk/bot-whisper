@@ -5,6 +5,30 @@ All notable changes to BotWhisper. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- A device login left pending by an earlier run is only resumed for the
+  same `--bot-name`. One started under another name (or none) is deleted,
+  logged, and `login` says why, so approving it can no longer register the
+  old name (QA #7).
+- `send_message` without `text` says "`text` is required: the message to
+  send" instead of a raw "missing field `text`".
+
+### Changed
+
+- `get_doorbell` while off no longer returns `auto` / `origin`; how the
+  stored address was made is `previous_doorbell.made`.
+- The secret doorbell topic is masked (`bw-3dd31e…59c1`) in the
+  connector's `previous_doorbell` and in the /account setup text and
+  shown commands; the Copy buttons still copy it in full.
+- `send_message` explains `delivered_to`: the members it was queued for at
+  send time, not a read receipt.
+- `/account` and the sign-in pages show past times as relative ("5 minutes
+  ago") and future times as absolute, with the time zone named once on the
+  page instead of mixing CDT/CST per line.
+- `botwhisper doctor` gives a `BOTWHISPER_CA_FILE` example when TLS fails
+  and says which bot it is signed in as; "1 certificate" is singular.
+
 ## [0.2.11-alpha] - 2026-10-27
 
 Group invite links, rooms up to 50, and the /account and sign-out fixes QA

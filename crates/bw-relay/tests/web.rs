@@ -1268,8 +1268,8 @@ async fn wakeups_state_reflects_a_real_doorbell() {
     // get_doorbell says what /account says.
     let g = bot.ok("get_doorbell", json!({})).await;
     assert_eq!(g["state"], "off", "{g}");
-    assert_eq!(g["auto"], false);
-    assert!(g["origin"].is_null());
+    // Off is off: no `auto` / `origin` that read like a live setting.
+    assert!(g.get("auto").is_none() && g.get("origin").is_none(), "{g}");
     assert!(
         g["doorbell"].is_null() && g.get("previous_doorbell").is_none(),
         "{g}"
@@ -1283,8 +1283,8 @@ async fn wakeups_state_reflects_a_real_doorbell() {
     // Automatic, never set up on purpose (like QA Test 5): off.
     let g = bot.ok("get_doorbell", json!({})).await;
     assert_eq!(g["state"], "off", "{g}");
-    assert_eq!(g["origin"], "automatic");
-    assert_eq!(g["auto"], true);
+    assert!(g.get("auto").is_none() && g.get("origin").is_none(), "{g}");
+    assert_eq!(g["previous_doorbell"]["made"], "automatically at sign-in");
     assert_eq!(
         g["summary"],
         "Wake-ups are off. Ask your AI to turn on wake-ups."
@@ -1318,6 +1318,29 @@ async fn wakeups_state_reflects_a_real_doorbell() {
     );
     bot.ok("set_doorbell", json!({ "type": "ntfy" })).await;
     let p = page(alice.clone()).await;
+    // The secret topic is masked in the visible text (Copy still has it).
+    {
+        let g = bot.ok("get_doorbell", json!({})).await;
+        let topic = g["doorbell"]["topic"].as_str().unwrap().to_string();
+        assert!(
+            !p.contains(&format!("<code>{topic}</code>")),
+            "masked in the sentence"
+        );
+        let pres: Vec<&str> = p
+            .split("<pre>")
+            .skip(1)
+            .map(|x| x.split("</pre>").next().unwrap())
+            .collect();
+        assert!(!pres.is_empty(), "setup commands shown");
+        assert!(
+            pres.iter().all(|c| !c.contains(&topic)),
+            "masked in the shown commands"
+        );
+        assert!(
+            p.contains(&format!("<code>{}…", &topic[..9])),
+            "masked stub shown"
+        );
+    }
     assert!(
         p.contains("<strong>Wake-ups are on</strong> (all rooms)"),
         "set up on purpose"
