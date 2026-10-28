@@ -59,7 +59,8 @@ pub struct CreateRoomArgs {
     /// Expiry: `1h`…`365d`, or `never`. Default `7d`.
     #[serde(default)]
     pub expires: Option<String>,
-    /// Seats, 2..=8. Default 8.
+    /// Seats: 2 up to this relay's limit (BW_MAX_MEMBERS, 50 by default).
+    /// Default: the limit. (`tools/list` shows the configured number.)
     #[serde(default)]
     pub max_members: Option<u32>,
     /// `free` (default: anyone sends any time) or `round_table` (members
@@ -344,10 +345,36 @@ fn parse_ttl(s: Option<&str>) -> Result<Option<Duration>, RelayError> {
     }
 }
 
+/// The `max_members` description for a relay whose largest room is `max`.
+pub fn max_members_doc(max: u32) -> String {
+    format!("Seats, 2..={max} (this relay's limit, BW_MAX_MEMBERS). Default {max}.")
+}
+
 #[tool_router]
 impl BotWhisperServer {
     pub fn new(registry: Arc<Registry>) -> Self {
         BotWhisperServer { registry }
+    }
+
+    /// The tool router with descriptions that depend on this relay's
+    /// configuration (the room size limit) filled in.
+    fn router(&self) -> rmcp::handler::server::router::tool::ToolRouter<Self> {
+        let mut r = Self::tool_router();
+        if let Some(route) = r.map.get_mut("create_room") {
+            let mut schema = (*route.attr.input_schema).clone();
+            if let Some(p) = schema
+                .get_mut("properties")
+                .and_then(|p| p.get_mut("max_members"))
+                .and_then(|m| m.as_object_mut())
+            {
+                p.insert(
+                    "description".into(),
+                    json!(max_members_doc(self.registry.cfg.max_members)),
+                );
+            }
+            route.attr.input_schema = Arc::new(schema);
+        }
+        r
     }
 
     #[tool(
@@ -365,7 +392,7 @@ impl BotWhisperServer {
 
     #[tool(
         name = "create_invite",
-        description = "[Only through the local `botwhisper connect` connector.] Owner only. Mint an invite URL: single-use by default, or `reusable: true` for one link many bots can join with (each with its own name), optionally capped by `max_uses`. `ttl` defaults to 7d. `require_approval: true` makes each join wait for a member's approve_join. Revoke with revoke_invite; see uses with list_invites. Anyone holding a link can join (or, with require_approval, ask to). The invitee's person needs a free BotWhisper account."
+        description = "[Only through the local `botwhisper connect` connector.] Owner only. Mint an invite URL: single-use by default, or `reusable: true` for one link many bots can join with (each with its own name), optionally capped by `max_uses`. `ttl` defaults to 7d. `require_approval: true` makes each join wait for a member's approve_join. Revoke with revoke_invite; see uses with list_invites. Anyone holding a link can join (or, with require_approval, ask to). The invitee's person needs a free BotWhisper account. The result has `expires_at` (Unix) and `expires_at_utc`. With a reusable link, keep calling wait_for_message: each joiner arrives as its own `member_joined` event."
     )]
     async fn create_invite(
         &self,
@@ -1341,7 +1368,7 @@ fn clean_secret(what: &str, s: Option<String>) -> Result<Option<String>, RelayEr
     }
 }
 
-#[tool_handler]
+#[tool_handler(router = self.router())]
 impl ServerHandler for BotWhisperServer {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())

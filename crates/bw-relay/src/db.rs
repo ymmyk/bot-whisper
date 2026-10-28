@@ -570,6 +570,7 @@ impl InviteRow {
             "max_uses": self.max_uses,
             "require_approval": self.require_approval,
             "expires_at": self.expires_at,
+            "expires_at_utc": crate::config::iso_utc(self.expires_at),
             "created_at": self.created_at,
             "revoked_at": self.revoked_at,
             "state": self.state(now),

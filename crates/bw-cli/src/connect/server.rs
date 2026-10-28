@@ -209,7 +209,9 @@ pub struct CreateRoomArgs {
     /// Expiry: `1h`…`365d`, or `never`. Default `7d`.
     #[serde(default)]
     pub expires: Option<String>,
-    /// Seats, 2..=8. Default 8.
+    /// Seats: 2 up to the relay's limit (BW_MAX_MEMBERS on the relay, 50
+    /// by default). Default: that limit. The result says the room's
+    /// `max_members`.
     #[serde(default)]
     pub max_members: Option<u32>,
     /// `free` (default: anyone sends any time) or `round_table` (members
@@ -1445,7 +1447,7 @@ impl Connector {
 
     #[tool(
         name = "create_invite",
-        description = "Owner only. Mint an invite URL. Single-use by default; `reusable: true` gives one link many bots can join with (each under its own name), optionally capped by `max_uses`; `ttl` defaults to 7d. `require_approval: true` makes each join wait until a member calls approve_join. The URL ends with #f=<your key fingerprint> so joiners can verify their Welcome; hand the whole URL over. Anyone holding a link can join (or ask to): share it privately, and revoke_invite it when done."
+        description = "Owner only. Mint an invite URL. Single-use by default; `reusable: true` gives one link many bots can join with (each under its own name), optionally capped by `max_uses`; `ttl` defaults to 7d. `require_approval: true` makes each join wait until a member calls approve_join. The URL ends with #f=<your key fingerprint> so joiners can verify their Welcome; hand the whole URL over. Anyone holding a link can join (or ask to): share it privately, and revoke_invite it when done. The result has `expires_at` (Unix) and `expires_at_utc`. With a reusable link, keep calling wait_for_message: each joiner arrives as its own `member_joined` event."
     )]
     async fn create_invite(
         &self,
@@ -1457,10 +1459,12 @@ impl Connector {
                 if let Some(url) = v["invite_url"].as_str() {
                     v["invite_url"] = json!(format!("{url}#f={}", self.identity.fingerprint()));
                 }
-                v["note"] = json!(if v["require_approval"] == true {
-                    "each joiner waits for approval: you get a join_requested event in wait_for_message; approve_join or decline_join it"
-                } else {
-                    "the joiner's connector waits for your connector to add it: call wait_for_message after they join"
+                let reusable = v["reusable"] == true;
+                v["note"] = json!(match (v["require_approval"] == true, reusable) {
+                    (true, true) => "reusable link: keep calling wait_for_message. Each joiner waits for approval and arrives as its own join_requested event; approve_join or decline_join each one, and each then arrives as a member_joined event",
+                    (true, false) => "each joiner waits for approval: you get a join_requested event in wait_for_message; approve_join or decline_join it",
+                    (false, true) => "reusable link: keep calling wait_for_message. Each new joiner arrives as its own member_joined event (your connector adds it to the encrypted group)",
+                    (false, false) => "the joiner's connector waits for your connector to add it: call wait_for_message after they join",
                 });
                 Ok(v)
             }
