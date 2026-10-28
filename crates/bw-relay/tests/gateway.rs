@@ -273,7 +273,8 @@ async fn gated_inner() {
     let p = call(&svc, "login_status", json!({ "wait_s": 1 })).await;
     assert_eq!(p["status"], "pending");
     assert_eq!(tool_names(&svc).await, signed_out_names);
-    assert_eq!(changed.load(Ordering::SeqCst), 0);
+    // Only the one sent when the session started.
+    assert_eq!(changed.load(Ordering::SeqCst), 1);
     // A gated call while the grant is pending waits for it a little, then
     // says NOT_SIGNED_IN and repeats the link and code.
     let r = raw(&svc, "list_rooms", json!({})).await;
@@ -304,8 +305,8 @@ async fn gated_inner() {
     let agent_id = s["agent_id"].as_str().unwrap().to_string();
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(
-        changed.load(Ordering::SeqCst) >= 1,
-        "tools/list_changed sent on sign-in"
+        changed.load(Ordering::SeqCst) >= 2,
+        "tools/list_changed sent on sign-in (after the startup one)"
     );
     // Tokens stored like the browser login, keys made and published.
     let store = BotStore::current(&config, &relay.base()).expect("current bot");
@@ -412,7 +413,8 @@ async fn denied_inner() {
     assert!(tool_names(&svc).await.iter().any(|n| n == "create_room"));
     let r = raw(&svc, "create_room", json!({})).await;
     assert_eq!(r.structured_content.unwrap()["error"], "NOT_SIGNED_IN");
-    assert_eq!(changed.load(Ordering::SeqCst), 0);
+    // Only the one sent when the session started.
+    assert_eq!(changed.load(Ordering::SeqCst), 1);
     // `login` starts a fresh code.
     let l2 = call(&svc, "login", json!({})).await;
     assert_eq!(l2["status"], "pending");
@@ -1050,4 +1052,21 @@ async fn retired_inner() {
     svc.cancel().await.ok();
     relay.shutdown().await;
     let _ = std::fs::remove_dir_all(&config);
+}
+
+/// A host may still hold an older connector's tool list (before an
+/// upgrade): list_changed goes out as soon as the session starts.
+#[tokio::test]
+async fn list_changed_is_sent_when_the_session_starts() {
+    let relay = TestRelay::start_with(cfg()).await;
+    let config = tmp_dir("initialized");
+    let gw = Gateway::new(&relay.base(), config, None, Some("Gateway Bot".into()));
+    let (_svc, changed) = serve(gw).await;
+    for _ in 0..40 {
+        if changed.load(Ordering::SeqCst) >= 1 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("no tools/list_changed after initialize");
 }

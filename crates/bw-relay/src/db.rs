@@ -1038,6 +1038,17 @@ impl Db {
         })
     }
 
+    /// A member renamed their own seat.
+    pub fn set_member_name(&self, room_id: &str, member_id: &str, name: &str) -> Result<()> {
+        self.with(|c| {
+            c.execute(
+                "UPDATE members SET display_name = ?3 WHERE room_id = ?1 AND member_id = ?2",
+                params![room_id, member_id, name],
+            )?;
+            Ok(())
+        })
+    }
+
     // ----- e2e: key packages and handshake messages -----
 
     /// Store one key package for a bot. Keeps at most `keep` unclaimed ones

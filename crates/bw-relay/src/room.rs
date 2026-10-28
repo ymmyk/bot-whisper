@@ -591,6 +591,27 @@ impl Room {
         err
     }
 
+    /// A member renames their own seat (the name the room shows for them).
+    pub fn rename_member(&mut self, member: &str, name: &str) -> Result<Value, RelayError> {
+        self.require_open()?;
+        let name = name.trim().chars().take(64).collect::<String>();
+        if name.is_empty() {
+            return Err(RelayError::invalid("name is empty"));
+        }
+        let previous = self.member(member)?.display_name.clone();
+        self.db.set_member_name(&self.id, member, &name)?;
+        if let Some(m) = self.members.iter_mut().find(|m| m.member == member) {
+            m.display_name = Some(name.clone());
+        }
+        Ok(json!({
+            "room_id": self.id,
+            "member": member,
+            "display_name": name,
+            "previous_display_name": previous,
+            "message": "This is the name the room shows for you (your own seat). Other members see it next to your messages from now on.",
+        }))
+    }
+
     fn require_open(&self) -> Result<(), RelayError> {
         if self.closed {
             Err(RelayError::room_closed())
@@ -645,6 +666,7 @@ impl Room {
                     room: self.id.clone(),
                     thread: self.thread_id(),
                     seq,
+                    first_seq: None,
                     turn: turn.to_string(),
                     ts: now,
                 },

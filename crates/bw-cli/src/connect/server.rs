@@ -34,7 +34,7 @@ use tokio::sync::Mutex;
 use super::{
     lock::ConfigLock,
     relay::{tool_error_code, RelayClient},
-    store::{item_fingerprint, BotStore, CachedDoorbell, Inbox, RoomMeta},
+    store::{item_fingerprint, BotStore, CachedDoorbell, History, Inbox, RoomMeta},
     trust::{Observation, TrustStore},
 };
 
@@ -126,6 +126,13 @@ struct ReceivedFile {
 struct State {
     /// Undelivered messages and processed-item fingerprints (inbox.json).
     inbox: Inbox,
+    /// Received messages by seq, capped and expiring (history.json): the
+    /// read-only re-read and the `already_delivered` hint.
+    history: History,
+    /// `send_message` `reply_to_seq` claims: (room, seq) -> (the reply's
+    /// seq once sent, when claimed). Stops two sessions of this bot from
+    /// both answering one message.
+    replies: HashMap<(String, u64), (Option<u64>, u64)>,
     rooms: HashMap<String, RoomState>,
     pending: HashMap<String, Pending>,
     awaiting: HashMap<String, Awaiting>,
@@ -328,9 +335,18 @@ pub struct JoinRoomArgs {
     /// The invite URL you were given (keep its `#...` part: it carries the
     /// inviter's key fingerprint and never leaves this machine).
     pub invite_url: String,
-    /// How the room sees this bot. Default: the bot's own name.
+    /// Your OWN display name in this room (how the other members see you),
+    /// not the room's or the inviter's name. Default: your signed-in bot
+    /// name. Change it later with rename_seat.
     #[serde(default)]
     pub name: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RenameSeatArgs {
+    pub room_id: String,
+    /// Your new display name in this room (1 to 64 characters).
+    pub name: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -370,6 +386,14 @@ pub struct SendArgs {
     /// thread when it is not your turn.
     #[serde(default)]
     pub interrupt: Option<bool>,
+    /// The seq of the message you are answering. If this bot already
+    /// answered it (another session, in the last 10 minutes) the send is
+    /// refused with ALREADY_REPLIED, so one message never gets two replies.
+    #[serde(default)]
+    pub reply_to_seq: Option<u64>,
+    /// With reply_to_seq: send even if this bot already answered it.
+    #[serde(default)]
+    pub allow_duplicate: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -380,6 +404,29 @@ pub struct WaitArgs {
     /// Seconds to block. Default 45, max 55.
     #[serde(default)]
     pub timeout_s: Option<u64>,
+    /// The `seq` from the doorbell that woke you (optional). If another
+    /// session of this bot already took that message, the result lists it
+    /// in `already_delivered` (and answers at once instead of waiting).
+    #[serde(default)]
+    pub seq: Option<u64>,
+    /// Re-read instead of waiting (read-only): the messages this computer
+    /// received with seq >= since_seq, also ones another session already
+    /// took. Nothing is fetched or acknowledged. Same as read_messages.
+    #[serde(default)]
+    pub since_seq: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ReadArgs {
+    /// Room to re-read. Omit for every room.
+    #[serde(default)]
+    pub room_id: Option<String>,
+    /// Messages with seq >= since_seq (default 0: all that are kept).
+    #[serde(default)]
+    pub since_seq: Option<u64>,
+    /// At most this many per room, the newest (default 50, max 200).
+    #[serde(default)]
+    pub limit: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -401,8 +448,17 @@ pub struct DoorbellArgs {
     pub webhook_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret: Option<String>,
+    /// webhook: the `Authorization` header VALUE only, e.g. `Bearer abc123`
+    /// (not `Authorization: Bearer abc123`). Prefer auth_header_file, so
+    /// the key never passes through the chat.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_header: Option<String>,
+    /// webhook: path to a file on this computer holding the Authorization
+    /// header value (one line, e.g. `Bearer abc123`). The connector reads
+    /// it and sends only the value to the relay; it never appears in the
+    /// chat or in any result.
+    #[serde(default, skip_serializing)]
+    pub auth_header_file: Option<String>,
     /// ntfy / gotify server base URL.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server: Option<String>,
@@ -547,6 +603,9 @@ struct Drained {
     mode: Value,
     /// Key-change warnings (loud, per member).
     warnings: Vec<String>,
+    /// Seqs this fetch returned that another call on this connector had
+    /// already processed (two sessions fetching at once).
+    taken_elsewhere: Vec<u64>,
 }
 
 /// The relay's seat id for an agent id, from a `get_status` members list.
@@ -557,6 +616,48 @@ fn seat_name(seats: &Value, agent_id: &str) -> Value {
         .and_then(|a| a.iter().find(|m| m["agent_id"] == agent_id))
         .map(|m| m["display_name"].clone())
         .unwrap_or(Value::Null)
+}
+
+/// The `Authorization` value from `auth_header_file` (`~/` is the home
+/// directory). The error names the file, never its contents.
+fn read_auth_header_file(path: &str) -> anyhow::Result<String> {
+    let p = match path.strip_prefix("~/") {
+        Some(rest) => std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(|h| std::path::PathBuf::from(h).join(rest))
+            .unwrap_or_else(|| std::path::PathBuf::from(path)),
+        None => std::path::PathBuf::from(path),
+    };
+    let raw = std::fs::read_to_string(&p).map_err(|e| {
+        anyhow::anyhow!(
+            "could not read auth_header_file {}: {}",
+            p.display(),
+            e.kind()
+        )
+    })?;
+    let v = raw.trim().to_string();
+    if v.is_empty() {
+        anyhow::bail!("auth_header_file {} is empty", p.display());
+    }
+    Ok(v)
+}
+
+/// What `read_messages` says about the local re-read store.
+const HISTORY_NOTE: &str = "The last 200 messages per room for 24 hours, kept on this computer only (decrypted here; never sent anywhere). Re-reading does not fetch or acknowledge anything.";
+/// How long a `reply_to_seq` claim stops a second reply.
+const REPLY_CLAIM_S: u64 = 600;
+const ALREADY_DELIVERED_NOTE: &str = "These messages were already handed out on this computer by an earlier wait_for_message call, usually another session of this bot woken by the same doorbell. Re-read them with read_messages (since_seq). Before answering one, check `replied`; send_message with reply_to_seq refuses a second answer.";
+const SEQ_NOTE: &str = "That seq is not a message on this computer. A room's seqs also number group changes (members joining or leaving) and title updates, which are applied without being shown, and a wake-up for a turn or member change names the room's latest seq. So gaps between message seqs are normal.";
+
+/// A history entry as `read_messages` shows it.
+fn history_view(e: &super::store::HistoryEntry) -> Value {
+    let mut m = e.message.clone();
+    m["received_at_utc"] = json!(bw_relay::config::iso_utc(e.received_at));
+    m["delivered_at_utc"] = json!(e.delivered_at.map(bw_relay::config::iso_utc));
+    if let Some((seq, at)) = e.replied {
+        m["replied"] = json!({ "seq": seq, "at_utc": bw_relay::config::iso_utc(at) });
+    }
+    m
 }
 
 fn seat_of(seats: &Value, agent_id: &str) -> Option<String> {
@@ -710,6 +811,8 @@ impl Connector {
             c.load_saved_rooms(&mut st);
             if let Some(s) = &c.store {
                 st.inbox = s.load_inbox();
+                st.history = s.load_history();
+                st.history.prune(bw_relay::doorbell::now_unix());
             }
         }
         // Replace whatever earlier runs left on the relay with fresh key
@@ -791,6 +894,9 @@ impl Connector {
             if let Err(e) = s.save_inbox(&st.inbox) {
                 tracing::warn!("could not save inbox.json: {e}");
             }
+            if let Err(e) = s.save_history(&st.history) {
+                tracing::warn!("could not save history.json: {e}");
+            }
         }
     }
 
@@ -807,8 +913,187 @@ impl Connector {
             std::mem::take(&mut ri.items),
             std::mem::take(&mut ri.events),
         );
+        let seqs: Vec<u64> = out.0.iter().filter_map(|m| m["seq"].as_u64()).collect();
+        let now = bw_relay::doorbell::now_unix();
+        st.history.mark_delivered(room_id, &seqs, now);
+        st.history.prune(now);
         self.persist_inbox(&st);
         out
+    }
+
+    /// The read-only re-read (`read_messages`, `wait_for_message since_seq`).
+    async fn reread(&self, room: Option<&str>, since: u64, limit: usize) -> Value {
+        let limit = limit.clamp(1, super::store::HISTORY_PER_ROOM);
+        let mut st = self.state.lock().await;
+        st.history.prune(bw_relay::doorbell::now_unix());
+        let ids: Vec<String> = match room {
+            Some(r) => vec![r.to_string()],
+            None => st.history.rooms.keys().cloned().collect(),
+        };
+        let rooms: Vec<Value> = ids
+            .iter()
+            .map(|id| {
+                let messages: Vec<Value> = st
+                    .history
+                    .since(id, since, limit)
+                    .into_iter()
+                    .map(history_view)
+                    .collect();
+                json!({ "room_id": id, "messages": messages })
+            })
+            .collect();
+        let mut v = match room {
+            Some(_) => rooms.into_iter().next().unwrap_or_default(),
+            None => json!({ "rooms": rooms }),
+        };
+        v["read_only"] = json!(true);
+        v["kept"] = json!(HISTORY_NOTE);
+        v
+    }
+
+    /// Messages of `room` that an earlier call on this connector already
+    /// handed out (another session of this bot, usually).
+    fn already_delivered(
+        st: &State,
+        room: &str,
+        rung: Option<u64>,
+        returned: &Value,
+        taken: &[u64],
+        now: u64,
+    ) -> Vec<Value> {
+        let returned: Vec<u64> = returned
+            .as_array()
+            .map(|a| a.iter().filter_map(|m| m["seq"].as_u64()).collect())
+            .unwrap_or_default();
+        let Some(q) = st.history.rooms.get(room) else {
+            return Vec::new();
+        };
+        let mut out: Vec<Value> = q
+            .iter()
+            .filter(|e| !returned.contains(&e.seq))
+            .filter_map(|e| e.delivered_at.map(|at| (e, at)))
+            // The doorbell's seq and later, or what a concurrent fetch had
+            // already processed. (Without a seq a session's own earlier
+            // messages would look the same, so they are not listed.)
+            .filter(|(e, at)| {
+                now.saturating_sub(*at) <= super::store::HISTORY_TTL_S
+                    && (rung.is_some_and(|n| e.seq >= n) || taken.contains(&e.seq))
+            })
+            .map(|(e, at)| {
+                let mut v = json!({ "seq": e.seq, "at_utc": bw_relay::config::iso_utc(at) });
+                match (
+                    e.replied,
+                    st.replies.get(&(room.to_string(), e.seq)).copied(),
+                ) {
+                    (Some((seq, t)), _) | (None, Some((Some(seq), t))) => {
+                        v["replied"] =
+                            json!({ "seq": seq, "at_utc": bw_relay::config::iso_utc(t) });
+                    }
+                    (None, Some((None, _))) => v["reply_in_progress"] = json!(true),
+                    _ => {}
+                }
+                v
+            })
+            .collect();
+        let skip = out.len().saturating_sub(20);
+        out.drain(..skip);
+        out
+    }
+
+    /// Claim the answer to `seq` for this send (see `reply_to_seq`).
+    async fn claim_reply(&self, room: &str, seq: u64, allow: bool) -> anyhow::Result<()> {
+        let now = bw_relay::doorbell::now_unix();
+        let mut st = self.state.lock().await;
+        st.replies
+            .retain(|_, (_, at)| now.saturating_sub(*at) <= REPLY_CLAIM_S);
+        let key = (room.to_string(), seq);
+        let earlier = st.replies.get(&key).copied().or_else(|| {
+            st.history
+                .get(room, seq)
+                .and_then(|e| e.replied)
+                .filter(|(_, at)| now.saturating_sub(*at) <= REPLY_CLAIM_S)
+                .map(|(s, at)| (Some(s), at))
+        });
+        if let (Some((reply, at)), false) = (earlier, allow) {
+            let when = bw_relay::config::iso_utc(at);
+            let message = match reply {
+                Some(r) => format!("This bot already answered seq {seq} (its reply is seq {r}, sent {when}), probably from another session. Not sent again; read the room with read_messages, or pass allow_duplicate: true to send anyway."),
+                None => format!("Another session of this bot is answering seq {seq} right now (since {when}). Not sent; read the room with read_messages, or pass allow_duplicate: true to send anyway."),
+            };
+            return Err(super::relay::ToolError(json!({
+                "error": "ALREADY_REPLIED",
+                "reply_to_seq": seq,
+                "reply_seq": reply,
+                "at_utc": when,
+                "message": message,
+            }))
+            .into());
+        }
+        st.replies.insert(key, (None, now));
+        Ok(())
+    }
+
+    /// The claimed send finished: keep its seq, or let go of the claim.
+    async fn finish_reply(&self, room: &str, seq: u64, sent: Option<u64>) {
+        let now = bw_relay::doorbell::now_unix();
+        let mut st = self.state.lock().await;
+        let key = (room.to_string(), seq);
+        match sent {
+            Some(mine) => {
+                st.replies.insert(key, (Some(mine), now));
+                if let Some(e) = st.history.get_mut(room, seq) {
+                    e.replied = Some((mine, now));
+                }
+                self.persist_inbox(&st);
+            }
+            None => {
+                st.replies.remove(&key);
+            }
+        }
+    }
+
+    /// Encrypt and send one text message (the body of send_message).
+    async fn send_text(&self, a: SendArgs) -> anyhow::Result<Value> {
+        // Apply anything queued (commits) before encrypting.
+        let _ = self.drain(&a.room_id, Duration::ZERO).await?;
+        self.add_pending_joiners(&a.room_id).await?;
+        let mut st = self.state.lock().await;
+        let Some(r) = st.rooms.get_mut(&a.room_id) else {
+            drop(st);
+            return Err(self.no_group_error(&a.room_id).await);
+        };
+        let inner = serde_json::to_vec(&Inner {
+            v: 1,
+            kind: "text".into(),
+            text: Some(a.text),
+            title: None,
+            file: None,
+        })?;
+        let ct = r.group.encrypt(&self.identity, &inner)?;
+        let epoch = r.group.epoch();
+        // Save the advanced ratchet before the ciphertext leaves.
+        self.persist_keys();
+        drop(st);
+        let mut args = json!({ "room_id": a.room_id, "ciphertext": B64.encode(ct) });
+        if let Some(t) = &a.turn {
+            args["turn"] = json!(t);
+        }
+        if let Some(l) = a.lease_s {
+            args["lease_s"] = json!(l);
+        }
+        if a.interrupt == Some(true) {
+            args["interrupt"] = json!(true);
+        }
+        let sent = self.relay.call("e2e_send", args).await?;
+        let mut out = json!({
+            "seq": sent["seq"], "epoch": epoch, "delivered_to": sent["delivered_to"], "delivered_to_members": sent["delivered_to_members"],
+            "encryption": "mls (end-to-end)", "thread": sent["thread"], "turn": sent["turn"],
+            "counted_toward_cap": sent["counted_toward_cap"], "interrupt": sent["interrupt"],
+            "expires_at": sent["expires_at"], "expires_at_utc": sent["expires_at_utc"],
+            "retention": sent["retention"],
+        });
+        copy_delivery_notes(&sent, &mut out);
+        Ok(out)
     }
 
     /// Undelivered messages held on this computer for a room.
@@ -1053,6 +1338,7 @@ impl Connector {
         let mut files_seen = Vec::new();
         let mut max_seq = 0u64;
         let mut warnings = Vec::new();
+        let mut taken_elsewhere = Vec::new();
         for item in items {
             max_seq = max_seq.max(item["seq"].as_u64().unwrap_or(0));
             let Some(bytes) = item["payload"].as_str().and_then(|p| B64.decode(p).ok()) else {
@@ -1062,6 +1348,11 @@ impl Connector {
             // once): it was already processed and saved; never twice.
             let fp = item_fingerprint(&bytes);
             if st.inbox.rooms.get(room_id).is_some_and(|r| r.saw(&fp)) {
+                if item["kind"] == "application" {
+                    if let Some(seq) = item["seq"].as_u64() {
+                        taken_elsewhere.push(seq);
+                    }
+                }
                 continue;
             }
             st.inbox
@@ -1231,6 +1522,34 @@ impl Connector {
         for f in files_seen {
             st.files.insert(f.file.blob_id.clone(), f);
         }
+        // A relay that sends no names with the fetch roster (0.2.16 and
+        // older): take them from the room's status, so a sender is never
+        // shown without its name when the room has one.
+        if messages
+            .iter()
+            .any(|m| m["sender"].is_object() && m["sender"]["display_name"].is_null())
+        {
+            if let Ok(status) = self
+                .relay
+                .call("get_status", json!({ "room_id": room_id }))
+                .await
+            {
+                for m in messages.iter_mut() {
+                    if !m["sender"]["display_name"].is_null() {
+                        continue;
+                    }
+                    let aid = m["sender"]["agent_id"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string();
+                    m["sender"]["display_name"] = seat_name(&status["members"], &aid);
+                }
+            }
+        }
+        let now = bw_relay::doorbell::now_unix();
+        for m in &messages {
+            st.history.record(room_id, m, now);
+        }
         // Nothing is handed over here: messages and events go to the on-disk
         // inbox first (wait_for_message takes them from there), so a call
         // that only applies commits (send_message, send_file, ...) or a
@@ -1267,6 +1586,7 @@ impl Connector {
             turn,
             mode,
             warnings,
+            taken_elsewhere,
         })
     }
 
@@ -1722,7 +2042,7 @@ impl Connector {
 
     #[tool(
         name = "join_room",
-        description = "Redeem an invite URL (pass it whole, with its #f= part), publish a key package and wait (up to 50 s) for a member's connector to add you to the encrypted group. `name` is how the room sees you (default: your bot name). The result has `max_members` and `room_expires_at` / `room_expires_at_utc` (null if the room never expires). If the link needs approval you get `state: awaiting_approval` (\"waiting for a member to let you in\") with `request_expires_at_utc` (the request stays open until the invite expires or the room closes); call wait_for_message or join_room again before then. If nobody is online you stay pending: call wait_for_message later."
+        description = "Redeem an invite URL (pass it whole, with its #f= part), publish a key package and wait (up to 50 s) for a member's connector to add you to the encrypted group. `name` is YOUR OWN display name in the room (how others see you; default: your signed-in bot name), not the room's name; change it later with rename_seat. The result has `max_members` and `room_expires_at` / `room_expires_at_utc` (null if the room never expires). If the link needs approval you get `state: awaiting_approval` (\"waiting for a member to let you in\") with `request_expires_at_utc` (the request stays open until the invite expires or the room closes); call wait_for_message or join_room again before then. If nobody is online you stay pending: call wait_for_message later."
     )]
     async fn join_room(
         &self,
@@ -1762,6 +2082,24 @@ impl Connector {
     }
 
     #[tool(
+        name = "rename_seat",
+        description = "Change your own display name in a room (the name the other members see next to your messages). Only your own seat."
+    )]
+    async fn rename_seat(
+        &self,
+        Parameters(a): Parameters<RenameSeatArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        respond(
+            self.relay
+                .call(
+                    "rename_seat",
+                    json!({ "room_id": a.room_id, "name": a.name }),
+                )
+                .await,
+        )
+    }
+
+    #[tool(
         name = "send_message",
         description = "Encrypt a message on this machine and send it to the room. In a round_table room it fails with NOT_YOUR_TURN out of turn (the result names the holder and the seating order); `turn: hold` keeps the floor, `turn: done` (owner) ends the thread, `interrupt: true` uses your one short interrupt. Pending joiners in rooms you own are added first. `delivered_to` lists the members it was queued for at send time (each gets it on its next fetch; it is not a read receipt); members still joining are listed in `pending_delivery` and get it once their join completes. The result has `expires_at` (Unix) and `expires_at_utc`: an undelivered message is deleted then (held until delivered, up to the relay's retention, 7 days by default)."
     )]
@@ -1787,48 +2125,26 @@ impl Connector {
                 }
                 if let Some(t) = a.turn.as_deref() {
                     if !matches!(t, "yield" | "hold" | "done") {
-                        anyhow::bail!("turn must be yield, hold or done (use the pass tool to pass)");
+                        anyhow::bail!(
+                            "turn must be yield, hold or done (use the pass tool to pass)"
+                        );
                     }
                 }
-                // Apply anything queued (commits) before encrypting.
-                let _ = self.drain(&a.room_id, Duration::ZERO).await?;
-                self.add_pending_joiners(&a.room_id).await?;
-                let mut st = self.state.lock().await;
-                let Some(r) = st.rooms.get_mut(&a.room_id) else {
-                    drop(st);
-                    return Err(self.no_group_error(&a.room_id).await);
-                };
-                let inner = serde_json::to_vec(&Inner {
-                    v: 1,
-                    kind: "text".into(),
-                    text: Some(a.text),
-                    title: None,
-                    file: None,
-                })?;
-                let ct = r.group.encrypt(&self.identity, &inner)?;
-                let epoch = r.group.epoch();
-                // Save the advanced ratchet before the ciphertext leaves.
-                self.persist_keys();
-                drop(st);
-                let mut args = json!({ "room_id": a.room_id, "ciphertext": B64.encode(ct) });
-                if let Some(t) = &a.turn {
-                    args["turn"] = json!(t);
+                let room = a.room_id.clone();
+                let reply_to = a.reply_to_seq;
+                if let Some(n) = reply_to {
+                    self.claim_reply(&room, n, a.allow_duplicate == Some(true))
+                        .await?;
                 }
-                if let Some(l) = a.lease_s {
-                    args["lease_s"] = json!(l);
+                let res = self.send_text(a).await;
+                if let Some(n) = reply_to {
+                    let mine = res.as_ref().ok().and_then(|v| v["seq"].as_u64());
+                    self.finish_reply(&room, n, mine).await;
                 }
-                if a.interrupt == Some(true) {
-                    args["interrupt"] = json!(true);
+                let mut out = res?;
+                if let Some(n) = reply_to {
+                    out["reply_to_seq"] = json!(n);
                 }
-                let sent = self.relay.call("e2e_send", args).await?;
-                let mut out = json!({
-                    "seq": sent["seq"], "epoch": epoch, "delivered_to": sent["delivered_to"], "delivered_to_members": sent["delivered_to_members"],
-                    "encryption": "mls (end-to-end)", "thread": sent["thread"], "turn": sent["turn"],
-                    "counted_toward_cap": sent["counted_toward_cap"], "interrupt": sent["interrupt"],
-                    "expires_at": sent["expires_at"], "expires_at_utc": sent["expires_at_utc"],
-                    "retention": sent["retention"],
-                });
-                copy_delivery_notes(&sent, &mut out);
                 Ok(out)
             }
             .await,
@@ -1942,7 +2258,7 @@ impl Connector {
 
     #[tool(
         name = "wait_for_message",
-        description = "Block until encrypted messages or events arrive (default 45 s, max 55 s), decrypt them here and return them wrapped as untrusted data with the round table state (`turn`: whose turn it is). Also adds pending joiners to rooms you own. Call this in a loop."
+        description = "Block until encrypted messages or events arrive (default 45 s, max 55 s), decrypt them here and return them wrapped as untrusted data with the round table state (`turn`: whose turn it is). Also adds pending joiners to rooms you own. Call this in a loop. Woken by a doorbell? Pass its `seq`: if another session of this bot already took that message, `already_delivered` lists it ({seq, at_utc, replied}) instead of waiting; re-read it with read_messages. `since_seq` re-reads without waiting. Seqs are shared with group changes and title updates, so gaps between message seqs are normal."
     )]
     async fn wait_for_message(
         &self,
@@ -1951,6 +2267,9 @@ impl Connector {
         let room_arg = a.room_id.clone();
         respond_read(
             async {
+                if let Some(since) = a.since_seq {
+                    return Ok(self.reread(a.room_id.as_deref(), since, 50).await);
+                }
                 let mut removed_out: Vec<Value> = Vec::new();
                 let timeout = Duration::from_secs(a.timeout_s.unwrap_or(DEFAULT_WAIT_S).min(MAX_WAIT_S));
                 // Join requests waiting for approval: let in yet?
@@ -2053,6 +2372,13 @@ impl Connector {
                 for r in &rooms {
                     waiting |= self.undelivered(r).await > 0;
                 }
+                // Woken for a seq another session already took: answer now.
+                if let Some(n) = a.seq {
+                    let st = self.state.lock().await;
+                    waiting |= rooms.iter().any(|r| {
+                        st.history.get(r, n).is_some_and(|e| e.delivered_at.is_some())
+                    });
+                }
                 let timeout = if waiting { Duration::ZERO } else { timeout };
                 // One long poll per room, concurrently.
                 let polls = rooms.iter().map(|r| {
@@ -2088,6 +2414,24 @@ impl Connector {
                     if !d.warnings.is_empty() {
                         r["warnings"] = json!(d.warnings);
                     }
+                    {
+                        let st = self.state.lock().await;
+                        let now = bw_relay::doorbell::now_unix();
+                        let taken = Self::already_delivered(&st, &room, a.seq, &r["messages"], &d.taken_elsewhere, now);
+                        if !taken.is_empty() {
+                            any = true;
+                            r["already_delivered"] = json!(taken);
+                            r["already_delivered_note"] = json!(ALREADY_DELIVERED_NOTE);
+                        }
+                        if let (Some(n), Some(_)) = (a.seq, &a.room_id) {
+                            let shown = r["messages"]
+                                .as_array()
+                                .is_some_and(|m| m.iter().any(|m| m["seq"] == n));
+                            if !shown && st.history.get(&room, n).is_none() {
+                                r["seq_note"] = json!(SEQ_NOTE);
+                            }
+                        }
+                    }
                     out.push(r);
                 }
                 let mut v = if a.room_id.is_some() && out.len() == 1 {
@@ -2110,6 +2454,24 @@ impl Connector {
                 None => json!({ "rooms": [], "timed_out": true }),
             },
         )
+    }
+
+    #[tool(
+        name = "read_messages",
+        description = "Re-read messages this computer already received, by seq (read-only: nothing is fetched, acknowledged or taken from the inbox). Also shows messages another session of this bot already took, with `delivered_at_utc` and `replied` (when this bot answered with reply_to_seq). Kept on this computer only: the last 200 per room for 24 hours."
+    )]
+    async fn read_messages(
+        &self,
+        Parameters(a): Parameters<ReadArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let v = self
+            .reread(
+                a.room_id.as_deref(),
+                a.since_seq.unwrap_or(0),
+                a.limit.unwrap_or(50),
+            )
+            .await;
+        Ok(CallToolResult::structured(v))
     }
 
     #[tool(
@@ -2423,7 +2785,7 @@ impl Connector {
 
     #[tool(
         name = "set_doorbell",
-        description = "How to wake you when you are not running (content-free pings). Same arguments as the relay's set_doorbell: no type = ntfy with a private topic (the result includes `botwhisper listen` commands); webhook, webpush, gotify, pushover; type none removes. Omit room_id for a bot-wide default."
+        description = "How to wake you when you are not running (content-free pings). Same arguments as the relay's set_doorbell: no type = ntfy with a private topic (the result includes `botwhisper listen` commands); webhook, webpush, gotify, pushover; type none removes. Omit room_id for a bot-wide default. Webhook `auth_header` is the header value only (`Bearer abc123`, never `Authorization: ...`); better, put it in a file and pass `auth_header_file` (a path on this computer) so the key never goes through the chat. Back-to-back rings within a few seconds arrive as one (`first_seq` names the earliest)."
     )]
     async fn set_doorbell(
         &self,
@@ -2431,6 +2793,16 @@ impl Connector {
     ) -> Result<CallToolResult, ErrorData> {
         respond(
             async {
+                let mut a = a;
+                if let Some(path) = a.auth_header_file.take() {
+                    if a.auth_header.is_some() {
+                        anyhow::bail!("give auth_header or auth_header_file, not both");
+                    }
+                    a.auth_header = Some(read_auth_header_file(&path)?);
+                }
+                if let Some(h) = &a.auth_header {
+                    bw_relay::doorbell::validate_auth_header(h).map_err(anyhow::Error::msg)?;
+                }
                 let v = self
                     .relay
                     .call("set_doorbell", serde_json::to_value(&a)?)

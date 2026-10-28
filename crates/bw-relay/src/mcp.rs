@@ -205,9 +205,18 @@ pub struct CreateInviteArgs {
 pub struct JoinRoomArgs {
     /// The invite URL you were given.
     pub invite_url: String,
-    /// The name the room sees for this bot. Default: the bot's own name.
+    /// Your OWN display name in this room (how other members see you), not
+    /// the room's name. Default: your signed-in bot name. Change it later
+    /// with rename_seat.
     #[serde(default)]
     pub name: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RenameSeatArgs {
+    pub room_id: String,
+    /// Your new display name in this room (1 to 64 characters).
+    pub name: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -266,7 +275,9 @@ pub struct SetDoorbellArgs {
     /// webhook: shared secret for the HMAC-SHA256 `BotWhisper-Signature` header.
     #[serde(default)]
     pub secret: Option<String>,
-    /// webhook: optional static `Authorization` header value sent with each ring.
+    /// webhook: optional `Authorization` header VALUE only, e.g. `Bearer abc123`
+    /// (not `Authorization: Bearer abc123`); sent as `Authorization: <value>`
+    /// with each ring. The connector's `auth_header_file` reads it from a file.
     #[serde(default)]
     pub auth_header: Option<String>,
     /// ntfy / gotify: server base URL. ntfy: omit for the relay's default server.
@@ -441,6 +452,26 @@ impl BotWhisperServer {
     ) -> Result<CallToolResult, ErrorData> {
         let agent = agent(&parts)?;
         respond(self.op_join(agent, a).await)
+    }
+
+    #[tool(
+        name = "rename_seat",
+        description = "[Only through the local `botwhisper connect` connector.] Change your own display name in a room (the name other members see for your seat). Only your own seat."
+    )]
+    async fn rename_seat(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(a): Parameters<RenameSeatArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let agent = agent(&parts)?;
+        respond(
+            async {
+                let (room, me) = self.registry.resolve(&agent, &a.room_id).await?;
+                let m = me.member.clone();
+                room.with(move |r| r.rename_member(&m, &a.name)).await?
+            }
+            .await,
+        )
     }
 
     #[tool(
@@ -1152,7 +1183,14 @@ impl BotWhisperServer {
                         DoorbellTarget::Webhook {
                             url,
                             secret,
-                            auth_header: a.auth_header.filter(|h| !h.is_empty() && h.len() <= 512),
+                            auth_header: match a.auth_header {
+                                Some(h) => {
+                                    doorbell::validate_auth_header(&h)
+                                        .map_err(RelayError::invalid)?;
+                                    Some(h.trim().to_string())
+                                }
+                                None => None,
+                            },
                         }
                     }
                     "ntfy" => {
@@ -1310,9 +1348,11 @@ impl BotWhisperServer {
         a: GetDoorbellArgs,
     ) -> Result<Value, RelayError> {
         let db = &self.registry.db;
+        let mut my_member = None;
         let (cfg, status, scope, room_id) = match &a.room_id {
             Some(id) => {
                 let (_room, me) = self.registry.resolve(&agent, id).await?;
+                my_member = Some(me.member.clone());
                 match db.room_doorbell(id, &me.member)? {
                     Some((c, st)) => (Some(c), Some(st), "room", Some(id.clone())),
                     None => match db.bot_doorbell(&agent.id)? {
@@ -1339,9 +1379,24 @@ impl BotWhisperServer {
         } else {
             "all rooms"
         };
-        let details = cfg
-            .as_ref()
-            .map(|c| self.describe_doorbell(c, status.as_ref()));
+        let key = match (scope, &room_id, my_member) {
+            ("room", Some(id), Some(m)) => Some(doorbell::DoorbellKey::Room {
+                room_id: id.clone(),
+                member_id: m,
+            }),
+            ("bot_default", _, _) => Some(doorbell::DoorbellKey::Bot {
+                agent_id: agent.id.clone(),
+            }),
+            _ => None,
+        };
+        let failure = key.and_then(|k| self.registry.bells.last_failure(&k));
+        let details = cfg.as_ref().map(|c| {
+            let mut d = self.describe_doorbell(c, status.as_ref());
+            // The last failed attempt (HTTP status when the destination
+            // answered), so a 401 from a webhook is visible here.
+            d["last_failure"] = json!(failure);
+            d
+        });
         let mut out = json!({
             "scope": scope,
             "room_id": room_id,

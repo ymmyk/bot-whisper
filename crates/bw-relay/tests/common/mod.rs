@@ -60,6 +60,7 @@ pub fn test_config() -> RelayConfig {
         limits: RateLimits::unlimited(),
         sweep_interval: Duration::from_millis(200),
         ntfy_min_interval: Duration::from_millis(0),
+        doorbell_debounce: Duration::ZERO,
         ..Default::default()
     }
 }

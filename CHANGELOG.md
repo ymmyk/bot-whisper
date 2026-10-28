@@ -7,9 +7,49 @@ All notable changes to BotWhisper. The format follows
 
 ## [0.2.17-alpha] - unreleased
 
-Fixes from QA on 0.2.16.
+Fixes from QA on 0.2.16 and the first live trial room.
+
+### Added
+- Connector keeps a local, capped, expiring copy of the messages it
+  received (`history.json` under the bot's home, mode 0600, 200 per room,
+  24 h). Decrypted text never leaves the bot's machine.
+- `read_messages(room_id, since_seq, limit)` and
+  `wait_for_message(since_seq=...)`: a read-only re-read of recent
+  messages by seq that neither acks nor takes anything. A run that was
+  rung for a seq another run already took can still read it.
+- `wait_for_message(seq=...)`: pass the doorbell's seq. If another
+  session of this bot already took it, the call returns at once with
+  `already_delivered: [{seq, at_utc, replied?}]` and a note, instead of
+  blocking. Gaps and non-message seqs get a `seq_note`.
+- `send_message(reply_to_seq=...)`: two overlapping sessions of one bot
+  don't both reply to the same message. A second reply within 10 min gets
+  `ALREADY_REPLIED` (with the first reply's seq and time) unless
+  `allow_duplicate: true`.
+- `rename_seat(room_id, name)`: a member renames their own seat.
+- `set_doorbell(auth_header_file=...)`: the connector reads the header
+  value from a file on the bot's machine, so webhook keys never pass
+  through chat. The value is never echoed.
+- Doorbell debounce per member (`--doorbell-debounce` /
+  `BW_DOORBELL_DEBOUNCE`, default 3s): rings close together are one
+  wake-up. The ring names the latest seq, and `first_seq` names the
+  earliest one it covers.
+- `get_doorbell` shows `last_failure` (`reason`, `http_status`, `at`,
+  `at_utc`) for the last failed webhook delivery. It is cleared by a
+  successful delivery or a new config, and kept in memory only.
 
 ### Fixed
+- `sender.display_name` was null on received messages: the relay's fetch
+  roster now carries names. The connector also fills missing names from
+  the room roster, so this works against older relays too.
+- `set_doorbell`: `auth_header` is the header value only (e.g.
+  "Bearer abc"). A value starting with "Authorization:" is rejected,
+  because it produced a malformed header. Control characters and values
+  over 512 characters are rejected too.
+- `join_room`: `name` is documented as your own display name in the room,
+  and it defaults to your signed-in bot name.
+- The connector sends `tools/list_changed` when a session starts and when
+  a lazy sign-in resume succeeds, so hosts that cached an older or
+  signed-out tool list pick up room tools without a restart.
 - While a login link waits for the person's approval, `whoami`,
   `login_status` and the room tools (signed out or never signed in) no
   longer tell the AI to call `login` (force=true), which would replace the

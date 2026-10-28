@@ -154,6 +154,11 @@ impl BotStore {
     pub fn inbox_path(&self) -> PathBuf {
         self.dir.join("inbox.json")
     }
+    /// Recently received messages by seq (decrypted, this computer only),
+    /// for `read_messages`.
+    pub fn history_path(&self) -> PathBuf {
+        self.dir.join("history.json")
+    }
     pub fn doorbell_path(&self) -> PathBuf {
         self.dir.join("doorbell.json")
     }
@@ -260,6 +265,17 @@ impl BotStore {
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_default()
+    }
+
+    pub fn load_history(&self) -> History {
+        std::fs::read(self.history_path())
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save_history(&self, h: &History) -> std::io::Result<()> {
+        paths::write_private(&self.history_path(), &serde_json::to_vec(h).expect("json"))
     }
 
     pub fn save_inbox(&self, inbox: &Inbox) -> std::io::Result<()> {
@@ -394,6 +410,95 @@ impl RoomInbox {
         while self.seen.len() > SEEN_PER_ROOM {
             self.seen.pop_front();
         }
+    }
+}
+
+/// How many received messages per room `read_messages` can show again.
+pub const HISTORY_PER_ROOM: usize = 200;
+/// How long a received message stays re-readable on this computer.
+pub const HISTORY_TTL_S: u64 = 24 * 3600;
+
+/// Messages this connector received, by seq: capped and expiring, kept in
+/// `history.json` (0600) on this computer only. The decrypted text never
+/// leaves it; this is what lets a second session of the same bot re-read
+/// a message the first session already took from the inbox.
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
+pub struct History {
+    #[serde(default)]
+    pub rooms: std::collections::BTreeMap<String, std::collections::VecDeque<HistoryEntry>>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct HistoryEntry {
+    pub seq: u64,
+    pub received_at: u64,
+    /// When a `wait_for_message` call handed it over (None: still waiting).
+    #[serde(default)]
+    pub delivered_at: Option<u64>,
+    /// A `send_message` with `reply_to_seq` = this seq (its own seq, when).
+    #[serde(default)]
+    pub replied: Option<(u64, u64)>,
+    /// The message exactly as `wait_for_message` returns it.
+    pub message: serde_json::Value,
+}
+
+impl History {
+    /// Keep a received message (or error item) that has a seq.
+    pub fn record(&mut self, room: &str, msg: &serde_json::Value, now: u64) {
+        let Some(seq) = msg["seq"].as_u64() else {
+            return;
+        };
+        let q = self.rooms.entry(room.to_string()).or_default();
+        if q.iter().any(|e| e.seq == seq) {
+            return;
+        }
+        q.push_back(HistoryEntry {
+            seq,
+            received_at: now,
+            delivered_at: None,
+            replied: None,
+            message: msg.clone(),
+        });
+        q.make_contiguous().sort_by_key(|e| e.seq);
+        while q.len() > HISTORY_PER_ROOM {
+            q.pop_front();
+        }
+    }
+
+    /// Drop what is older than the TTL (and rooms left empty).
+    pub fn prune(&mut self, now: u64) {
+        for q in self.rooms.values_mut() {
+            q.retain(|e| now.saturating_sub(e.received_at) < HISTORY_TTL_S);
+        }
+        self.rooms.retain(|_, q| !q.is_empty());
+    }
+
+    pub fn mark_delivered(&mut self, room: &str, seqs: &[u64], now: u64) {
+        if let Some(q) = self.rooms.get_mut(room) {
+            for e in q.iter_mut().filter(|e| seqs.contains(&e.seq)) {
+                e.delivered_at.get_or_insert(now);
+            }
+        }
+    }
+
+    pub fn get(&self, room: &str, seq: u64) -> Option<&HistoryEntry> {
+        self.rooms.get(room)?.iter().find(|e| e.seq == seq)
+    }
+
+    pub fn get_mut(&mut self, room: &str, seq: u64) -> Option<&mut HistoryEntry> {
+        self.rooms.get_mut(room)?.iter_mut().find(|e| e.seq == seq)
+    }
+
+    /// Entries with `seq >= since`, oldest first, at most `limit`
+    /// (the newest ones when there are more).
+    pub fn since(&self, room: &str, since: u64, limit: usize) -> Vec<&HistoryEntry> {
+        let all: Vec<&HistoryEntry> = self
+            .rooms
+            .get(room)
+            .map(|q| q.iter().filter(|e| e.seq >= since).collect())
+            .unwrap_or_default();
+        let skip = all.len().saturating_sub(limit);
+        all.into_iter().skip(skip).collect()
     }
 }
 

@@ -688,7 +688,13 @@ impl Gateway {
         if self.connector().is_some() {
             return Ok(true);
         }
-        self.resume_once().await
+        let r = self.resume_once().await;
+        // Signed in by a stored login (lazily too: a waiting tool call, the
+        // background pickup): tell the host to list the tools again.
+        if matches!(r, Ok(true)) {
+            self.notify_tools_changed().await;
+        }
+        r
     }
 
     async fn resume_once(&self) -> anyhow::Result<bool> {
@@ -1426,6 +1432,10 @@ impl ServerHandler for Gateway {
 
     async fn on_initialized(&self, context: NotificationContext<RoleServer>) {
         self.remember_peer(&context.peer);
+        // A host may still hold the tool list of an older connector (from
+        // before an upgrade, or one that listed only the sign-in tools):
+        // ask it to list the tools again right away.
+        let _ = context.peer.notify_tool_list_changed().await;
     }
 
     async fn list_tools(

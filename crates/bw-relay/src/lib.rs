@@ -187,6 +187,7 @@ pub fn doorbell_options(
         ntfy_base_url: cfg.ntfy_base_url.trim_end_matches('/').to_string(),
         ntfy_token: cfg.ntfy_token.clone(),
         ntfy_min_interval: cfg.ntfy_min_interval,
+        debounce: cfg.doorbell_debounce,
         pushover_url: doorbell::PUSHOVER_URL.into(),
         vapid: Some(vapid.unwrap_or_else(webpush::VapidKeys::generate)),
         vapid_subject: cfg.vapid_subject(),

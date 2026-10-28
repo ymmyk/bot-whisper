@@ -71,6 +71,9 @@ pub struct RelayConfig {
     pub ntfy_token: Option<String>,
     /// Minimum spacing between pings to one ntfy topic.
     pub ntfy_min_interval: Duration,
+    /// Rings for one member within this window are sent as one wake-up
+    /// (the latest seq, with `first_seq`). Zero sends each ring at once.
+    pub doorbell_debounce: Duration,
     /// VAPID private key file (hex P-256 scalar, 0600). `None` means
     /// `vapid.key` next to the SQLite file, or an ephemeral key when the
     /// database is in memory.
@@ -126,6 +129,7 @@ impl Default for RelayConfig {
             ntfy_base_url: crate::doorbell::DEFAULT_NTFY_BASE_URL.into(),
             ntfy_token: None,
             ntfy_min_interval: Duration::from_secs(5),
+            doorbell_debounce: Duration::from_secs(crate::doorbell::DEFAULT_DEBOUNCE_S),
             vapid_private_key_file: None,
             vapid_subject: None,
             max_file_bytes: crate::blobs::DEFAULT_MAX_FILE_BYTES,

@@ -56,6 +56,31 @@ pub const DEFAULT_EVENTS: &[&str] = &[
 
 /// Default ntfy server when the relay has none configured.
 pub const DEFAULT_NTFY_BASE_URL: &str = "https://ntfy.sh";
+
+/// Default wake-up debounce: rings for one member this close together are
+/// one wake-up (so one routine run, not several overlapping ones).
+pub const DEFAULT_DEBOUNCE_S: u64 = 3;
+
+/// The sentence for an `auth_header` given with its header name.
+pub const AUTH_HEADER_NAME_GIVEN: &str = "auth_header is the header value only (for example `Bearer abc123`), without `Authorization:`; the relay sends it as `Authorization: <auth_header>`";
+
+/// Check a webhook `auth_header` value (the value only, never the name).
+pub fn validate_auth_header(v: &str) -> Result<(), String> {
+    let t = v.trim();
+    if t.is_empty() {
+        return Err("auth_header is empty; omit it for no Authorization header".into());
+    }
+    if t.len() >= 14 && t[..14].eq_ignore_ascii_case("authorization:") {
+        return Err(AUTH_HEADER_NAME_GIVEN.into());
+    }
+    if t.len() > 512 {
+        return Err("auth_header is too long (at most 512 characters)".into());
+    }
+    if t.chars().any(|c| c.is_control()) {
+        return Err("auth_header must be one line (no line breaks or control characters)".into());
+    }
+    Ok(())
+}
 /// Pushover's publish endpoint (overridable for tests).
 pub const PUSHOVER_URL: &str = "https://api.pushover.net/1/messages.json";
 
@@ -272,6 +297,19 @@ pub struct DoorbellStatus {
     pub last_delivery_at: Option<u64>,
 }
 
+/// The last failed delivery attempt to a destination (kept in memory, so
+/// it starts empty after a relay restart). Never content or secrets.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DeliveryFailure {
+    /// `HTTP 401`, `timeout`, `connect`, ...
+    pub reason: String,
+    /// The destination's HTTP status code, when it answered.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub http_status: Option<u16>,
+    pub at: u64,
+    pub at_utc: String,
+}
+
 /// The wire payload. **No content, ever.**
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DoorbellPayload {
@@ -281,6 +319,10 @@ pub struct DoorbellPayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread: Option<String>,
     pub seq: u64,
+    /// When several rings were sent as this one wake-up (debounce): the
+    /// earliest of their seqs. Absent for a single ring.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_seq: Option<u64>,
     /// `yours`, `theirs`, `open` (free mode: anyone may send) or `none`.
     pub turn: String,
     pub ts: u64,
@@ -508,6 +550,8 @@ pub struct DoorbellOptions {
     pub ntfy_token: Option<String>,
     /// Minimum spacing between pings to one ntfy topic.
     pub ntfy_min_interval: Duration,
+    /// Rings for one member within this window become one delivery.
+    pub debounce: Duration,
     /// Where Pushover posts go (tests point this at a mock).
     pub pushover_url: String,
     pub vapid: Option<VapidKeys>,
@@ -522,6 +566,7 @@ impl Default for DoorbellOptions {
             ntfy_base_url: DEFAULT_NTFY_BASE_URL.into(),
             ntfy_token: None,
             ntfy_min_interval: Duration::from_secs(5),
+            debounce: Duration::ZERO,
             pushover_url: PUSHOVER_URL.into(),
             vapid: None,
             vapid_subject: "mailto:botwhisper@localhost".into(),
@@ -546,6 +591,8 @@ struct Shared {
     dead: RwLock<HashSet<DoorbellKey>>,
     /// Bot-wide default doorbells by agent id.
     defaults: RwLock<HashMap<String, DoorbellConfig>>,
+    /// Last failed delivery per destination (for `get_doorbell`).
+    failures: RwLock<HashMap<DoorbellKey, DeliveryFailure>>,
     opts: DoorbellOptions,
 }
 
@@ -591,6 +638,7 @@ impl Doorbells {
             stats: DoorbellStats::default(),
             dead: RwLock::new(dead),
             defaults: RwLock::new(defaults),
+            failures: RwLock::new(HashMap::new()),
             opts,
         });
         tokio::spawn(dispatcher(rx, client, shared.clone()));
@@ -607,6 +655,7 @@ impl Doorbells {
                 stats: DoorbellStats::default(),
                 dead: RwLock::new(HashSet::new()),
                 defaults: RwLock::new(HashMap::new()),
+                failures: RwLock::new(HashMap::new()),
                 opts: DoorbellOptions::default(),
             }),
         }
@@ -650,13 +699,30 @@ impl Doorbells {
             .contains(key)
     }
 
-    /// A configuration was replaced or removed: forget that it was dead.
+    /// A configuration was replaced or removed: forget that it was dead
+    /// (and its last failure, which was about the old destination).
     pub fn revive(&self, key: &DoorbellKey) {
         self.shared
             .dead
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .remove(key);
+        self.shared
+            .failures
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(key);
+    }
+
+    /// The last failed delivery to this destination, if any since the
+    /// relay started.
+    pub fn last_failure(&self, key: &DoorbellKey) -> Option<DeliveryFailure> {
+        self.shared
+            .failures
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(key)
+            .cloned()
     }
 
     /// The bot-wide default doorbell for an agent, if any.
@@ -741,6 +807,7 @@ enum Outcome {
     Retry {
         reason: String,
         after: Option<Duration>,
+        http_status: Option<u16>,
     },
     /// The destination is gone for good (Web Push 404/410).
     Dead,
@@ -755,10 +822,30 @@ async fn worker(
     let backoff = shared.opts.backoff.clone();
     let mut attempt: u32 = 0;
     let mut delay = backoff.initial;
+    // A fresh burst: wait out the debounce window first, so rings close
+    // together become one wake-up.
+    let mut fresh = true;
     loop {
-        let Some(ring) = slot_rx.borrow_and_update().clone() else {
+        let first_seq = slot_rx.borrow().as_ref().map(|r| r.payload.seq);
+        if fresh && !shared.opts.debounce.is_zero() {
+            let until = Instant::now() + shared.opts.debounce;
+            loop {
+                let left = until.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    break;
+                }
+                if !pause(&mut slot_rx, left).await {
+                    return;
+                }
+            }
+        }
+        fresh = false;
+        let Some(mut ring) = slot_rx.borrow_and_update().clone() else {
             return;
         };
+        if let Some(f) = first_seq.filter(|f| *f < ring.payload.seq) {
+            ring.payload.first_seq = Some(ring.payload.first_seq.unwrap_or(f).min(f));
+        }
         // Space ntfy pings to one topic.
         if let DoorbellTarget::Ntfy { server, topic, .. } = &ring.config.target {
             let dest = topic_hash(
@@ -797,6 +884,7 @@ async fn worker(
                 if slot_rx.has_changed().unwrap_or(false) {
                     attempt = 0;
                     delay = backoff.initial;
+                    fresh = true;
                     continue;
                 }
                 return;
@@ -815,9 +903,26 @@ async fn worker(
                 );
                 return;
             }
-            Outcome::Retry { reason, after } => {
+            Outcome::Retry {
+                reason,
+                after,
+                http_status,
+            } => {
                 attempt += 1;
                 set_status(&shared, &ring.key, "failing", now);
+                shared
+                    .failures
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(
+                        ring.key.clone(),
+                        DeliveryFailure {
+                            reason: reason.clone(),
+                            http_status,
+                            at: now,
+                            at_utc: crate::config::iso_utc(now),
+                        },
+                    );
                 tracing::debug!(attempt, kind = ring.config.target.kind(), reason = %reason, "doorbell delivery failed");
                 if attempt >= backoff.max_attempts {
                     shared.stats.failed.fetch_add(1, Ordering::Relaxed);
@@ -872,6 +977,7 @@ async fn deliver(client: &reqwest::Client, shared: &Shared, ring: &Ring, now: u6
             return Outcome::Retry {
                 reason: e.to_string(),
                 after: None,
+                http_status: None,
             }
         }
     };
@@ -943,6 +1049,7 @@ async fn deliver(client: &reqwest::Client, shared: &Shared, ring: &Ring, now: u6
                 return Outcome::Retry {
                     reason: "no vapid key".into(),
                     after: None,
+                    http_status: None,
                 };
             };
             let audience = match crate::webpush::origin_of(endpoint) {
@@ -982,7 +1089,8 @@ async fn deliver(client: &reqwest::Client, shared: &Shared, ring: &Ring, now: u6
         }
         Ok(resp) => Outcome::Retry {
             after: retry_after(&resp),
-            reason: format!("status {}", resp.status()),
+            reason: format!("HTTP {}", resp.status().as_u16()),
+            http_status: Some(resp.status().as_u16()),
         },
         Err(e) => Outcome::Retry {
             // reqwest errors can include the URL; keep only the kind.
@@ -994,6 +1102,7 @@ async fn deliver(client: &reqwest::Client, shared: &Shared, ring: &Ring, now: u6
                 "request".into()
             },
             after: None,
+            http_status: None,
         },
     }
 }
@@ -1044,6 +1153,7 @@ mod tests {
             room: "r".into(),
             thread: Some("t".into()),
             seq: 3,
+            first_seq: None,
             turn: "yours".into(),
             ts: 10,
         };

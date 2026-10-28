@@ -125,7 +125,23 @@ fn connect_starts_signed_out_as_a_stdio_mcp_server() {
     );
     send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
     send(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}));
-    let tools = read();
+    // tools/list_changed goes out when the session starts (a host may hold
+    // an older connector's list); then the reply to id 2.
+    let mut notified = false;
+    let tools = loop {
+        let v = read();
+        if v["method"] == "notifications/tools/list_changed" {
+            notified = true;
+            continue;
+        }
+        assert_eq!(v["id"], 2, "{v}");
+        break v;
+    };
+    if !notified {
+        // It may also land just after the reply.
+        let v = read();
+        assert_eq!(v["method"], "notifications/tools/list_changed", "{v}");
+    }
     let mut names: Vec<&str> = tools["result"]["tools"]
         .as_array()
         .unwrap()

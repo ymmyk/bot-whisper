@@ -729,7 +729,7 @@ impl Room {
             "mode": self.mode,
             "turn": self.view_for(member),
             "you": self.member(member).ok().map(|m| m.e2e_state),
-            "members": self.members.iter().map(|m| json!({ "member": m.member, "agent_id": m.agent_id, "e2e_state": m.e2e_state })).collect::<Vec<_>>(),
+            "members": self.members.iter().map(|m| json!({ "member": m.member, "agent_id": m.agent_id, "display_name": m.display_name, "e2e_state": m.e2e_state })).collect::<Vec<_>>(),
         }))
     }
 

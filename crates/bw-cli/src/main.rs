@@ -289,6 +289,11 @@ struct RelayArgs {
     #[arg(long, env = "BW_NTFY_MIN_INTERVAL", default_value = "5s")]
     ntfy_min_interval: String,
 
+    /// Back-to-back wake-ups for one member within this window are sent as
+    /// one (e.g. 3s; 0s sends every ring at once).
+    #[arg(long, env = "BW_DOORBELL_DEBOUNCE", default_value = "3s")]
+    doorbell_debounce: String,
+
     /// VAPID private key file for Web Push (created on first start, 0600).
     /// Default: vapid.key next to the SQLite file.
     #[arg(long, env = "BW_VAPID_PRIVATE_KEY_FILE")]
@@ -609,6 +614,9 @@ async fn relay(args: RelayArgs) -> anyhow::Result<()> {
     let ntfy_min_interval = bw_relay::config::parse_expiry(&args.ntfy_min_interval)
         .map_err(anyhow::Error::msg)?
         .unwrap_or(Duration::ZERO);
+    let doorbell_debounce = bw_relay::config::parse_expiry(&args.doorbell_debounce)
+        .map_err(anyhow::Error::msg)?
+        .unwrap_or(Duration::ZERO);
     // The relay's ntfy token: environment first, then the file. Never printed.
     let ntfy_token = match std::env::var("BW_NTFY_TOKEN") {
         Ok(t) if !t.trim().is_empty() => Some(t.trim().to_string()),
@@ -661,6 +669,7 @@ async fn relay(args: RelayArgs) -> anyhow::Result<()> {
         ntfy_base_url: args.ntfy_base_url,
         ntfy_token,
         ntfy_min_interval,
+        doorbell_debounce,
         vapid_private_key_file: args.vapid_private_key_file,
         vapid_subject: args.vapid_subject,
         max_file_bytes: args.max_file_bytes.max(1),
