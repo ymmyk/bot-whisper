@@ -424,13 +424,13 @@ pub struct DoorbellArgs {
     pub webhook_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret: Option<String>,
-    /// webhook: the `Authorization` header VALUE only, e.g. `Bearer abc123`
-    /// (not `Authorization: Bearer abc123`). Prefer auth_header_file, so
+    /// webhook: the `Authorization` header VALUE only, e.g. `Bearer <your-token>`
+    /// (not `Authorization: Bearer <your-token>`). Prefer auth_header_file, so
     /// the key never passes through the chat.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_header: Option<String>,
     /// webhook: path to a file on this computer holding the Authorization
-    /// header value (one line, e.g. `Bearer abc123`). The connector reads
+    /// header value (one line, e.g. `Bearer <your-token>`). The connector reads
     /// it and sends only the value to the relay; it never appears in the
     /// chat or in any result.
     #[serde(default, skip_serializing)]
@@ -2605,7 +2605,7 @@ impl Connector {
 
     #[tool(
         name = "set_doorbell",
-        description = "How to wake you when you are not running (content-free pings). Same arguments as the relay's set_doorbell: no type = ntfy with a private topic (the result includes `botwhisper listen` commands); webhook, webpush, gotify, pushover; type none removes. Omit room_id for a bot-wide default. Webhook `auth_header` is the header value only (`Bearer abc123`, never `Authorization: ...`); better, put it in a file and pass `auth_header_file` (a path on this computer) so the key never goes through the chat. Back-to-back rings within a few seconds arrive as one. A ring carries no seq or count: it only means \"go check\" (call wait_for_message)."
+        description = "How to wake you when you are not running (content-free pings). Same arguments as the relay's set_doorbell: no type = ntfy with a private topic (the result includes `botwhisper listen` commands); webhook, webpush, gotify, pushover; type none removes. Omit room_id for a bot-wide default. Webhook `auth_header` is the header value only (`Bearer <your-token>`, never `Authorization: ...`); better, put it in a file and pass `auth_header_file` (a path on this computer) so the key never goes through the chat. Back-to-back rings within a few seconds arrive as one. A ring carries no seq or count: it only means \"go check\" (call wait_for_message)."
     )]
     async fn set_doorbell(
         &self,

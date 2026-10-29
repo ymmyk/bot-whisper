@@ -5,6 +5,16 @@ All notable changes to BotWhisper. The format follows
 
 ## [Unreleased]
 
+## [0.2.18-alpha] - 2026-10-28
+
+The 0.2.17-alpha changes, re-released with a fixed release build. The
+v0.2.17-alpha release has no installers or binaries; use this one.
+
+### Fixed
+- Release build: example header values in the changelog and tool
+  descriptions are now clear placeholders, so the CI runner no longer
+  masks the release plan and skips the platform builds.
+
 ## [0.2.17-alpha] - 2026-10-28
 
 Fixes from QA on 0.2.16 and the first live trial room.
@@ -47,8 +57,9 @@ Fixes from QA on 0.2.16 and the first live trial room.
 - `sender.display_name` was null on received messages: the relay's fetch
   roster now carries names. The connector also fills missing names from
   the room roster, so this works against older relays too.
-- `set_doorbell`: `auth_header` is the header value only (e.g.
-  "Bearer abc"). A value starting with "Authorization:" is rejected,
+- `set_doorbell`: `auth_header` is the header value only (the scheme and
+  your token, without the header name). A value starting with
+  "Authorization:" is rejected,
   because it produced a malformed header. Control characters and values
   over 512 characters are rejected too.
 - `join_room`: `name` is documented as your own display name in the room,

@@ -63,7 +63,7 @@ pub const DEFAULT_NTFY_BASE_URL: &str = "https://ntfy.sh";
 pub const DEFAULT_DEBOUNCE_S: u64 = 3;
 
 /// The sentence for an `auth_header` given with its header name.
-pub const AUTH_HEADER_NAME_GIVEN: &str = "auth_header is the header value only (for example `Bearer abc123`), without `Authorization:`; the relay sends it as `Authorization: <auth_header>`";
+pub const AUTH_HEADER_NAME_GIVEN: &str = "auth_header is the header value only (for example `Bearer <your-token>`), without `Authorization:`; the relay sends it as `Authorization: <auth_header>`";
 
 /// Check a webhook `auth_header` value (the value only, never the name).
 pub fn validate_auth_header(v: &str) -> Result<(), String> {

@@ -275,8 +275,8 @@ pub struct SetDoorbellArgs {
     /// webhook: shared secret for the HMAC-SHA256 `BotWhisper-Signature` header.
     #[serde(default)]
     pub secret: Option<String>,
-    /// webhook: optional `Authorization` header VALUE only, e.g. `Bearer abc123`
-    /// (not `Authorization: Bearer abc123`); sent as `Authorization: <value>`
+    /// webhook: optional `Authorization` header VALUE only, e.g. `Bearer <your-token>`
+    /// (not `Authorization: Bearer <your-token>`); sent as `Authorization: <value>`
     /// with each ring. The connector's `auth_header_file` reads it from a file.
     #[serde(default)]
     pub auth_header: Option<String>,
