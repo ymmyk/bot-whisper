@@ -698,19 +698,6 @@ impl Connector {
         // One connector per bot: take the lock before anything else (before
         // the relay is called, so a refused process never refreshes the
         // tokens, fetches or acks as this bot).
-        let take_lock = |s: &BotStore, bot: String| -> anyhow::Result<Arc<ConfigLock>> {
-            // <home>/<relay host>/<bot>: the home is two levels up.
-            let home = s
-                .dir
-                .parent()
-                .and_then(|p| p.parent())
-                .map(std::path::Path::to_path_buf)
-                .unwrap_or_else(|| s.dir.clone());
-            Ok(Arc::new(ConfigLock::acquire(
-                &s.dir,
-                &super::lock::LockWho { home, bot },
-            )?))
-        };
         let early_lock = match &store {
             Some(s) => {
                 let bot = s.load_bot_name().unwrap_or_else(|| {
@@ -719,7 +706,7 @@ impl Connector {
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_default()
                 });
-                Some(take_lock(s, bot)?)
+                Some(take_lock(s, bot).await?)
             }
             None => None,
         };
@@ -754,15 +741,16 @@ impl Connector {
         }
         let (store, lock) = match (store, early_lock) {
             (Some(s), l) => (Some(s), l),
-            (None, _) => match config_dir_identity
-                .map(|d| BotStore::new(d, &relay.relay, &agent_id))
-            {
-                Some(s) => {
-                    let l = take_lock(&s, bot_name.clone().unwrap_or_else(|| agent_id.clone()))?;
-                    (Some(s), Some(l))
+            (None, _) => {
+                match config_dir_identity.map(|d| BotStore::new(d, &relay.relay, &agent_id)) {
+                    Some(s) => {
+                        let l = take_lock(&s, bot_name.clone().unwrap_or_else(|| agent_id.clone()))
+                            .await?;
+                        (Some(s), Some(l))
+                    }
+                    None => (None, None),
                 }
-                None => (None, None),
-            },
+            }
         };
         let identity = match &store {
             Some(s) => s.load_or_create_identity(&agent_id)?,
@@ -806,6 +794,13 @@ impl Connector {
     /// The `--bot-name` mismatch this connector started with, if any.
     pub fn name_mismatch(&self) -> Option<&WrongBot> {
         self.name_mismatch.as_ref()
+    }
+
+    /// The bot directory whose lock this connector holds.
+    pub fn lock_dir(&self) -> Option<std::path::PathBuf> {
+        self._lock
+            .as_ref()
+            .and_then(|l| l.dir().map(std::path::Path::to_path_buf))
     }
 
     /// Give up this bot's home lock now (the connector is being dropped
@@ -907,15 +902,17 @@ impl Connector {
         let earlier = st.replies.get(&key).copied();
         if let (Some((reply, at)), false) = (earlier, allow) {
             let when = bw_relay::config::iso_utc(at);
+            let when_text = format!("{} ({when})", super::gateway::local_time(at));
             let message = match reply {
-                Some(r) => format!("This bot already answered seq {seq} (its reply is seq {r}, sent {when}), probably from another session. Not sent again; wait_for_message for new messages, or pass allow_duplicate: true to send anyway."),
-                None => format!("Another session of this bot is answering seq {seq} right now (since {when}). Not sent; wait_for_message for new messages, or pass allow_duplicate: true to send anyway."),
+                Some(r) => format!("This bot already answered seq {seq} (its reply is seq {r}, sent {when_text}), probably from another session. Not sent again; wait_for_message for new messages, or pass allow_duplicate: true to send anyway."),
+                None => format!("Another session of this bot is answering seq {seq} right now (since {when_text}). Not sent; wait_for_message for new messages, or pass allow_duplicate: true to send anyway."),
             };
             return Err(super::relay::ToolError(json!({
                 "error": "ALREADY_REPLIED",
                 "reply_to_seq": seq,
                 "reply_seq": reply,
                 "at_utc": when,
+                "at_local": super::gateway::local_time(at),
                 "message": message,
             }))
             .into());
@@ -977,6 +974,7 @@ impl Connector {
             "encryption": "mls (end-to-end)", "thread": sent["thread"], "turn": sent["turn"],
             "counted_toward_cap": sent["counted_toward_cap"], "interrupt": sent["interrupt"],
             "expires_at": sent["expires_at"], "expires_at_utc": sent["expires_at_utc"],
+            "expires_at_local": sent["expires_at"].as_u64().map(super::gateway::local_time),
             "retention": sent["retention"],
         });
         copy_delivery_notes(&sent, &mut out);
@@ -1977,7 +1975,7 @@ impl Connector {
 
     #[tool(
         name = "send_message",
-        description = "Encrypt a message on this machine and send it to the room. In a round_table room it fails with NOT_YOUR_TURN out of turn (the result names the holder and the seating order); `turn: hold` keeps the floor, `turn: done` (owner) ends the thread, `interrupt: true` uses your one short interrupt. Pending joiners in rooms you own are added first. `delivered_to` lists the members it was queued for at send time (each gets it on its next fetch; it is not a read receipt); members still joining are listed in `pending_delivery` and get it once their join completes. The result has `expires_at` (Unix) and `expires_at_utc`: an undelivered message is deleted then (held until delivered, up to the relay's retention, 30 days by default; a delivered message is deleted from the relay on ack)."
+        description = "Encrypt a message on this machine and send it to the room. In a round_table room it fails with NOT_YOUR_TURN out of turn (the result names the holder and the seating order); `turn: hold` keeps the floor, `turn: done` (owner) ends the thread, `interrupt: true` uses your one short interrupt. Pending joiners in rooms you own are added first. `delivered_to` lists the members it was queued for at send time (each gets it on its next fetch; it is not a read receipt); members still joining are listed in `pending_delivery` and get it once their join completes. The result has `expires_at` (Unix), `expires_at_utc` and `expires_at_local`: an undelivered message is deleted then (held until delivered, up to the relay's retention, 30 days by default, and never past the room's own expiry; a delivered message is deleted from the relay on ack)."
     )]
     async fn send_message(
         &self,
@@ -2621,7 +2619,7 @@ impl Connector {
 
     #[tool(
         name = "set_doorbell",
-        description = "How to wake you when you are not running (content-free pings). Same arguments as the relay's set_doorbell: no type = ntfy with a private topic (the result includes `botwhisper listen` commands); webhook, webpush, gotify, pushover; type none removes. Omit room_id for a bot-wide default. Webhook `auth_header` is the header value only (`Bearer <your-token>`, never `Authorization: ...`); better, put it in a file and pass `auth_header_file` (a path on this computer) so the key never goes through the chat. Back-to-back rings within a few seconds arrive as one. A ring carries no seq or count: it only means \"go check\" (call wait_for_message)."
+        description = "How to wake you when you are not running (content-free pings). Same arguments as the relay's set_doorbell: no type = ntfy with a private topic (the result includes `botwhisper listen` commands); webhook, webpush, gotify, pushover; type none removes. Omit room_id for a bot-wide default. A webhook needs `secret` (signs each ring), `auth_header`/`auth_header_file`, or both. Webhook `auth_header` is the header value only (`Bearer <your-token>`, never `Authorization: ...`); better, put it in a file and pass `auth_header_file` (a path on this computer) so the key never goes through the chat. Back-to-back rings within a few seconds arrive as one. A ring carries no seq or count: it only means \"go check\" (call wait_for_message)."
     )]
     async fn set_doorbell(
         &self,
@@ -2954,6 +2952,30 @@ fn a_json(a: &CreateInviteArgs) -> Value {
 /// The room tools the connector serves, as `tools/list` shows them. The
 /// gateway lists exactly these whether or not anyone is signed in, so a
 /// host that caches the first `tools/list` still sees every tool.
+/// How long a starting connector waits for an upgraded predecessor to hand
+/// the bot over (see [`super::lock::TakeoverRequest`]).
+pub const TAKEOVER_WAIT: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// Take this bot's home lock (one connector per bot), asking an upgraded
+/// predecessor to hand over first.
+async fn take_lock(s: &BotStore, bot: String) -> anyhow::Result<Arc<ConfigLock>> {
+    // <home>/<relay host>/<bot>: the home is two levels up.
+    let home = s
+        .dir
+        .parent()
+        .and_then(|p| p.parent())
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| s.dir.clone());
+    Ok(Arc::new(
+        ConfigLock::acquire_or_take_over(
+            &s.dir,
+            &super::lock::LockWho { home, bot },
+            TAKEOVER_WAIT,
+        )
+        .await?,
+    ))
+}
+
 pub fn room_tools() -> Vec<rmcp::model::Tool> {
     Connector::tool_router().list_all()
 }

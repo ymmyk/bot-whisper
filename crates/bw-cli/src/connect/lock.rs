@@ -194,6 +194,105 @@ impl ConfigLock {
     }
 }
 
+/// A newer `botwhisper connect` for the same bot asks the holder to hand
+/// over (written to `<bot dir>/takeover.json`). The holder only yields when
+/// its own binary was upgraded on disk since it started: then it is the
+/// leftover of an AI app restart, and the newcomer is what the app talks to.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TakeoverRequest {
+    pub pid: u32,
+    pub version: String,
+    /// Milliseconds since the Unix epoch.
+    pub at_ms: u64,
+}
+
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Is process `pid` still running? (Unknown off Unix: assume yes.)
+pub fn process_alive(pid: u32) -> bool {
+    !cfg!(unix) || process_started(pid).is_some()
+}
+
+impl TakeoverRequest {
+    pub fn path_in(bot_dir: &Path) -> PathBuf {
+        bot_dir.join("takeover.json")
+    }
+
+    /// Ask whoever holds `bot_dir` to hand over.
+    pub fn write(bot_dir: &Path) -> anyhow::Result<()> {
+        let req = TakeoverRequest {
+            pid: std::process::id(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            at_ms: now_ms(),
+        };
+        crate::paths::write_private(&Self::path_in(bot_dir), &serde_json::to_vec(&req)?)?;
+        Ok(())
+    }
+
+    pub fn read(bot_dir: &Path) -> Option<TakeoverRequest> {
+        serde_json::from_slice(&std::fs::read(Self::path_in(bot_dir)).ok()?).ok()
+    }
+
+    /// A request the holder (this process, started at `started_ms`) should
+    /// act on: made after it started, by another process still waiting.
+    pub fn pending_for(bot_dir: &Path, started_ms: u64) -> Option<TakeoverRequest> {
+        let r = Self::read(bot_dir)?;
+        (r.at_ms >= started_ms && r.pid != std::process::id() && process_alive(r.pid)).then_some(r)
+    }
+}
+
+impl ConfigLock {
+    /// The bot directory this lock guards.
+    pub fn dir(&self) -> Option<&Path> {
+        self.pid_path.parent()
+    }
+
+    /// [`ConfigLock::acquire`], but when another process holds the lock,
+    /// ask it to hand over ([`TakeoverRequest`]) and keep trying for up to
+    /// `wait`. An upgraded 0.2.19+ holder lets go within a few seconds;
+    /// anything else still gets [`LockHeld`].
+    pub async fn acquire_or_take_over(
+        bot_dir: &Path,
+        who: &LockWho,
+        wait: std::time::Duration,
+    ) -> anyhow::Result<ConfigLock> {
+        let first = match Self::acquire(bot_dir, who) {
+            Ok(l) => return Ok(l),
+            Err(e) if e.downcast_ref::<LockHeld>().is_some() => e,
+            Err(e) => return Err(e),
+        };
+        if wait.is_zero() || TakeoverRequest::write(bot_dir).is_err() {
+            return Err(first);
+        }
+        let deadline = std::time::Instant::now() + wait;
+        let mut last = first;
+        while std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            match Self::acquire(bot_dir, who) {
+                Ok(l) => {
+                    tracing::info!(
+                        "botwhisper connect: the previous connector for this bot handed over"
+                    );
+                    let _ = std::fs::remove_file(TakeoverRequest::path_in(bot_dir));
+                    return Ok(l);
+                }
+                Err(e) if e.downcast_ref::<LockHeld>().is_some() => last = e,
+                Err(e) => return Err(e),
+            }
+        }
+        // Nobody took the request: do not leave it for a later holder.
+        if TakeoverRequest::read(bot_dir).is_some_and(|r| r.pid == std::process::id()) {
+            let _ = std::fs::remove_file(TakeoverRequest::path_in(bot_dir));
+        }
+        Err(last)
+    }
+}
+
 impl Drop for ConfigLock {
     fn drop(&mut self) {
         self.release();
@@ -501,6 +600,50 @@ mod tests {
         let rec: Record =
             serde_json::from_slice(&std::fs::read(ConfigLock::pid_path_in(&dir)).unwrap()).unwrap();
         assert_eq!(rec.pid, std::process::id());
+        drop(l);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A starting connector asks the holder to hand over and gets the lock
+    /// once it lets go; a holder that ignores the request still refuses it,
+    /// and the unanswered request is cleaned up.
+    #[tokio::test]
+    async fn takeover_request_then_lock_or_refusal() {
+        let home = tmp("takeover");
+        let dir = home.join("relay").join("bot");
+        let held = ConfigLock::acquire(&dir, &who(&home, "Old")).unwrap();
+        assert_eq!(held.dir(), Some(dir.as_path()));
+        // A holder that honours requests (here: a thread polling the file).
+        let d2 = dir.clone();
+        let honour = std::thread::spawn(move || {
+            for _ in 0..100 {
+                if TakeoverRequest::read(&d2).is_some() {
+                    drop(held);
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            false
+        });
+        let l = ConfigLock::acquire_or_take_over(
+            &dir,
+            &who(&home, "New"),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .expect("handed over");
+        assert!(honour.join().unwrap());
+        assert!(TakeoverRequest::read(&dir).is_none(), "request consumed");
+        // A holder that ignores it: refused after the wait, no request left.
+        let err = ConfigLock::acquire_or_take_over(
+            &dir,
+            &who(&home, "Third"),
+            std::time::Duration::from_millis(600),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.downcast_ref::<LockHeld>().is_some(), "{err}");
+        assert!(TakeoverRequest::read(&dir).is_none());
         drop(l);
         let _ = std::fs::remove_dir_all(&home);
     }

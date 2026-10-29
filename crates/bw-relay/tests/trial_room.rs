@@ -254,6 +254,25 @@ async fn zero_retention_inner() {
     .await;
     assert_eq!(r2["error"], "ALREADY_REPLIED", "{r2}");
     assert_eq!(r2["reply_seq"], mine);
+    // Local time next to UTC, like every other time the connector shows.
+    let local = r2["at_local"].as_str().expect("at_local");
+    assert!(local.contains("(UTC"), "{r2}");
+    let m = r2["message"].as_str().unwrap();
+    assert!(
+        m.contains(local) && m.contains(r2["at_utc"].as_str().unwrap()),
+        "{r2}"
+    );
+    assert!(
+        r1["expires_at_local"]
+            .as_str()
+            .is_some_and(|l| l.contains("(UTC")),
+        "{r1}"
+    );
+    // Never held past the room's own expiry (7 days by default here).
+    assert!(
+        r1["expires_at"].as_u64().unwrap() <= created["room_expires_at"].as_u64().unwrap(),
+        "{r1} vs {created}"
+    );
     let r3 = call(
         &bob,
         "send_message",

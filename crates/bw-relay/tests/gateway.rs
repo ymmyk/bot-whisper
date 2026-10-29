@@ -1084,3 +1084,100 @@ async fn list_changed_is_sent_when_the_session_starts() {
     }
     panic!("no tools/list_changed after initialize");
 }
+
+/// A connector left running after an upgrade + AI app restart hands the bot
+/// over: when a newer connector for the same bot asks (takeover.json) and
+/// this process's binary was replaced on disk, it lets go of the lock and
+/// stops serving. Without the upgrade it keeps the bot (two apps on one
+/// bot: the newcomer is refused, as before).
+#[cfg(unix)]
+#[tokio::test]
+async fn an_upgraded_connector_hands_over_to_a_newer_one() {
+    use botwhisper::connect::{
+        lock::{ConfigLock, LockWho, TakeoverRequest},
+        relay::RelayClient,
+        server::Connector,
+        upgrade::UpgradeWatch,
+    };
+    use std::os::unix::fs::PermissionsExt;
+
+    let relay = TestRelay::start().await;
+    let dir = tmp_dir("takeover");
+    let config = dir.join("home");
+    let exe = dir.join("botwhisper");
+    let write = |version: &str| {
+        std::fs::write(&exe, format!("#!/bin/sh\necho botwhisper {version}\n")).unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    write("0.0.1-old");
+    let c = Connector::new(
+        RelayClient::with_token(&relay.base(), TOKENS[0]),
+        None,
+        Some(&config),
+    )
+    .await
+    .unwrap();
+    let bot_dir = c.lock_dir().expect("holds the bot's lock");
+    let who = LockWho {
+        home: config.clone(),
+        bot: "x".into(),
+    };
+    let gw = Gateway::with_connector(&relay.base(), config.clone(), c);
+    gw.watch_binary(UpgradeWatch::for_path(Some(exe.clone()), "0.0.1-old"));
+    let (done_tx, mut done) = tokio::sync::oneshot::channel();
+    let (client_side, server_side) = tokio::io::duplex(64 * 1024);
+    let (sr, sw) = tokio::io::split(server_side);
+    tokio::spawn(async move {
+        let r = gw.run_on((sr, sw)).await;
+        let _ = done_tx.send(r.is_ok());
+    });
+    let (cr, cw) = tokio::io::split(client_side);
+    let svc = Watcher::default()
+        .serve((cr, cw))
+        .await
+        .expect("client connects");
+
+    // The "newer connector": a live process that asked to take over.
+    let mut newer = std::process::Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .unwrap();
+    let req = TakeoverRequest {
+        pid: newer.id(),
+        version: "9.9.9-new".into(),
+        at_ms: botwhisper::connect::lock::now_ms(),
+    };
+    std::fs::write(
+        TakeoverRequest::path_in(&bot_dir),
+        serde_json::to_vec(&req).unwrap(),
+    )
+    .unwrap();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(done.try_recv().is_err(), "same binary: keeps serving");
+    assert!(
+        ConfigLock::acquire(&bot_dir, &who).is_err(),
+        "still holds the lock"
+    );
+    let _ = raw(&svc, "whoami", json!({})).await;
+
+    // Now the binary on disk is upgraded: the old process hands over.
+    write("9.9.9-new");
+    std::fs::File::options()
+        .write(true)
+        .open(&exe)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() + Duration::from_secs(120))
+        .unwrap();
+    let ok = tokio::time::timeout(Duration::from_secs(10), &mut done)
+        .await
+        .expect("an upgraded connector stops serving when superseded")
+        .unwrap();
+    assert!(ok, "a clean stop");
+    let lock = ConfigLock::acquire(&bot_dir, &who);
+    assert!(lock.is_ok(), "the lock was released: {:?}", lock.err());
+    let _ = newer.kill();
+    let _ = newer.wait();
+    drop(svc);
+    let _ = std::fs::remove_dir_all(&dir);
+    relay.shutdown().await;
+}

@@ -499,7 +499,11 @@ async fn connect(args: ConnectArgs) -> anyhow::Result<()> {
                 signed_in = gateway.is_signed_in(),
                 "botwhisper connect: serving MCP over stdio"
             );
-            gateway.run_on(rmcp::transport::stdio()).await
+            gateway.run_on(rmcp::transport::stdio()).await?;
+            // The client went away (stdin closed) or a newer connector took
+            // the bot over. Exit now: a blocking stdin read or a background
+            // long-poll must not keep a superseded process alive.
+            std::process::exit(0)
         }
     }
 }

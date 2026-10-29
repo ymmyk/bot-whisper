@@ -275,6 +275,9 @@ struct Inner {
     /// connector that is going away never redeems a grant its successor
     /// (resuming the same saved login) is waiting for.
     stopped: std::sync::atomic::AtomicBool,
+    /// When this process started serving (ms since the epoch): takeover
+    /// requests older than this are not for us.
+    started_ms: u64,
     /// One `resume` at a time: two at once (the background poller and a
     /// tool call both seeing an expired link) would find this very
     /// process holding the bot's home lock and report CONNECTOR_BUSY.
@@ -441,20 +444,41 @@ pub(crate) fn short_reason(r: &str) -> String {
     {
         return "the relay refused this bot's stored sign-in (HTTP 401)".to_string();
     }
-    let first = r.lines().next().unwrap_or_default().trim();
-    // Advice about signing in again is the message's job, not the cause's.
+    // The relay appends its sign-in steps to the cause; they are the
+    // `next_step`'s job, never part of `reason` (QA 0.2.18 saw "unknown or
+    // expired refresh token It returns a link and a short code; ...").
+    let steps = bw_relay::guidance::sign_in_again(None, 0);
+    let first = r.lines().next().unwrap_or_default().replace(&steps, "");
+    let first = first.trim();
     let kept: Vec<String> = sentences(first)
         .into_iter()
-        .filter(|s| {
-            let l = s.to_ascii_lowercase();
-            !l.contains("login") && !l.contains("sign in again")
-        })
+        .filter(|s| !is_sign_in_step(s))
         .collect();
     if kept.is_empty() {
         "the relay refused this bot's stored sign-in".to_string()
     } else {
         kept.join(" ").trim_end_matches('.').to_string()
     }
+}
+
+/// A sentence that tells the bot how to sign in again (a step, not a
+/// cause).
+fn is_sign_in_step(s: &str) -> bool {
+    let l = s.to_ascii_lowercase();
+    [
+        "login",
+        "sign in again",
+        "sign-in again",
+        "sign in once more",
+        "force=true",
+        "short code",
+        "opens the link",
+        "approve",
+        "then retry",
+        "try again",
+    ]
+    .iter()
+    .any(|k| l.contains(k))
 }
 
 /// [`short_reason`] for other modules (doctor).
@@ -488,6 +512,12 @@ fn signed_out_view(reason: Option<&str>, pending: Option<&Pending>, expired: Opt
         None => signed_out_message(retired, waiting.as_deref()),
     };
     let mut v = json!({ "error": "SIGNED_OUT", "message": message });
+    // The next step on its own, apart from the cause (`reason`).
+    v["next_step"] = json!(match (&waiting, expired) {
+        (Some(w), _) => w.clone(),
+        (None, Some(at)) => expired_message(at),
+        (None, None) => LOGIN_NEXT_STEP.to_string(),
+    });
     if let Some(at) = expired {
         merge(&mut v, expired_fields(at));
     }
@@ -581,6 +611,9 @@ fn minutes_left(expires: Instant) -> u64 {
     expires.saturating_duration_since(Instant::now()).as_secs()
 }
 
+/// How often a running connector looks for a takeover request.
+const TAKEOVER_POLL: Duration = Duration::from_secs(1);
+
 impl Gateway {
     /// A gateway that is signed out until `login` (or `resume`) succeeds.
     pub fn new(
@@ -603,6 +636,7 @@ impl Gateway {
                 busy: StdMutex::new(None),
                 upgrade: StdMutex::new(Arc::new(UpgradeWatch::for_current_exe())),
                 stopped: std::sync::atomic::AtomicBool::new(false),
+                started_ms: super::lock::now_ms(),
                 resume_gate: Mutex::new(()),
                 name_warning: StdMutex::new(None),
             }),
@@ -798,9 +832,20 @@ impl Gateway {
         E: std::error::Error + From<std::io::Error> + Send + Sync + 'static,
     {
         let inner = self.inner.clone();
+        let gw = self.clone();
         let running = rmcp::ServiceExt::serve(self, transport).await;
         let r = match running {
-            Ok(running) => running.waiting().await.map(|_| ()).map_err(Into::into),
+            Ok(running) => {
+                let token = running.cancellation_token();
+                let watch = tokio::spawn(async move {
+                    if gw.superseded().await {
+                        token.cancel();
+                    }
+                });
+                let r = running.waiting().await.map(|_| ()).map_err(Into::into);
+                watch.abort();
+                r
+            }
             Err(e) => Err(e.into()),
         };
         inner
@@ -809,7 +854,45 @@ impl Gateway {
         r
     }
 
-    // ----- device login -----
+    /// Resolves once a newer connector for this bot asked to take over
+    /// and this process's binary was upgraded since it started (so this is
+    /// the leftover of an AI app restart): the lock is released first, so
+    /// the newcomer can serve the bot. Never resolves otherwise.
+    async fn superseded(&self) -> bool {
+        loop {
+            tokio::time::sleep(TAKEOVER_POLL).await;
+            if self.inner.stopped.load(std::sync::atomic::Ordering::SeqCst) {
+                return false;
+            }
+            let Some(c) = self.connector() else { continue };
+            let Some(dir) = c.lock_dir() else { continue };
+            let Some(req) = super::lock::TakeoverRequest::pending_for(&dir, self.inner.started_ms)
+            else {
+                continue;
+            };
+            let watch = self.inner.upgrade.lock().expect("lock").clone();
+            let upgraded = tokio::task::spawn_blocking(move || watch.warning())
+                .await
+                .ok()
+                .flatten();
+            if upgraded.is_none() {
+                // Same binary: two apps on one bot. Keep refusing the
+                // newcomer (it says who is in the way).
+                continue;
+            }
+            tracing::warn!(
+                "botwhisper connect: a newer connector (pid {}, v{}) started for this bot and this binary was upgraded; handing over and exiting",
+                req.pid,
+                req.version
+            );
+            if let Some(old) = self.inner.connector.write().expect("lock").take() {
+                old.release_lock();
+            }
+            return true;
+        }
+    }
+
+    // ----- device login -----    // ----- device login -----
 
     fn pending_view(&self, p: &Pending, status: &str) -> Value {
         let url = &p.start.verification_uri_complete;
@@ -1024,7 +1107,7 @@ impl Gateway {
         let mut v = json!({ "status": "expired", "message": expired_message(at) });
         if why.is_some() {
             let so = signed_out_view(why.as_deref(), None, Some(at));
-            for k in ["message", "reason", "retired"] {
+            for k in ["message", "reason", "next_step", "retired"] {
                 if !so[k].is_null() {
                     v[k] = so[k].clone();
                 }
@@ -1402,7 +1485,7 @@ impl Gateway {
         let expired = live.is_none().then(|| self.expired_at(&st)).flatten();
         if why.is_some() {
             let so = signed_out_view(why.as_deref(), live, expired);
-            for k in ["message", "reason", "retired"] {
+            for k in ["message", "reason", "next_step", "retired"] {
                 if !so[k].is_null() {
                     v[k] = so[k].clone();
                 }
@@ -1618,9 +1701,19 @@ mod tests {
             "invalid_grant: the refresh token was revoked. Call `login` (force=true) to sign in again.",
             "invalid_grant: the refresh token was revoked",
             "the relay no longer accepts this bot's sign-in",
+            // What the relay really says (cause + its sign-in steps).
+            &format!(
+                "unknown or expired refresh token. {}",
+                bw_relay::guidance::sign_in_again(None, 0)
+            ),
+            &format!(
+                "refresh token already used; this grant was revoked. {}",
+                bw_relay::guidance::sign_in_again(None, 0)
+            ),
         ] {
             let v = signed_out_view(Some(why), None, None);
             no_shared_sentence(&v);
+            assert_eq!(v["next_step"], LOGIN_NEXT_STEP, "{v}");
             let m = v["message"].as_str().unwrap();
             assert!(m.starts_with("SIGNED_OUT: "), "{m}");
             assert_eq!(
@@ -1631,6 +1724,16 @@ mod tests {
             assert!(m.ends_with(LOGIN_NEXT_STEP), "explanation, then next step: {m}");
             assert!(!v.to_string().contains(".."), "{v}");
         }
+        // The cause alone: no sign-in steps leak into `reason`.
+        let v = signed_out_view(
+            Some(&format!(
+                "unknown or expired refresh token. {}",
+                bw_relay::guidance::sign_in_again(None, 0)
+            )),
+            None,
+            None,
+        );
+        assert_eq!(v["reason"], "unknown or expired refresh token", "{v}");
         // The plain constant is explanation + next step, unchanged.
         assert_eq!(signed_out_message(false, None), SIGNED_OUT_MESSAGE);
         let v = signed_out_view(Some("BOT_RETIRED: x"), None, None);
