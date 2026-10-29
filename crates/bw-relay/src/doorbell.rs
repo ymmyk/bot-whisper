@@ -92,7 +92,10 @@ pub enum DoorbellTarget {
     /// HMAC-signed `POST` (the Phase 0 doorbell).
     Webhook {
         url: String,
-        secret: String,
+        /// HMAC key for `BotWhisper-Signature`. Optional when `auth_header`
+        /// authenticates the ring (0.2.19); stored configs always have one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        secret: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         auth_header: Option<String>,
     },
@@ -146,7 +149,7 @@ impl DoorbellTarget {
     /// Whether a bot-supplied secret is stored.
     pub fn has_secret(&self) -> bool {
         match self {
-            DoorbellTarget::Webhook { .. } => true,
+            DoorbellTarget::Webhook { secret, .. } => secret.is_some(),
             DoorbellTarget::Ntfy { token, .. } => token.is_some(),
             DoorbellTarget::WebPush { .. } => true,
             DoorbellTarget::Gotify { .. } => true,
@@ -1036,9 +1039,11 @@ async fn deliver(client: &reqwest::Client, shared: &Shared, ring: &Ring, now: u6
             let mut req = client
                 .post(url)
                 .header("Content-Type", "application/json")
-                .header("BotWhisper-Signature", sign(secret, now, &body))
-                .header("BotWhisper-Delivery", uuid::Uuid::new_v4().to_string())
-                .body(body);
+                .header("BotWhisper-Delivery", uuid::Uuid::new_v4().to_string());
+            if let Some(secret) = secret {
+                req = req.header("BotWhisper-Signature", sign(secret, now, &body));
+            }
+            let mut req = req.body(body);
             if let Some(auth) = auth_header {
                 req = req.header("Authorization", auth);
             }

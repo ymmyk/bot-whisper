@@ -260,7 +260,10 @@ impl Room {
             .items
             .iter()
             .filter(|i| i.kind == E2eItemKind::Application && i.pending.contains(member))
-            .map(|i| i.created_at + self.cfg.unacked_ttl.as_secs())
+            .map(|i| {
+                let at = i.created_at + self.cfg.unacked_ttl.as_secs();
+                self.expires_at.map_or(at, |room| at.min(room))
+            })
             .min();
         // A seat still waiting to be added (or to confirm its Welcome) lasts
         // as long as the room does.
@@ -494,9 +497,30 @@ impl Room {
     }
 
     /// When a message queued `now` is deleted if still undelivered.
+    /// When a message sent now is deleted if nobody fetches it: the relay's
+    /// retention, but never later than the room itself closes (QA 0.2.18:
+    /// "held until Nov 27" in a room closing in an hour).
     fn message_expiry(&self, now: u64) -> (u64, String) {
-        let at = now + self.cfg.unacked_ttl.as_secs();
+        let mut at = now + self.cfg.unacked_ttl.as_secs();
+        if let Some(room) = self.expires_at {
+            at = at.min(room.max(now));
+        }
         (at, crate::config::iso_utc(at))
+    }
+
+    fn retention_words(&self, now: u64) -> String {
+        let ttl = now + self.cfg.unacked_ttl.as_secs();
+        match self.expires_at {
+            Some(room) if room < ttl => format!(
+                "held until delivered, up to {} or until the room closes at {}, whichever is first",
+                crate::config::ttl_words(self.cfg.unacked_ttl),
+                crate::config::iso_utc(room)
+            ),
+            _ => format!(
+                "held until delivered, up to {}",
+                crate::config::ttl_words(self.cfg.unacked_ttl)
+            ),
+        }
     }
 
     /// Queue application ciphertext for every active member but the sender,
@@ -647,7 +671,7 @@ impl Room {
             "turn": turn_view,
             "expires_at": seq.map(|_| self.message_expiry(now).0),
             "expires_at_utc": seq.map(|_| self.message_expiry(now).1),
-            "retention": format!("held until delivered, up to {}", crate::config::ttl_words(self.cfg.unacked_ttl)),
+            "retention": self.retention_words(now),
         });
         if !welcoming.is_empty() {
             out["pending_delivery"] = json!(welcoming);

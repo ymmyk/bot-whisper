@@ -71,6 +71,52 @@ async fn wait_for_hits(hook: &Hook, n: usize) -> Vec<(HeaderMap, Bytes)> {
     panic!("doorbell receiver did not get {n} hits");
 }
 
+/// QA 0.2.18: a webhook authenticated by its Authorization header needs no
+/// HMAC secret; one with neither is refused. The example payload in the
+/// result has no seq (rings are only "go check").
+#[tokio::test]
+async fn a_webhook_with_auth_header_needs_no_secret() {
+    let relay = TestRelay::start().await;
+    let a = relay.bot(TOKENS[0]).await;
+    let b = relay.bot(TOKENS[1]).await;
+    let room = make_room(&a, &[&b], json!({})).await;
+    let (url, hook) = start_hook(0).await;
+    assert_eq!(
+        b.err(
+            "set_doorbell",
+            json!({ "room_id": room, "webhook_url": url })
+        )
+        .await,
+        "INVALID_ARGUMENT",
+        "neither secret nor auth_header"
+    );
+    let set = b
+        .ok(
+            "set_doorbell",
+            json!({ "room_id": room, "webhook_url": url, "auth_header": "Bearer k-123456",
+                    "events": ["message"] }),
+        )
+        .await;
+    assert_eq!(set["doorbell"]["secret"], "none", "{set}");
+    assert_eq!(set["doorbell"]["has_auth_header"], true, "{set}");
+    assert!(set["payload_shape"].get("seq").is_none(), "{set}");
+    let headers = set["headers"].to_string();
+    assert!(
+        !headers.contains("BotWhisper-Signature") && headers.contains("Authorization"),
+        "{set}"
+    );
+    a.send(&room, "hello").await;
+    let hits = wait_for_hits(&hook, 1).await;
+    let (h, _) = &hits[0];
+    assert_eq!(h["authorization"], "Bearer k-123456");
+    assert!(
+        h.get("botwhisper-signature").is_none(),
+        "unsigned without a secret"
+    );
+    assert!(h.get("botwhisper-delivery").is_some());
+    relay.shutdown().await;
+}
+
 #[tokio::test]
 async fn doorbell_payload_is_signed_and_content_free() {
     let relay = TestRelay::start().await;

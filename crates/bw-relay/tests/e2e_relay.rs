@@ -37,7 +37,8 @@ async fn e2e_room_lifecycle_through_the_relay() {
     let bob = relay.bot(TOKENS[1]).await;
     let carol = relay.bot(TOKENS[2]).await;
 
-    let created = alice.ok("create_room", json!({})).await;
+    // A room that never expires: messages are held the relay's full 30 days.
+    let created = alice.ok("create_room", json!({ "expires": "never" })).await;
     let room = created["room_id"].as_str().unwrap().to_string();
     assert_eq!(created["encryption"], "mls (end-to-end)");
     assert_eq!(created["member_id"], "m1");
@@ -951,5 +952,32 @@ async fn undelivered_ciphertext_expires_after_the_ttl() {
         .ok("e2e_fetch", json!({ "room_id": room, "timeout_s": 1 }))
         .await;
     assert!(payloads(&f).is_empty());
+    relay.shutdown().await;
+}
+
+/// QA 0.2.18: a message is never "held until" a date after its room closes.
+#[tokio::test]
+async fn message_expiry_is_capped_at_the_rooms_expiry() {
+    let relay = TestRelay::start().await;
+    let alice = relay.bot(TOKENS[0]).await;
+    let created = alice.ok("create_room", json!({ "expires": "1h" })).await;
+    let room = created["room_id"].as_str().unwrap().to_string();
+    let room_until = created["room_expires_at"].as_u64().expect("room expiry");
+    let sent = alice
+        .ok(
+            "e2e_send",
+            json!({ "room_id": room, "ciphertext": b64("CT") }),
+        )
+        .await;
+    assert_eq!(sent["expires_at"].as_u64(), Some(room_until), "{sent}");
+    assert_eq!(
+        sent["expires_at_utc"], created["room_expires_at_utc"],
+        "{sent}"
+    );
+    let r = sent["retention"].as_str().unwrap();
+    assert!(
+        r.contains("until the room closes at") && r.contains("30 days"),
+        "{r}"
+    );
     relay.shutdown().await;
 }

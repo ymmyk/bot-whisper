@@ -272,7 +272,9 @@ pub struct SetDoorbellArgs {
     /// webhook: HTTPS URL to POST to. Giving this without `type` means webhook.
     #[serde(default)]
     pub webhook_url: Option<String>,
-    /// webhook: shared secret for the HMAC-SHA256 `BotWhisper-Signature` header.
+    /// webhook: shared secret for the HMAC-SHA256 `BotWhisper-Signature`
+    /// header. Optional when `auth_header` (or the connector's
+    /// `auth_header_file`) is set.
     #[serde(default)]
     pub secret: Option<String>,
     /// webhook: optional `Authorization` header VALUE only, e.g. `Bearer <your-token>`
@@ -686,7 +688,7 @@ impl BotWhisperServer {
 
     #[tool(
         name = "set_doorbell",
-        description = "[Only through the local `botwhisper connect` connector.] Register how to wake you when you are not running. Doorbells carry only room id, event, thread id and turn hint: never content, a seq or a count. A ring only means \"go check\"; call wait_for_message. Default (no type): ntfy with a private random topic the relay creates; the result includes the topic and copy-paste `botwhisper listen` commands to subscribe. Other types: webhook (HMAC-signed HTTPS POST), webpush (RFC 8030 subscription: endpoint, p256dh, auth; VAPID key at GET /push/vapid-public-key), gotify, pushover. Omit room_id to set your bot-wide default for all rooms. type `none` removes."
+        description = "[Only through the local `botwhisper connect` connector.] Register how to wake you when you are not running. Doorbells carry only room id, event, thread id and turn hint: never content, a seq or a count. A ring only means \"go check\"; call wait_for_message. Default (no type): ntfy with a private random topic the relay creates; the result includes the topic and copy-paste `botwhisper listen` commands to subscribe. Other types: webhook (HTTPS POST; set secret for an HMAC `BotWhisper-Signature`, auth_header for an `Authorization` header, or both; one is required), webpush (RFC 8030 subscription: endpoint, p256dh, auth; VAPID key at GET /push/vapid-public-key), gotify, pushover. Omit room_id to set your bot-wide default for all rooms. type `none` removes."
     )]
     async fn set_doorbell(
         &self,
@@ -1177,20 +1179,34 @@ impl BotWhisperServer {
                             .webhook_url
                             .ok_or_else(|| RelayError::invalid("webhook_url is required"))?;
                         doorbell::validate_url(&url, insecure).map_err(RelayError::invalid)?;
-                        let secret = a.secret.filter(|s| (8..=256).contains(&s.len())).ok_or_else(
-                            || RelayError::invalid("secret is required (8 to 256 characters)"),
-                        )?;
+                        let auth_header = match a.auth_header.filter(|h| !h.trim().is_empty()) {
+                            Some(h) => {
+                                doorbell::validate_auth_header(&h).map_err(RelayError::invalid)?;
+                                Some(h.trim().to_string())
+                            }
+                            None => None,
+                        };
+                        // A secret signs each ring; with an Authorization
+                        // header (auth_header / auth_header_file) it is
+                        // optional.
+                        let secret = match a.secret.filter(|s| !s.is_empty()) {
+                            Some(s) if (8..=256).contains(&s.len()) => Some(s),
+                            Some(_) => {
+                                return Err(RelayError::invalid(
+                                    "secret must be 8 to 256 characters",
+                                ))
+                            }
+                            None if auth_header.is_some() => None,
+                            None => {
+                                return Err(RelayError::invalid(
+                                    "a webhook needs secret (8 to 256 characters) or auth_header / auth_header_file",
+                                ))
+                            }
+                        };
                         DoorbellTarget::Webhook {
                             url,
                             secret,
-                            auth_header: match a.auth_header {
-                                Some(h) => {
-                                    doorbell::validate_auth_header(&h)
-                                        .map_err(RelayError::invalid)?;
-                                    Some(h.trim().to_string())
-                                }
-                                None => None,
-                            },
+                            auth_header,
                         }
                     }
                     "ntfy" => {
@@ -1297,16 +1313,28 @@ impl BotWhisperServer {
             None => Value::Null,
             Some(c) => self.describe_doorbell(c, None),
         };
-        out["payload_shape"] = json!({ "v": 1, "event": "message", "room": "<room_id>", "thread": "<thread id, when there is one>", "seq": 0, "turn": "yours|theirs|open|none", "ts": 0 });
+        out["payload_shape"] = json!({ "v": 1, "event": "message", "room": "<room_id>", "thread": "<thread id, when there is one>", "turn": "yours|theirs|open|none", "ts": 0 });
         if let Some(DoorbellConfig {
-            target: DoorbellTarget::Webhook { .. },
+            target:
+                DoorbellTarget::Webhook {
+                    secret,
+                    auth_header,
+                    ..
+                },
             ..
         }) = &cfg
         {
-            out["headers"] = json!([
-                "BotWhisper-Signature: t=<unix>,v1=<hex HMAC-SHA256(secret, t + \".\" + body)>",
-                "BotWhisper-Delivery: <uuid>"
-            ]);
+            let mut h = vec![];
+            if secret.is_some() {
+                h.push(
+                    "BotWhisper-Signature: t=<unix>,v1=<hex HMAC-SHA256(secret, t + \".\" + body)>",
+                );
+            }
+            if auth_header.is_some() {
+                h.push("Authorization: <your auth_header>");
+            }
+            h.push("BotWhisper-Delivery: <uuid>");
+            out["headers"] = json!(h);
         }
         Ok(out)
     }
