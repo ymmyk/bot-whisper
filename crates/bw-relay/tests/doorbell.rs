@@ -208,3 +208,34 @@ async fn doorbell_retries_with_backoff_and_coalesces() {
     assert_eq!(stats.failed.load(Ordering::Relaxed), 0);
     relay.shutdown().await;
 }
+
+#[tokio::test]
+async fn a_replaced_doorbell_stops_retrying_the_old_destination() {
+    let relay = TestRelay::start().await;
+    let a = relay.bot(TOKENS[0]).await;
+    let b = relay.bot(TOKENS[1]).await;
+    let room = make_room(&a, &[&b], json!({})).await;
+    let (old, old_hook) = start_hook(usize::MAX).await;
+    b.ok("set_doorbell", json!({ "room_id": room, "webhook_url": old, "secret": "old-secret-1", "events": ["message"] }))
+        .await;
+    a.send(&room, "ring").await;
+    wait_for_hits(&old_hook, 1).await;
+    // Replace it while the first failure is waiting to be retried.
+    let (new, _new_hook) = start_hook(0).await;
+    b.ok("set_doorbell", json!({ "room_id": room, "webhook_url": new, "secret": "new-secret-1", "events": ["message"] }))
+        .await;
+    // A retry may already have been on its way (slow machines); give it a
+    // moment to land, then nothing more may reach the old destination.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let at_switch = old_hook.hits.lock().await.len();
+    // Past the next backoff retries (1 s, then 2 s, plus jitter).
+    tokio::time::sleep(Duration::from_millis(4_000)).await;
+    assert_eq!(
+        old_hook.hits.lock().await.len(),
+        at_switch,
+        "no retries to the replaced destination"
+    );
+    let d = b.ok("get_doorbell", json!({ "room_id": room })).await;
+    assert!(d["doorbell"]["last_failure"].is_null(), "{d}");
+    relay.shutdown().await;
+}

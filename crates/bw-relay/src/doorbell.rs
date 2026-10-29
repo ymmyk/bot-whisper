@@ -610,7 +610,7 @@ impl Shared {
 /// Fan-in point for rings. Cheap to clone.
 #[derive(Clone)]
 pub struct Doorbells {
-    tx: mpsc::UnboundedSender<Ring>,
+    tx: mpsc::UnboundedSender<Queued>,
     shared: Arc<Shared>,
 }
 
@@ -659,7 +659,7 @@ impl Doorbells {
 
     /// A dispatcher that drops everything (tests that don't care).
     pub fn noop() -> Self {
-        let (tx, mut rx) = mpsc::unbounded_channel::<Ring>();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Queued>();
         tokio::spawn(async move { while rx.recv().await.is_some() {} });
         Doorbells {
             tx,
@@ -701,7 +701,10 @@ impl Doorbells {
         if self.is_dead(&ring.key) {
             return;
         }
-        let _ = self.tx.send(ring);
+        // Stamp the configuration generation now: a retry that outlives a
+        // config change must not report on (or keep ringing for) the new one.
+        let generation = self.shared.generation(&ring.key);
+        let _ = self.tx.send(Queued { ring, generation });
     }
 
     pub fn is_dead(&self, key: &DoorbellKey) -> bool {
@@ -785,10 +788,17 @@ impl Doorbells {
     }
 }
 
-type Slot = watch::Sender<Option<Ring>>;
+/// A ring plus the configuration generation it was made under.
+#[derive(Clone)]
+struct Queued {
+    ring: Ring,
+    generation: u64,
+}
+
+type Slot = watch::Sender<Option<Queued>>;
 
 async fn dispatcher(
-    mut rx: mpsc::UnboundedReceiver<Ring>,
+    mut rx: mpsc::UnboundedReceiver<Queued>,
     client: reqwest::Client,
     shared: Arc<Shared>,
 ) {
@@ -798,7 +808,7 @@ async fn dispatcher(
     // Last successful ntfy publish per destination, for the minimum interval.
     let ntfy_last: Arc<Mutex<HashMap<String, Instant>>> = Arc::new(Mutex::new(HashMap::new()));
     while let Some(ring) = rx.recv().await {
-        let key = (ring.room_id.clone(), ring.member_id.clone());
+        let key = (ring.ring.room_id.clone(), ring.ring.member_id.clone());
         let mut map = slots.lock().await;
         if let Some(slot) = map.get(&key) {
             if slot.receiver_count() > 0 {
@@ -834,7 +844,7 @@ enum Outcome {
 }
 
 async fn worker(
-    mut slot_rx: watch::Receiver<Option<Ring>>,
+    mut slot_rx: watch::Receiver<Option<Queued>>,
     client: reqwest::Client,
     shared: Arc<Shared>,
     ntfy_last: Arc<Mutex<HashMap<String, Instant>>>,
@@ -859,10 +869,13 @@ async fn worker(
             }
         }
         fresh = false;
-        let Some(ring) = slot_rx.borrow_and_update().clone() else {
+        let Some(Queued { ring, generation }) = slot_rx.borrow_and_update().clone() else {
             return;
         };
-        let generation = shared.generation(&ring.key);
+        if shared.generation(&ring.key) != generation {
+            // Made for a configuration that has since been replaced.
+            return;
+        }
         // Space ntfy pings to one topic.
         if let DoorbellTarget::Ntfy { server, topic, .. } = &ring.config.target {
             let dest = topic_hash(
@@ -978,7 +991,7 @@ async fn worker(
 }
 
 /// Sleep for `wait` or until the slot changes. `false` when the slot closed.
-async fn pause(slot_rx: &mut watch::Receiver<Option<Ring>>, wait: Duration) -> bool {
+async fn pause(slot_rx: &mut watch::Receiver<Option<Queued>>, wait: Duration) -> bool {
     tokio::select! {
         _ = tokio::time::sleep(wait) => true,
         changed = slot_rx.changed() => changed.is_ok(),
