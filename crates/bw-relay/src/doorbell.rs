@@ -589,7 +589,22 @@ struct Shared {
     defaults: RwLock<HashMap<String, DoorbellConfig>>,
     /// Last failed delivery per destination (for `get_doorbell`).
     failures: RwLock<HashMap<DoorbellKey, DeliveryFailure>>,
+    /// Bumped whenever a key's configuration is replaced or removed, so a
+    /// delivery still in flight to the old destination neither reports on
+    /// the new one nor keeps retrying.
+    generations: RwLock<HashMap<DoorbellKey, u64>>,
     opts: DoorbellOptions,
+}
+
+impl Shared {
+    fn generation(&self, key: &DoorbellKey) -> u64 {
+        self.generations
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(key)
+            .copied()
+            .unwrap_or(0)
+    }
 }
 
 /// Fan-in point for rings. Cheap to clone.
@@ -635,6 +650,7 @@ impl Doorbells {
             dead: RwLock::new(dead),
             defaults: RwLock::new(defaults),
             failures: RwLock::new(HashMap::new()),
+            generations: RwLock::new(HashMap::new()),
             opts,
         });
         tokio::spawn(dispatcher(rx, client, shared.clone()));
@@ -652,6 +668,7 @@ impl Doorbells {
                 dead: RwLock::new(HashSet::new()),
                 defaults: RwLock::new(HashMap::new()),
                 failures: RwLock::new(HashMap::new()),
+                generations: RwLock::new(HashMap::new()),
                 opts: DoorbellOptions::default(),
             }),
         }
@@ -708,6 +725,13 @@ impl Doorbells {
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .remove(key);
+        *self
+            .shared
+            .generations
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(key.clone())
+            .or_default() += 1;
     }
 
     /// The last failed delivery to this destination, if any since the
@@ -838,6 +862,7 @@ async fn worker(
         let Some(ring) = slot_rx.borrow_and_update().clone() else {
             return;
         };
+        let generation = shared.generation(&ring.key);
         // Space ntfy pings to one topic.
         if let DoorbellTarget::Ntfy { server, topic, .. } = &ring.config.target {
             let dest = topic_hash(
@@ -861,7 +886,19 @@ async fn worker(
             }
         }
         let now = now_unix();
-        match deliver(&client, &shared, &ring, now).await {
+        let outcome = deliver(&client, &shared, &ring, now).await;
+        if shared.generation(&ring.key) != generation {
+            // The configuration changed while this was in flight: it was
+            // about the old destination. Say nothing; a newer ring goes on.
+            if slot_rx.has_changed().unwrap_or(false) {
+                attempt = 0;
+                delay = backoff.initial;
+                fresh = true;
+                continue;
+            }
+            return;
+        }
+        match outcome {
             Outcome::Ok => {
                 shared.stats.delivered.fetch_add(1, Ordering::Relaxed);
                 if let DoorbellTarget::Ntfy { server, topic, .. } = &ring.config.target {

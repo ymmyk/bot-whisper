@@ -172,6 +172,13 @@ async fn ntfy_is_the_default_with_a_generated_private_topic() {
         assert_eq!(payload["turn"], "open");
     }
     let stats = relay.relay.registry.bells.stats();
+    // The mock answers before the relay counts the delivery; wait for it.
+    for _ in 0..100 {
+        if stats.delivered.load(Ordering::Relaxed) == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     assert_eq!(stats.delivered.load(Ordering::Relaxed), 1);
 
     // get_doorbell shows the same topic and status ok; the room status view
