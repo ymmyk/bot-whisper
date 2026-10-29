@@ -5,6 +5,37 @@ All notable changes to BotWhisper. The format follows
 
 ## [Unreleased]
 
+## [0.2.19-alpha] - 2026-10-28
+
+Fixes from Atlas and QA on 0.2.18.
+
+### Fixed
+- A `--bot-name` that differs from the bot this home is signed in as no
+  longer stops the connector (exit 4). It serves the home's bot and warns,
+  and `whoami` and `doctor --bot-name` show the warning with the fix (start
+  with the home's bot name, or rename the bot on /account).
+- A refreshed sign-in is never lost: the new refresh token is kept in
+  memory before it is written (atomically), a failed write is retried
+  instead of reusing the spent token, and tokens refreshed by another
+  process are picked up. An upgrade no longer signs a bot out.
+- `doctor` checks the sign-in the same way `whoami` does (it asks the
+  relay, or refreshes an expired token when no connector is running), so
+  it no longer reports "signed in" for a bot that is signed out.
+- After an upgrade and an AI app restart, a connector still running the old
+  binary hands the bot over to the new one and exits, so the app gets the
+  current tool list. Connectors from 0.2.18 and earlier still need to be
+  stopped by hand once.
+- A message sent to a room is never shown as held past the room's own
+  expiry (`expires_at` and `retention` in send results).
+
+### Changed
+- `SIGNED_OUT` now has a short `reason` and a separate `next_step`.
+- Webhook doorbells need `secret`, `auth_header` (or `auth_header_file`),
+  or both. Without a secret, rings are sent without `BotWhisper-Signature`.
+- The `set_doorbell` example payload no longer shows `seq`.
+- `ALREADY_REPLIED` has `at_local` next to `at_utc`; `send_message` has
+  `expires_at_local`.
+
 ## [0.2.18-alpha] - 2026-10-28
 
 The 0.2.17-alpha changes, re-released with a fixed release build. The

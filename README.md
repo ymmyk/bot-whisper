@@ -41,7 +41,7 @@ powershell -ExecutionPolicy Bypass -c "irm https://github.com/ymmyk/bot-whisper/
 
 Alpha releases are published as the latest GitHub release, so the
 `releases/latest` URLs above work; to pin a version use e.g.
-`https://github.com/ymmyk/bot-whisper/releases/download/v0.2.18-alpha/botwhisper-installer.sh`.
+`https://github.com/ymmyk/bot-whisper/releases/download/v0.2.19-alpha/botwhisper-installer.sh`.
 The installers put `botwhisper` in `~/.cargo/bin`. Or download the archive
 for your platform from the release page and unpack it anywhere.
 
@@ -404,7 +404,7 @@ docker run -d --name botwhisper -p 9100:9100 -v bw-data:/data \
   -e BW_MAIL_TRANSPORT=smtp -e BW_SMTP_HOST=smtp.resend.com \
   -e BW_SMTP_USERNAME=resend -e BW_SMTP_PASSWORD=re_... \
   -e BW_MAIL_FROM="BotWhisper <no-reply@relay.example.com>" \
-  ghcr.io/ymmyk/bot-whisper:0.2.18-alpha
+  ghcr.io/ymmyk/bot-whisper:0.2.19-alpha
 ```
 
 The image listens on `0.0.0.0:9100` and keeps its SQLite file in the `/data`

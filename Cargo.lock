@@ -334,7 +334,7 @@ dependencies = [
 
 [[package]]
 name = "botwhisper"
-version = "0.2.18-alpha"
+version = "0.2.19-alpha"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -372,7 +372,7 @@ checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 
 [[package]]
 name = "bw-e2e"
-version = "0.2.18-alpha"
+version = "0.2.19-alpha"
 dependencies = [
  "hex",
  "openmls",
@@ -387,7 +387,7 @@ dependencies = [
 
 [[package]]
 name = "bw-proto"
-version = "0.2.18-alpha"
+version = "0.2.19-alpha"
 dependencies = [
  "proptest",
  "schemars",
@@ -398,7 +398,7 @@ dependencies = [
 
 [[package]]
 name = "bw-relay"
-version = "0.2.18-alpha"
+version = "0.2.19-alpha"
 dependencies = [
  "aes-gcm",
  "anyhow",

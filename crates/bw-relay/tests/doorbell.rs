@@ -93,7 +93,7 @@ async fn a_webhook_with_auth_header_needs_no_secret() {
     let set = b
         .ok(
             "set_doorbell",
-            json!({ "room_id": room, "webhook_url": url, "auth_header": "Bearer k-123456",
+            json!({ "room_id": room, "webhook_url": url, "auth_header": "Bearer PLACEHOLDER",
                     "events": ["message"] }),
         )
         .await;
@@ -108,7 +108,7 @@ async fn a_webhook_with_auth_header_needs_no_secret() {
     a.send(&room, "hello").await;
     let hits = wait_for_hits(&hook, 1).await;
     let (h, _) = &hits[0];
-    assert_eq!(h["authorization"], "Bearer k-123456");
+    assert_eq!(h["authorization"], "Bearer PLACEHOLDER");
     assert!(
         h.get("botwhisper-signature").is_none(),
         "unsigned without a secret"
