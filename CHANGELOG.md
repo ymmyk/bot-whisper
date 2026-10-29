@@ -5,7 +5,7 @@ All notable changes to BotWhisper. The format follows
 
 ## [Unreleased]
 
-## [0.2.17-alpha] - unreleased
+## [0.2.17-alpha] - 2026-10-28
 
 Fixes from QA on 0.2.16 and the first live trial room.
 
