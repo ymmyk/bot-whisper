@@ -178,6 +178,99 @@ async fn login_through_the_browser_stores_tokens_and_identity() {
         "refreshed tokens were saved"
     );
     assert_eq!(relay.db.count_key_packages(&agent_id).unwrap(), 5);
+    drop(connector);
+
+    // QA 0.2.18: an upgrade must never sign a bot out. Refresh tokens
+    // rotate (presenting a spent one revokes the sign-in), so:
+    // (1) a client whose in-memory token was rotated by another process
+    //     adopts the newer tokens on disk instead of reusing the spent one;
+    let spent = store.load_tokens().unwrap();
+    let mut spent_due = spent.clone();
+    spent_due.expires_at = bw_relay::doorbell::now_unix();
+    let other = RelayClient::new(&relay_url, spent_due.clone(), Some(store.clone()));
+    other
+        .call("whoami", json!({}))
+        .await
+        .expect("other process refreshes");
+    let rotated = store.load_tokens().unwrap();
+    assert_ne!(
+        rotated.refresh_token, spent.refresh_token,
+        "rotated on disk"
+    );
+    let stale = RelayClient::new(&relay_url, spent_due, Some(store.clone()));
+    let who = stale
+        .call("whoami", json!({}))
+        .await
+        .expect("adopts the disk tokens");
+    assert_eq!(who["agent_id"], agent_id.as_str());
+    assert_eq!(stale.current_tokens().await, rotated);
+    // (2) a refresh whose write fails keeps the rotated token in memory
+    //     (the call still works) and writes it once the disk is back.
+    let mut due = rotated.clone();
+    due.expires_at = bw_relay::doorbell::now_unix();
+    let blocker = store
+        .tokens_path()
+        .with_file_name(format!("tokens.json.tmp{}", std::process::id()));
+    std::fs::create_dir_all(&blocker).unwrap();
+    let c = RelayClient::new(&relay_url, due, Some(store.clone()));
+    c.call("whoami", json!({}))
+        .await
+        .expect("a failed token write does not fail the call");
+    let in_memory = c.current_tokens().await;
+    assert_ne!(in_memory.refresh_token, rotated.refresh_token);
+    assert_eq!(store.load_tokens().unwrap(), rotated, "write blocked");
+    c.call("whoami", json!({})).await.expect("still signed in");
+    std::fs::remove_dir_all(&blocker).unwrap();
+    c.call("whoami", json!({})).await.unwrap();
+    assert_eq!(
+        store.load_tokens().unwrap(),
+        in_memory,
+        "saved once possible"
+    );
+    // A restart (new process) from disk refreshes without a reuse.
+    let mut restarted = store.load_tokens().unwrap();
+    restarted.expires_at = bw_relay::doorbell::now_unix();
+    let r = RelayClient::new(&relay_url, restarted, Some(store.clone()));
+    r.call("whoami", json!({}))
+        .await
+        .expect("restart stays signed in");
+    drop(r);
+
+    // doctor asks the relay, like whoami: accepted ...
+    let (ok, line) = botwhisper::doctor::sign_in_check(&config, &relay_url)
+        .await
+        .expect("a stored sign-in");
+    assert!(ok, "{line}");
+    // ... and a sign-in the relay refuses is SIGNED_OUT, not "signed in".
+    let good = store.load_tokens().unwrap();
+    let mut bad = good.clone();
+    bad.access_token = "bwa_not-a-token".into();
+    bad.refresh_token = Some("bwr_not-a-token".into());
+    store.save_tokens(&bad).unwrap();
+    let (ok, line) = botwhisper::doctor::sign_in_check(&config, &relay_url)
+        .await
+        .unwrap();
+    assert!(
+        !ok && line.starts_with("FAIL sign-in: SIGNED_OUT"),
+        "{line}"
+    );
+    assert!(
+        !line.contains("bwa_") && !line.contains("bwr_"),
+        "no tokens: {line}"
+    );
+    assert!(
+        botwhisper::doctor::signed_out_line(&config, &relay_url).contains("signed out"),
+        "never 'signed in as'"
+    );
+    // Due for a refresh with a bad refresh token: also SIGNED_OUT.
+    bad.expires_at = bw_relay::doorbell::now_unix();
+    store.save_tokens(&bad).unwrap();
+    let (ok, line) = botwhisper::doctor::sign_in_check(&config, &relay_url)
+        .await
+        .unwrap();
+    assert!(!ok && line.contains("SIGNED_OUT"), "{line}");
+    store.save_tokens(&good).unwrap();
+
     let _ = std::fs::remove_dir_all(&config);
     relay.shutdown().await;
 }

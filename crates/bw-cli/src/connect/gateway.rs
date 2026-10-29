@@ -106,7 +106,8 @@ pub async fn finish_sign_in(
         let who = client.call("whoami", json!({})).await?;
         let agent_id = who["agent_id"].as_str().unwrap_or("bot").to_string();
         let store = BotStore::new(config, relay, &agent_id);
-        store.save_tokens(tokens)?;
+        // What this client holds now: a refresh during whoami rotated them.
+        store.save_tokens(&client.current_tokens().await)?;
         if let Some(n) = who["bot_name"].as_str().filter(|n| !n.trim().is_empty()) {
             store.save_bot_name(n)?;
         }
@@ -454,6 +455,11 @@ pub(crate) fn short_reason(r: &str) -> String {
     } else {
         kept.join(" ").trim_end_matches('.').to_string()
     }
+}
+
+/// [`short_reason`] for other modules (doctor).
+pub fn short_reason_pub(r: &str) -> String {
+    short_reason(r)
 }
 
 /// Did the relay say this bot was retired (0.2.14, older Member ID)?
@@ -949,7 +955,9 @@ impl Gateway {
         if let Some(old) = i.connector.write().expect("lock").take() {
             old.release_lock();
         }
-        let client = RelayClient::new(&i.relay, tokens.clone(), Some(signed.store.clone()));
+        // The saved tokens: finish_sign_in may have refreshed (rotated) them.
+        let tokens = signed.store.load_tokens().unwrap_or_else(|| tokens.clone());
+        let client = RelayClient::new(&i.relay, tokens, Some(signed.store.clone()));
         let connector = Connector::new(client, Some(signed.store), Some(&i.config)).await?;
         *i.connector.write().expect("lock") = Some(connector);
         *i.resume_note.lock().expect("lock") = None;

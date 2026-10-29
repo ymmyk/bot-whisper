@@ -162,14 +162,86 @@ pub fn bot_name_line(
     Some(format!("WARN bot name: {w}"))
 }
 
+/// Whether the relay accepts this home's stored sign-in: the same test
+/// `whoami` makes (QA 0.2.18: doctor said "signed in" from the token file
+/// alone while whoami said SIGNED_OUT). A live access token is checked
+/// as is; an expired one is refreshed only when no connector runs for the
+/// bot (doctor then holds the bot's lock, so it never rotates a token a
+/// running connector holds). `None`: nothing stored, nothing to check.
+pub async fn sign_in_check(config: &std::path::Path, relay: &str) -> Option<(bool, String)> {
+    use crate::connect::{lock::ConfigLock, lock::LockWho, relay::RelayClient, store::BotStore};
+    let store = BotStore::current(config, relay)?;
+    let tokens = store.load_tokens()?;
+    if let Some(orig) = store.copied_from() {
+        return Some((
+            false,
+            format!("FAIL sign-in: this bot's home was copied from {orig}; a copy cannot reuse that sign-in (call `login`)"),
+        ));
+    }
+    let now = bw_relay::doorbell::now_unix();
+    let (client, _lock) = if tokens.expires_at > now + 60 {
+        let t = tokens.access_token.clone();
+        (RelayClient::with_token(relay, &t), None)
+    } else {
+        let who = LockWho {
+            home: config.to_path_buf(),
+            bot: store.load_bot_name().unwrap_or_default(),
+        };
+        match ConfigLock::acquire(&store.dir, &who) {
+            Ok(l) => (RelayClient::new(relay, tokens, Some(store.clone())), Some(l)),
+            Err(_) => {
+                return Some((
+                    true,
+                    "sign-in: not checked (the access token is due for a refresh and a running connector owns it; ask your AI to call whoami)".to_string(),
+                ))
+            }
+        }
+    };
+    Some(match client.call("whoami", serde_json::json!({})).await {
+        Ok(_) => (true, "ok   sign-in: the relay accepts this bot's sign-in".to_string()),
+        Err(e) => match crate::connect::relay::signed_out(&e) {
+            Some(so) => (
+                false,
+                format!(
+                    "FAIL sign-in: SIGNED_OUT: {} (next step: call `login` in your AI app, or run `botwhisper connect login`)",
+                    crate::connect::relay::sentence(&crate::connect::gateway::short_reason_pub(&so.0))
+                ),
+            ),
+            None => (false, format!("FAIL sign-in: could not check ({e})")),
+        },
+    })
+}
+
+/// Like [`signed_in_line`] for a home whose stored sign-in the relay
+/// refused: never "signed in as".
+pub fn signed_out_line(config: &std::path::Path, relay: &str) -> String {
+    use crate::connect::store::BotStore;
+    match BotStore::current(config, relay).and_then(|s| s.load_bot_name()) {
+        Some(n) => format!("bot: \"{n}\", signed out (home {})", config.display()),
+        None => format!("bot: signed out (home {})", config.display()),
+    }
+}
+
 /// The CLI entry point. Returns the exit code.
 pub async fn run(relay: &str, bot_name: Option<&str>) -> i32 {
-    let r = check(relay, &tls::CaSources::from_env()).await;
+    let mut r = check(relay, &tls::CaSources::from_env()).await;
     for l in &r.lines {
         println!("{l}");
     }
     let config = crate::paths::config_dir();
-    println!("{}", signed_in_line(&config, relay));
+    let relay_url = relay.trim_end_matches('/');
+    match sign_in_check(&config, relay_url).await {
+        Some((true, l)) => {
+            println!("{}", signed_in_line(&config, relay_url));
+            println!("{l}");
+        }
+        Some((false, l)) => {
+            println!("{}", signed_out_line(&config, relay_url));
+            println!("{l}");
+            r.ok = false;
+        }
+        None => println!("{}", signed_in_line(&config, relay_url)),
+    }
     if let Some(l) = bot_name_line(&config, relay, bot_name) {
         println!("{l}");
     }

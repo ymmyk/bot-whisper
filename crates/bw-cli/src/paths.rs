@@ -81,11 +81,20 @@ pub fn safe_segment(s: &str) -> String {
 
 /// Create a directory (and parents) owner-only.
 pub fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    let existed = dir.is_dir();
     std::fs::create_dir_all(dir)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        if let Err(e) = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)) {
+            // A directory we just made must be private. One that already
+            // existed (owned by someone else, a read-only mount's parent)
+            // must not stop a write into it, above all a refreshed sign-in.
+            if !existed {
+                return Err(e);
+            }
+            tracing::warn!("could not make {} owner-only: {}", dir.display(), e.kind());
+        }
     }
     Ok(())
 }

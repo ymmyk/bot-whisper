@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::paths;
 
 /// OAuth tokens for one bot on one relay (or a dev token).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Tokens {
     pub access_token: String,
     #[serde(default)]
@@ -173,12 +173,21 @@ impl BotStore {
         serde_json::from_slice(&bytes).ok()
     }
 
+    /// Atomic (temp file, fsync, rename). `home.json` is best effort: a
+    /// failure there must never look like the tokens were not saved.
     pub fn save_tokens(&self, t: &Tokens) -> std::io::Result<()> {
         paths::write_private(
             &self.tokens_path(),
             &serde_json::to_vec_pretty(t).expect("json"),
         )?;
-        self.record_home()
+        if let Err(e) = self.record_home() {
+            tracing::warn!(
+                "could not record {}: {}",
+                self.home_path().display(),
+                e.kind()
+            );
+        }
+        Ok(())
     }
 
     /// Where this bot's directory lives, written next to its tokens.

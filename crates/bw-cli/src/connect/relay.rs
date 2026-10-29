@@ -229,6 +229,27 @@ fn unreachable_or_plain(msg: String) -> anyhow::Error {
     }
 }
 
+/// Tokens on disk that differ from ours and live longer were written after
+/// ours (a refresh elsewhere): ours are spent.
+fn disk_is_newer(ours: &Tokens, disk: &Tokens) -> bool {
+    disk.refresh_token.is_some()
+        && disk.refresh_token != ours.refresh_token
+        && disk.client_id == ours.client_id
+        && disk.expires_at > ours.expires_at
+}
+
+/// Write rotated tokens; a failure is logged (never the tokens) and the
+/// write is retried on the next call.
+fn save_or_warn(s: &BotStore, t: &Tokens) {
+    if let Err(e) = s.save_tokens(t) {
+        tracing::error!(
+            "could not save the refreshed sign-in to {} ({}); keeping it in memory and retrying",
+            s.tokens_path().display(),
+            e.kind()
+        );
+    }
+}
+
 impl RelayClient {
     /// `store` is where refreshed tokens are written (`None` for dev tokens).
     pub fn new(relay: &str, tokens: Tokens, store: Option<BotStore>) -> Self {
@@ -261,16 +282,51 @@ impl RelayClient {
         Ok(self.tokens.lock().await.access_token.clone())
     }
 
+    /// The tokens this client holds now (after any refresh).
+    pub async fn current_tokens(&self) -> Tokens {
+        self.tokens.lock().await.clone()
+    }
+
     /// Refresh when the access token is about to expire.
+    ///
+    /// The relay rotates refresh tokens: the old one dies with the
+    /// exchange, and presenting it again revokes the whole sign-in. So the
+    /// rotated token must never be lost:
+    /// - tokens on disk that are newer than ours (another process, or a
+    ///   `connect login`, rotated them) are adopted instead of refreshing
+    ///   with a token that is already spent;
+    /// - the fresh tokens replace ours in memory first, then are written
+    ///   (atomically), and a failed write is retried on the next call
+    ///   instead of failing it (0.2.18 returned the write error and kept
+    ///   the spent token in memory, so the next refresh signed the bot out).
     async fn ensure_fresh(&self) -> anyhow::Result<()> {
         let mut t = self.tokens.lock().await;
-        if t.expires_at != u64::MAX && t.expires_at <= bw_relay::doorbell::now_unix() + 60 {
-            let fresh = login::refresh(&self.relay, &t).await?;
-            if let Some(s) = &self.store {
-                s.save_tokens(&fresh)?;
+        if t.expires_at == u64::MAX {
+            return Ok(());
+        }
+        let now = bw_relay::doorbell::now_unix();
+        if let Some(s) = &self.store {
+            if let Some(disk) = s.load_tokens() {
+                if disk_is_newer(&t, &disk) {
+                    tracing::info!(
+                        "using the newer sign-in tokens saved in {}",
+                        s.tokens_path().display()
+                    );
+                    *t = disk;
+                    *self.svc.lock().await = None;
+                } else if disk != *t && t.expires_at > now {
+                    // Ours are newer (a write failed earlier): save again.
+                    save_or_warn(s, &t);
+                }
             }
+        }
+        if t.expires_at <= now + 60 {
+            let fresh = login::refresh(&self.relay, &t).await?;
             *t = fresh;
             *self.svc.lock().await = None;
+            if let Some(s) = &self.store {
+                save_or_warn(s, &t);
+            }
         }
         Ok(())
     }
