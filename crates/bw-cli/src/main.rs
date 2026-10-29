@@ -240,8 +240,9 @@ struct RelayArgs {
     #[arg(long, env = "BW_RATE_MSGS_PER_ROOM", default_value_t = 30)]
     rate_msgs_per_room: u32,
 
-    /// Rate limit: doorbell rings per member per hour (0 = unlimited).
-    #[arg(long, env = "BW_RATE_DOORBELLS_PER_MEMBER", default_value_t = 20)]
+    /// Doorbell ring budget per member per room per hour (0 = unlimited).
+    /// Rings over it wait (merged) for the next token; none is dropped.
+    #[arg(long, env = "BW_RATE_DOORBELLS_PER_MEMBER", default_value_t = 120)]
     rate_doorbells_per_member: u32,
 
     /// Rate limit: rooms an account may own at once (0 = unlimited).

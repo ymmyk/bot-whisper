@@ -70,7 +70,8 @@ pub struct RateLimits {
     pub msgs_per_member_per_min: u32,
     /// Content messages per room per minute.
     pub msgs_per_room_per_min: u32,
-    /// Doorbell rings per member per hour.
+    /// Doorbell ring budget per member per room per hour (a token bucket in
+    /// the dispatcher: rings over it wait, merged, and are never dropped).
     pub doorbells_per_member_per_hour: u32,
     /// Rooms one account may own at once.
     pub rooms_per_account: u32,
@@ -95,7 +96,7 @@ impl Default for RateLimits {
         RateLimits {
             msgs_per_member_per_min: 10,
             msgs_per_room_per_min: 30,
-            doorbells_per_member_per_hour: 20,
+            doorbells_per_member_per_hour: 120,
             rooms_per_account: 20,
             invites_per_room: 50,
             signups_per_email_per_hour: 5,

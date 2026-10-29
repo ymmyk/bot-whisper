@@ -454,7 +454,12 @@ async fn rings_close_together_are_one_wake_up() {
     // Only "go check": no seq, no count, no content.
     let mut keys: Vec<&str> = p.as_object().unwrap().keys().map(String::as_str).collect();
     keys.sort_unstable();
-    assert_eq!(keys, ["event", "room", "thread", "ts", "turn", "v"], "{p}");
+    assert_eq!(
+        keys,
+        ["event", "events", "room", "thread", "ts", "turn", "v"],
+        "{p}"
+    );
+    assert_eq!(p["events"], json!(["message"]), "{p}");
 
     // The fetch roster carries names now (here the renamed seat).
     a.ok(
@@ -470,6 +475,76 @@ async fn rings_close_together_are_one_wake_up() {
         .map(|m| &m["display_name"])
         .collect();
     assert!(names.contains(&&json!("Owner Bot")), "{fetched}");
+}
+
+/// QA 0.2.19: a message then end_thread rang only as `thread_done` with
+/// turn `none`. A merged ring names every event and keeps the message.
+#[tokio::test]
+async fn a_merged_ring_carries_every_event_and_keeps_the_message() {
+    let relay = TestRelay::start_with(RelayConfig {
+        doorbell_debounce: Duration::from_millis(1200),
+        ..test_config()
+    })
+    .await;
+    let a = relay.bot(TOKENS[0]).await;
+    let b = relay.bot(TOKENS[1]).await;
+    let room = make_room(&a, &[&b], json!({})).await;
+    let (url, hook) = start_hook(StatusCode::OK).await;
+    b.ok(
+        "set_doorbell",
+        json!({ "room_id": room, "webhook_url": url, "secret": "trial-secret-1", "events": ["message", "thread_done"] }),
+    )
+    .await;
+    a.send(&room, "last word").await;
+    let done = a
+        .ok("e2e_turn", json!({ "room_id": room, "signal": "done" }))
+        .await;
+    assert!(done.get("error").is_none(), "{done}");
+    let hits = hits_after(&hook, 1, Duration::from_secs(5)).await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(hook.hits.lock().await.len(), 1, "one wake-up");
+    let p: Value = serde_json::from_slice(&hits[0].1).unwrap();
+    assert_eq!(p["event"], "message", "{p}");
+    assert_eq!(p["events"], json!(["message", "thread_done"]), "{p}");
+    assert_eq!(p["turn"], "open", "the message's turn: {p}");
+}
+
+/// The ring budget defers, never drops (0.2.16: rings past 20 an hour per
+/// member were silently dropped).
+#[tokio::test]
+async fn rings_over_the_budget_wait_instead_of_being_dropped() {
+    let mut cfg = test_config();
+    cfg.limits.doorbells_per_member_per_hour = 2;
+    let relay = TestRelay::start_with(cfg).await;
+    let a = relay.bot(TOKENS[0]).await;
+    let b = relay.bot(TOKENS[1]).await;
+    let room = make_room(&a, &[&b], json!({})).await;
+    let (url, hook) = start_hook(StatusCode::OK).await;
+    b.ok(
+        "set_doorbell",
+        json!({ "room_id": room, "webhook_url": url, "secret": "trial-secret-1", "events": ["message"] }),
+    )
+    .await;
+    for (i, text) in ["one", "two", "three"].iter().enumerate() {
+        a.send(&room, text).await;
+        if i < 2 {
+            hits_after(&hook, i + 1, Duration::from_secs(5)).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+    let stats = relay.relay.registry.bells.stats();
+    for _ in 0..100 {
+        if stats.deferred.load(std::sync::atomic::Ordering::Relaxed) == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(stats.deferred.load(std::sync::atomic::Ordering::Relaxed), 1);
+    assert_eq!(
+        hook.hits.lock().await.len(),
+        2,
+        "the third waits for a token"
+    );
 }
 
 #[tokio::test]

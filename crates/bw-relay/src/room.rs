@@ -268,7 +268,6 @@ pub struct Room {
     removed: HashMap<String, Removed>,
     member_msgs: Limiter,
     room_msgs: Limiter,
-    bells_per_member: Limiter,
     last_content_from: HashMap<MemberId, Instant>,
     db: Db,
     bells: Doorbells,
@@ -403,10 +402,6 @@ impl Room {
             removed: HashMap::new(),
             member_msgs: Limiter::new(limits.msgs_per_member_per_min, Duration::from_secs(60)),
             room_msgs: Limiter::new(limits.msgs_per_room_per_min, Duration::from_secs(60)),
-            bells_per_member: Limiter::new(
-                limits.doorbells_per_member_per_hour,
-                Duration::from_secs(3600),
-            ),
             last_content_from: HashMap::new(),
             db,
             bells,
@@ -647,14 +642,16 @@ impl Room {
         }
     }
 
-    /// Ring one member's doorbell for `event` if they subscribed to it and
-    /// are under their hourly ring budget. A per-room doorbell wins over the
-    /// bot's default doorbell.
+    /// Ring one member's doorbell for `event` if they subscribed to it. A
+    /// per-room doorbell wins over the bot's default doorbell.
     fn ring(&self, member: &str, event: &str, turn: &str, now: u64) {
         let Some((cfg, key)) = self.doorbell_for(member) else {
             return;
         };
-        if cfg.wants(event) && self.bells_per_member.check(member).is_ok() {
+        // The ring budget lives in the dispatcher now: over it, rings wait
+        // (merged) instead of being dropped here (QA 0.2.19 / 0.2.16 lost
+        // rings once a member had 20 in an hour).
+        if cfg.wants(event) {
             self.bells.ring(Ring {
                 room_id: self.id.clone(),
                 member_id: member.to_string(),
@@ -667,6 +664,7 @@ impl Room {
                     thread: self.thread_id(),
                     turn: turn.to_string(),
                     ts: now,
+                    events: vec![event.to_string()],
                 },
             });
         }

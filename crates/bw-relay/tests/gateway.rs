@@ -767,7 +767,14 @@ async fn a_retired_bot_is_told_why_everywhere_and_signs_in_again() {
 fn check_waiting(v: &Value, tool: &str, login: &Value) {
     let all = v.to_string();
     assert!(!all.contains("force"), "{tool}: {all}");
-    let m = v["message"].as_str().unwrap_or_default();
+    // QA 0.2.19: the wait instructions live in next_step only; the message
+    // says a link is waiting and points there (no repeat).
+    let msg = v["message"].as_str().unwrap_or_default();
+    assert!(
+        v["next_step"].is_null() || !msg.contains("Waiting for your person to approve"),
+        "{tool}: {v}"
+    );
+    let m = v["next_step"].as_str().unwrap_or(msg);
     assert!(
         m.contains("Waiting for your person to approve the link sent at ")
             && m.contains("Don't call login again unless it has expired."),
@@ -796,7 +803,16 @@ fn check_waiting(v: &Value, tool: &str, login: &Value) {
 /// signed-out bot keeps `retired` and the explanation.
 fn check_expired(v: &Value, tool: &str, at: u64) {
     const WHY: &str = "BotWhisper updated how bots are identified; this bot needs to sign in once more. Its old rooms will need a new invite.";
-    let m = v["message"].as_str().unwrap_or_default();
+    let msg = v["message"].as_str().unwrap_or_default();
+    // QA 0.2.19: with a next_step, the message points there (no repeat).
+    let has_next = v["next_step"].is_string();
+    if has_next {
+        assert!(
+            !msg.contains("force=true") && msg.ends_with("see next_step."),
+            "{tool}: {v}"
+        );
+    }
+    let m = v["next_step"].as_str().unwrap_or(msg);
     let utc = bw_proto::time::iso_utc(at);
     assert!(
         m.contains("Your last link expired at ")
@@ -818,11 +834,14 @@ fn check_expired(v: &Value, tool: &str, at: u64) {
     }
     assert_eq!(v["retired"], true, "{tool}: {v}");
     assert!(
-        m.starts_with("SIGNED_OUT: Your last link expired") && m.contains(WHY),
-        "{tool}: {m}"
+        (has_next || msg.starts_with("SIGNED_OUT: Your last link expired")) && msg.contains(WHY),
+        "{tool}: {msg}"
     );
     if let Some(r) = v["reason"].as_str() {
-        assert!(!m.contains(r) && !r.contains("login"), "{tool}: {m} / {r}");
+        assert!(
+            !msg.contains(r) && !r.contains("login"),
+            "{tool}: {msg} / {r}"
+        );
     }
     assert!(!v.to_string().contains(".."), "{tool}: {v}");
 }
@@ -868,8 +887,13 @@ async fn pending_inner() {
     let r = raw(&svc, "list_rooms", json!({})).await;
     let v = r.structured_content.unwrap();
     assert_eq!(v["error"], "SIGNED_OUT", "{v}");
+    // QA 0.2.19: the message points at next_step instead of repeating it.
     assert!(
-        v["message"].as_str().unwrap().contains("(force=true)"),
+        v["next_step"].as_str().unwrap().contains("(force=true)"),
+        "{v}"
+    );
+    assert!(
+        v["message"].as_str().unwrap().ends_with("See next_step."),
         "{v}"
     );
 
@@ -969,7 +993,17 @@ async fn retired_inner() {
             m.contains(WHY),
             "{tool}: the explanation is the message: {m}"
         );
-        assert!(m.contains("Call `login` (force=true)"), "{tool}: {m}");
+        assert!(
+            m.ends_with("See next_step.") && !m.contains("force=true"),
+            "{tool}: next_step is not repeated: {m}"
+        );
+        assert!(
+            v["next_step"]
+                .as_str()
+                .unwrap()
+                .contains("Call `login` (force=true)"),
+            "{tool}: {v}"
+        );
         let r = v["reason"].as_str().unwrap();
         assert!(
             r.starts_with("BOT_RETIRED: ") && !r.contains(WHY) && !r.contains("login"),

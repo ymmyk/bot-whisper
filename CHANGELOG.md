@@ -14,11 +14,43 @@ All notable changes to BotWhisper. The format follows
   `*_local` sibling, and UTC times inside relay prose (the `get_doorbell`
   summary's "Last wake-up sent", notes, retention, error messages) get the
   local time in front.
+- Doorbell payloads carry `events`: every event type a ring stands for
+  (a merged ring after a message and `end_thread` says
+  `["message", "thread_done"]`). `event` stays `message`, with that
+  message's `turn`, whenever a message is among them.
+- `/health` doorbell counters add `gave_up` and `deferred`.
+
+### Changed
+
+- The doorbell ring budget is a token bucket in the dispatcher (default
+  120 per member per room per hour, was a fixed window of 20). Rings over
+  it wait, merged into one, instead of being dropped.
+- `create_invite` with a `ttl` that runs past the room's expiry shortens
+  it to the room's remaining time (with a note and `ttl_capped: true`)
+  instead of refusing.
 
 ### Fixed
 
+- Rings were silently dropped once a member had 20 in an hour (the trial
+  room's 6:00 pm CT wake-ups that never came). They now wait for the
+  budget, and a ring that arrived just as a delivery finished is no longer
+  lost.
+- `/health` counted `failed: 0` while a webhook answered 500: every failed
+  attempt counts now.
+- `join_room` on a room that needs approval answers `awaiting_approval` at
+  once instead of holding the call for up to 50 s.
+- `wait_for_message` says "No new messages" only when nothing at all came
+  back (not when only events did).
+- `doctor` and `whoami` give the same fix for a bot that was signed out or
+  deleted: call `login` (force=true).
+- The `SIGNED_OUT` message no longer repeats `next_step`.
 - The upgrade notice and handover also notice a binary replaced by an
   installer that keeps the archive's modification time (a new inode).
+
+### Docs
+
+- The README explains that a host may cache the tool list (remove and
+  re-add the connector, or restart the host app, if tools are missing).
 
 ## [0.2.19-alpha] - 2026-10-28
 

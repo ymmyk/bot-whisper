@@ -109,7 +109,10 @@ fn content_free(body: &[u8], secret_text: &str) -> Value {
         .map(String::as_str)
         .collect();
     keys.sort_unstable();
-    assert_eq!(keys, ["event", "room", "thread", "ts", "turn", "v"]);
+    assert_eq!(
+        keys,
+        ["event", "events", "room", "thread", "ts", "turn", "v"]
+    );
     payload
 }
 

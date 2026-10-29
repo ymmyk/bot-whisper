@@ -325,6 +325,52 @@ pub struct DoorbellPayload {
     /// `yours`, `theirs`, `open` (free mode: anyone may send) or `none`.
     pub turn: String,
     pub ts: u64,
+    /// Every event type this ring covers, in order (rings merged by the
+    /// debounce or the ring budget carry them all; `event` is `message`
+    /// whenever one of them is, with that message's `turn`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub events: Vec<String>,
+}
+
+impl Ring {
+    /// `self` (pending) merged with a newer ring for the same member and
+    /// room: the newest configuration and time, every event type, and a
+    /// message kept as the headline (QA 0.2.19: a message then end_thread
+    /// rang only as thread_done with turn none).
+    pub fn merged_with(&self, newer: Ring) -> Ring {
+        let mut out = newer;
+        out.payload = self.payload.merged_with(out.payload);
+        out
+    }
+}
+
+impl DoorbellPayload {
+    /// `self` merged with a newer payload; see [`Ring::merged_with`].
+    pub fn merged_with(&self, newer: DoorbellPayload) -> DoorbellPayload {
+        let mut events = self.all_events();
+        for e in newer.all_events() {
+            if !events.contains(&e) {
+                events.push(e);
+            }
+        }
+        let mut out = newer;
+        if self.event == "message" && out.event != "message" {
+            out.event = "message".into();
+            out.turn = self.turn.clone();
+            out.thread = self.thread.clone();
+        }
+        out.events = events;
+        out
+    }
+
+    /// `events`, or just `event` for a ring that was never merged.
+    pub fn all_events(&self) -> Vec<String> {
+        if self.events.is_empty() {
+            vec![self.event.clone()]
+        } else {
+            self.events.clone()
+        }
+    }
 }
 
 /// Which stored configuration a ring came from (for status updates and the
@@ -511,8 +557,15 @@ pub fn ntfy_recipes(server: &str, topic: &str, token: bool) -> Value {
 #[derive(Debug, Default)]
 pub struct DoorbellStats {
     pub delivered: AtomicU64,
+    /// Failed delivery attempts (each retry of a failing webhook counts;
+    /// QA 0.2.19 saw `failed: 0` while a webhook answered 500).
     pub failed: AtomicU64,
+    /// Rings dropped after the last retry failed.
+    pub gave_up: AtomicU64,
     pub coalesced: AtomicU64,
+    /// Rings held back by the per-member ring budget (delivered, merged,
+    /// once the budget allows; never dropped).
+    pub deferred: AtomicU64,
     pub dead: AtomicU64,
 }
 
@@ -551,6 +604,11 @@ pub struct DoorbellOptions {
     pub ntfy_min_interval: Duration,
     /// Rings for one member within this window become one delivery.
     pub debounce: Duration,
+    /// Deliveries per member per room per hour (0: unlimited), as a token
+    /// bucket: up to this many at once, refilled evenly over the hour.
+    /// Rings over it wait (merged) for the next token instead of being
+    /// dropped, as they were before 0.2.20.
+    pub per_member_per_hour: u32,
     /// Where Pushover posts go (tests point this at a mock).
     pub pushover_url: String,
     pub vapid: Option<VapidKeys>,
@@ -566,6 +624,7 @@ impl Default for DoorbellOptions {
             ntfy_token: None,
             ntfy_min_interval: Duration::from_secs(5),
             debounce: Duration::ZERO,
+            per_member_per_hour: 0,
             pushover_url: PUSHOVER_URL.into(),
             vapid: None,
             vapid_subject: "mailto:botwhisper@localhost".into(),
@@ -596,6 +655,8 @@ struct Shared {
     /// delivery still in flight to the old destination neither reports on
     /// the new one nor keeps retrying.
     generations: RwLock<HashMap<DoorbellKey, u64>>,
+    /// Ring budget per (room, member): tokens left and when last refilled.
+    budget: std::sync::Mutex<HashMap<(String, String), (f64, Instant)>>,
     opts: DoorbellOptions,
 }
 
@@ -607,6 +668,30 @@ impl Shared {
             .get(key)
             .copied()
             .unwrap_or(0)
+    }
+
+    /// Take one delivery token for (room, member), or say how long until
+    /// the next one.
+    fn take_token(&self, key: &(String, String), now: Instant) -> Result<(), Duration> {
+        let per_hour = self.opts.per_member_per_hour;
+        if per_hour == 0 {
+            return Ok(());
+        }
+        let cap = f64::from(per_hour);
+        let rate = cap / 3600.0;
+        let mut map = self.budget.lock().unwrap_or_else(|e| e.into_inner());
+        if map.len() > 4096 {
+            map.retain(|_, (t, at)| *t + now.duration_since(*at).as_secs_f64() * rate < cap);
+        }
+        let (tokens, at) = map.entry(key.clone()).or_insert((cap, now));
+        *tokens = (*tokens + now.duration_since(*at).as_secs_f64() * rate).min(cap);
+        *at = now;
+        if *tokens >= 1.0 {
+            *tokens -= 1.0;
+            Ok(())
+        } else {
+            Err(Duration::from_secs_f64((1.0 - *tokens) / rate).max(Duration::from_millis(10)))
+        }
     }
 }
 
@@ -654,6 +739,7 @@ impl Doorbells {
             defaults: RwLock::new(defaults),
             failures: RwLock::new(HashMap::new()),
             generations: RwLock::new(HashMap::new()),
+            budget: std::sync::Mutex::new(HashMap::new()),
             opts,
         });
         tokio::spawn(dispatcher(rx, client, shared.clone()));
@@ -672,6 +758,7 @@ impl Doorbells {
                 defaults: RwLock::new(HashMap::new()),
                 failures: RwLock::new(HashMap::new()),
                 generations: RwLock::new(HashMap::new()),
+                budget: std::sync::Mutex::new(HashMap::new()),
                 opts: DoorbellOptions::default(),
             }),
         }
@@ -707,7 +794,11 @@ impl Doorbells {
         // Stamp the configuration generation now: a retry that outlives a
         // config change must not report on (or keep ringing for) the new one.
         let generation = self.shared.generation(&ring.key);
-        let _ = self.tx.send(Queued { ring, generation });
+        let _ = self.tx.send(Queued {
+            ring,
+            generation,
+            id: next_ring_id(),
+        });
     }
 
     pub fn is_dead(&self, key: &DoorbellKey) -> bool {
@@ -796,40 +887,80 @@ impl Doorbells {
 struct Queued {
     ring: Ring,
     generation: u64,
+    /// Increasing per queued or merged ring, so the dispatcher knows
+    /// whether the slot's ring was already taken by the worker.
+    id: u64,
+}
+
+static NEXT_RING_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_ring_id() -> u64 {
+    NEXT_RING_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 type Slot = watch::Sender<Option<Queued>>;
+/// A slot and the id of the newest ring its worker has taken.
+type Slots = Arc<Mutex<HashMap<(String, String), (Slot, Arc<AtomicU64>)>>>;
 
 async fn dispatcher(
     mut rx: mpsc::UnboundedReceiver<Queued>,
     client: reqwest::Client,
     shared: Arc<Shared>,
 ) {
-    // One slot per (room, member). A slot holds the latest pending ring; the
-    // worker for that slot delivers whatever is current when it gets to it.
-    let slots: Arc<Mutex<HashMap<(String, String), Slot>>> = Arc::new(Mutex::new(HashMap::new()));
+    // One slot per (room, member). A slot holds the pending ring, merged
+    // with every ring that arrives before the worker takes it; the worker
+    // delivers whatever is current when it gets to it.
+    let slots: Slots = Arc::new(Mutex::new(HashMap::new()));
     // Last successful ntfy publish per destination, for the minimum interval.
     let ntfy_last: Arc<Mutex<HashMap<String, Instant>>> = Arc::new(Mutex::new(HashMap::new()));
     while let Some(ring) = rx.recv().await {
         let key = (ring.ring.room_id.clone(), ring.ring.member_id.clone());
         let mut map = slots.lock().await;
-        if let Some(slot) = map.get(&key) {
+        // The worker removes its slot under this lock before it stops, so
+        // a slot in the map always has a live worker: nothing sent into it
+        // is lost (0.2.16 could drop a ring sent as the worker finished).
+        if let Some((slot, taken)) = map.get(&key) {
             if slot.receiver_count() > 0 {
                 shared.stats.coalesced.fetch_add(1, Ordering::Relaxed);
-                let _ = slot.send(Some(ring));
+                let taken = taken.load(Ordering::SeqCst);
+                slot.send_modify(|cur| {
+                    let merged = match cur.as_ref().filter(|q| q.id > taken) {
+                        // Not delivered yet: one ring covering both.
+                        Some(old) => Queued {
+                            ring: old.ring.merged_with(ring.ring.clone()),
+                            generation: ring.generation,
+                            id: next_ring_id(),
+                        },
+                        None => ring.clone(),
+                    };
+                    *cur = Some(merged);
+                });
                 continue;
             }
             map.remove(&key);
         }
-        let (slot, slot_rx) = watch::channel(Some(ring));
-        map.insert(key.clone(), slot);
+        let (slot, mut slot_rx) = watch::channel(Some(ring));
+        let taken = Arc::new(AtomicU64::new(0));
+        map.insert(key.clone(), (slot, taken.clone()));
         drop(map);
-        tokio::spawn(worker(
-            slot_rx,
+        let (client, shared, ntfy_last, slots) = (
             client.clone(),
             shared.clone(),
             ntfy_last.clone(),
-        ));
+            slots.clone(),
+        );
+        tokio::spawn(async move {
+            loop {
+                worker(&mut slot_rx, &taken, &key, &client, &shared, &ntfy_last).await;
+                let mut map = slots.lock().await;
+                if slot_rx.has_changed().unwrap_or(false) {
+                    // A ring arrived as the worker finished: deliver it.
+                    continue;
+                }
+                map.remove(&key);
+                return;
+            }
+        });
     }
 }
 
@@ -847,10 +978,12 @@ enum Outcome {
 }
 
 async fn worker(
-    mut slot_rx: watch::Receiver<Option<Queued>>,
-    client: reqwest::Client,
-    shared: Arc<Shared>,
-    ntfy_last: Arc<Mutex<HashMap<String, Instant>>>,
+    slot_rx: &mut watch::Receiver<Option<Queued>>,
+    taken: &AtomicU64,
+    slot_key: &(String, String),
+    client: &reqwest::Client,
+    shared: &Shared,
+    ntfy_last: &Mutex<HashMap<String, Instant>>,
 ) {
     let backoff = shared.opts.backoff.clone();
     let mut attempt: u32 = 0;
@@ -858,6 +991,8 @@ async fn worker(
     // A fresh burst: wait out the debounce window first, so rings close
     // together become one wake-up.
     let mut fresh = true;
+    // One budget token per delivery (its retries are free).
+    let mut have_token = false;
     loop {
         if fresh && !shared.opts.debounce.is_zero() {
             let until = Instant::now() + shared.opts.debounce;
@@ -866,15 +1001,42 @@ async fn worker(
                 if left.is_zero() {
                     break;
                 }
-                if !pause(&mut slot_rx, left).await {
+                if !pause(slot_rx, left).await {
                     return;
                 }
             }
         }
+        // The ring budget: over it, wait (merging what arrives meanwhile)
+        // for the next token instead of dropping the ring. Retries of one
+        // delivery spend no new token.
+        if !have_token {
+            let mut counted = false;
+            loop {
+                match shared.take_token(slot_key, Instant::now()) {
+                    Ok(()) => break,
+                    Err(wait) => {
+                        if !counted {
+                            shared.stats.deferred.fetch_add(1, Ordering::Relaxed);
+                            counted = true;
+                        }
+                        if !pause(slot_rx, wait).await {
+                            return;
+                        }
+                    }
+                }
+            }
+            have_token = true;
+        }
         fresh = false;
-        let Some(Queued { ring, generation }) = slot_rx.borrow_and_update().clone() else {
+        let Some(Queued {
+            ring,
+            generation,
+            id,
+        }) = slot_rx.borrow_and_update().clone()
+        else {
             return;
         };
+        taken.store(id, Ordering::SeqCst);
         if shared.generation(&ring.key) != generation {
             // Made for a configuration that has since been replaced.
             return;
@@ -894,7 +1056,7 @@ async fn worker(
                     })
                     .unwrap_or_default()
             };
-            if !wait.is_zero() && !pause(&mut slot_rx, wait).await {
+            if !wait.is_zero() && !pause(slot_rx, wait).await {
                 return;
             }
             if slot_rx.has_changed().unwrap_or(false) {
@@ -902,7 +1064,8 @@ async fn worker(
             }
         }
         let now = now_unix();
-        let outcome = deliver(&client, &shared, &ring, now).await;
+        let outcome = deliver(client, shared, &ring, now).await;
+        have_token = false;
         if shared.generation(&ring.key) != generation {
             // The configuration changed while this was in flight: it was
             // about the old destination. Say nothing; a newer ring goes on.
@@ -924,7 +1087,7 @@ async fn worker(
                     );
                     ntfy_last.lock().await.insert(dest, Instant::now());
                 }
-                set_status(&shared, &ring.key, "ok", now);
+                set_status(shared, &ring.key, "ok", now);
                 // Anything newer that arrived while we were sending?
                 if slot_rx.has_changed().unwrap_or(false) {
                     attempt = 0;
@@ -941,7 +1104,7 @@ async fn worker(
                     .write()
                     .unwrap_or_else(|e| e.into_inner())
                     .insert(ring.key.clone());
-                set_status(&shared, &ring.key, "dead", now);
+                set_status(shared, &ring.key, "dead", now);
                 tracing::info!(
                     kind = ring.config.target.kind(),
                     "doorbell destination is gone; marked dead"
@@ -954,7 +1117,10 @@ async fn worker(
                 http_status,
             } => {
                 attempt += 1;
-                set_status(&shared, &ring.key, "failing", now);
+                // The retry of this delivery spends no new token.
+                have_token = true;
+                shared.stats.failed.fetch_add(1, Ordering::Relaxed);
+                set_status(shared, &ring.key, "failing", now);
                 shared
                     .failures
                     .write()
@@ -970,7 +1136,7 @@ async fn worker(
                     );
                 tracing::debug!(attempt, kind = ring.config.target.kind(), reason = %reason, "doorbell delivery failed");
                 if attempt >= backoff.max_attempts {
-                    shared.stats.failed.fetch_add(1, Ordering::Relaxed);
+                    shared.stats.gave_up.fetch_add(1, Ordering::Relaxed);
                     return;
                 }
                 let jitter = rand::rng().random_range(0..=delay.as_millis() as u64 / 2);
@@ -978,7 +1144,7 @@ async fn worker(
                 if let Some(a) = after {
                     wait = wait.max(a.min(Duration::from_secs(600)));
                 }
-                if !pause(&mut slot_rx, wait).await {
+                if !pause(slot_rx, wait).await {
                     return;
                 }
                 if slot_rx.has_changed().unwrap_or(false) {
@@ -1166,6 +1332,72 @@ pub fn now_unix() -> u64 {
 mod tests {
     use super::*;
 
+    fn payload(event: &str, turn: &str) -> DoorbellPayload {
+        DoorbellPayload {
+            v: 1,
+            event: event.into(),
+            room: "r".into(),
+            thread: Some("adhoc-1".into()),
+            turn: turn.into(),
+            ts: 1,
+            events: vec![event.into()],
+        }
+    }
+
+    #[test]
+    fn a_merge_keeps_the_message_and_every_event() {
+        let m = payload("message", "yours");
+        let mut done = payload("thread_done", "none");
+        done.thread = None;
+        let merged = m.merged_with(done);
+        assert_eq!(merged.event, "message");
+        assert_eq!(merged.turn, "yours");
+        assert_eq!(merged.thread.as_deref(), Some("adhoc-1"));
+        assert_eq!(merged.events, ["message", "thread_done"]);
+        // A later message takes the headline with its own turn.
+        let again = merged.merged_with(payload("message", "theirs"));
+        assert_eq!(
+            (again.event.as_str(), again.turn.as_str()),
+            ("message", "theirs")
+        );
+        assert_eq!(again.events, ["message", "thread_done"]);
+        // No message: the newest event leads.
+        let t = payload("turn", "yours").merged_with(payload("thread_done", "none"));
+        assert_eq!((t.event.as_str(), t.turn.as_str()), ("thread_done", "none"));
+        assert_eq!(t.events, ["turn", "thread_done"]);
+    }
+
+    #[test]
+    fn the_ring_budget_refills_and_never_says_never() {
+        let shared = Shared {
+            stats: DoorbellStats::default(),
+            dead: Default::default(),
+            defaults: Default::default(),
+            failures: Default::default(),
+            generations: Default::default(),
+            budget: Default::default(),
+            opts: DoorbellOptions {
+                per_member_per_hour: 2,
+                ..DoorbellOptions::default()
+            },
+        };
+        let key = ("r".to_string(), "m1".to_string());
+        let t0 = Instant::now();
+        assert!(shared.take_token(&key, t0).is_ok());
+        assert!(shared.take_token(&key, t0).is_ok());
+        let wait = shared.take_token(&key, t0).unwrap_err();
+        assert!(
+            wait <= Duration::from_secs(1800) && wait > Duration::from_secs(1700),
+            "{wait:?}"
+        );
+        // Another member has their own budget.
+        assert!(shared.take_token(&("r".into(), "m2".into()), t0).is_ok());
+        // Half an hour later one token is back.
+        assert!(shared
+            .take_token(&key, t0 + Duration::from_secs(1800))
+            .is_ok());
+    }
+
     #[test]
     fn signature_round_trip() {
         let body = br#"{"v":1,"event":"turn","room":"r","turn":"yours","ts":1}"#;
@@ -1201,11 +1433,15 @@ mod tests {
             thread: Some("t".into()),
             turn: "yours".into(),
             ts: 10,
+            events: vec!["turn".into()],
         };
         let v: serde_json::Value = serde_json::to_value(&p).unwrap();
         let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
         keys.sort_unstable();
-        assert_eq!(keys, ["event", "room", "thread", "ts", "turn", "v"]);
+        assert_eq!(
+            keys,
+            ["event", "events", "room", "thread", "ts", "turn", "v"]
+        );
         // A ring names no seq and no count: it cannot be matched to a message.
         let old = r#"{"v":1,"event":"message","room":"r","seq":9,"turn":"none","ts":1}"#;
         let back: DoorbellPayload = serde_json::from_str(old).unwrap();

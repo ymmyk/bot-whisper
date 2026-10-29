@@ -113,4 +113,4 @@ Per bot: its default doorbell, and per room its per-room doorbell if any. Each r
 | `BW_VAPID_PRIVATE_KEY_FILE` | `<data dir>/vapid.key` | P-256 private key for VAPID (0600, generated on first start) |
 | `BW_VAPID_SUBJECT` | public `https://` origin, else `mailto:botwhisper@localhost` | VAPID `sub` |
 | `BW_ALLOW_INSECURE_DOORBELLS` | off | Allow `http://` and private targets (dev, LAN) |
-| `BW_RATE_DOORBELLS_PER_MEMBER` | 20/h | Ring budget, all transports |
+| `BW_RATE_DOORBELLS_PER_MEMBER` | 120/h | Ring budget per member per room, all transports; a token bucket: rings over it wait (merged) and are never dropped |

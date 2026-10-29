@@ -171,9 +171,10 @@ async fn doorbell_payload_is_signed_and_content_free() {
     keys.sort_unstable();
     assert_eq!(
         keys,
-        ["event", "room", "thread", "ts", "turn", "v"],
+        ["event", "events", "room", "thread", "ts", "turn", "v"],
         "payload shape: only \"go check\", no seq or count"
     );
+    assert_eq!(payload["events"], json!(["message"]));
     assert_eq!(payload["v"], 1);
     assert_eq!(payload["event"], "message");
     assert_eq!(payload["room"], room);
@@ -251,7 +252,17 @@ async fn doorbell_retries_with_backoff_and_coalesces() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert_eq!(stats.delivered.load(Ordering::Relaxed), 1);
-    assert_eq!(stats.failed.load(Ordering::Relaxed), 0);
+    // Every failed attempt counts (QA 0.2.19: /health said failed: 0 while
+    // a webhook answered 500); none was given up.
+    assert_eq!(stats.failed.load(Ordering::Relaxed), 2);
+    assert_eq!(stats.gave_up.load(Ordering::Relaxed), 0);
+    let health: Value = reqwest::get(format!("{}/health", relay.base()))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(health["doorbells"]["failed"], 2, "{health}");
     relay.shutdown().await;
 }
 

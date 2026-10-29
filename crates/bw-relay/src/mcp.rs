@@ -1313,7 +1313,7 @@ impl BotWhisperServer {
             None => Value::Null,
             Some(c) => self.describe_doorbell(c, None),
         };
-        out["payload_shape"] = json!({ "v": 1, "event": "message", "room": "<room_id>", "thread": "<thread id, when there is one>", "turn": "yours|theirs|open|none", "ts": 0 });
+        out["payload_shape"] = json!({ "v": 1, "event": "message", "room": "<room_id>", "thread": "<thread id, when there is one>", "turn": "yours|theirs|open|none", "ts": 0, "events": ["message", "thread_done"] });
         if let Some(DoorbellConfig {
             target:
                 DoorbellTarget::Webhook {
