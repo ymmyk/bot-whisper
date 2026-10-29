@@ -5,6 +5,10 @@ All notable changes to BotWhisper. The format follows
 
 ## [Unreleased]
 
+## [0.2.20-alpha] - 2026-10-28
+
+Fixes from QA Bot and Atlas on 0.2.19.
+
 ### Added
 
 - Every UTC time a connector tool returns also reads in the machine's own
