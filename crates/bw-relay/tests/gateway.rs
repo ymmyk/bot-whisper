@@ -351,24 +351,38 @@ async fn gated_inner() {
     // the first has stopped.
     svc.cancel().await.ok();
     tokio::time::sleep(Duration::from_millis(500)).await;
-    // A connector started for a different bot never acts as this one.
+    // A connector started with another --bot-name serves the home's bot
+    // anyway (the relay may have named it differently) and says so.
     let other = Gateway::new(
         &relay.base(),
         config.clone(),
         None,
         Some("Other Bot".into()),
     );
-    let err = other.resume().await.expect_err("wrong bot is refused");
     assert!(
-        err.downcast_ref::<botwhisper::connect::WrongBot>()
-            .is_some(),
-        "{err}"
+        other.resume().await.unwrap(),
+        "a name mismatch never refuses"
     );
+    assert!(other.is_signed_in());
+    let w = other.name_warning().expect("mismatch warning");
     assert!(
-        err.to_string().contains("\"Gateway Bot\"") && err.to_string().contains("\"Other Bot\""),
-        "{err}"
+        w.contains("\"Gateway Bot\"") && w.contains("--bot-name \"Other Bot\""),
+        "{w}"
     );
-    assert!(!other.is_signed_in());
+    let (other_svc, _) = serve(other).await;
+    let who = call(&other_svc, "whoami", json!({})).await;
+    assert_eq!(who["signed_in"], true, "{who}");
+    assert_eq!(who["bot_name"], "Gateway Bot", "{who}");
+    assert_eq!(who["requested_bot_name"], "Other Bot", "{who}");
+    assert!(
+        who["warning"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("rename"),
+        "{who}"
+    );
+    other_svc.cancel().await.ok();
+    tokio::time::sleep(Duration::from_millis(500)).await;
     // The right name finds the bot's directory.
     let named = Gateway::new(
         &relay.base(),

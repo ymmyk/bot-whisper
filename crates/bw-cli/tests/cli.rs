@@ -387,16 +387,18 @@ fn a_busy_bot_refuses_to_start() {
     let _ = std::fs::remove_dir_all(&h);
 }
 
-/// A home that belongs to another bot: `connect --bot-name` for a different
-/// name exits 4 before serving (nothing listens at NOWHERE), with one plain
-/// line and no login suggestion.
+/// A home whose bot has another name than `--bot-name` (the relay named it
+/// "Atlas 2" because "Atlas" was taken) still starts and serves the home's
+/// bot, with one warning line that explains the fix. 0.2.18 exited 4 here,
+/// which took a working bot offline on upgrade. Closing stdin (the host
+/// going away) ends the process promptly.
 #[test]
-fn a_wrong_bot_name_refuses_to_start() {
+fn a_different_bot_name_starts_with_a_warning() {
     let h = home("wrongbot");
     let s = fake_bot(&h, "atlas");
-    s.save_bot_name("Atlas").unwrap();
+    s.save_bot_name("Atlas 2").unwrap();
     let mut child = Command::new(BIN)
-        .args(["connect", "--relay", NOWHERE, "--bot-name", "QA Test 2"])
+        .args(["connect", "--relay", NOWHERE, "--bot-name", "Atlas"])
         .env("BOTWHISPER_HOME", &h)
         .env_remove("BOTWHISPER_RELAY")
         .env_remove("BOTWHISPER_BOT")
@@ -407,31 +409,39 @@ fn a_wrong_bot_name_refuses_to_start() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
+    // Still running a few seconds later (it did not refuse to start).
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "connect exited for a bot-name mismatch"
+    );
+    drop(child.stdin.take());
     let start = std::time::Instant::now();
     let status = loop {
         if let Some(st) = child.try_wait().unwrap() {
             break st;
         }
         assert!(
-            start.elapsed().as_secs() < 20,
-            "connect kept running for the wrong bot"
+            start.elapsed().as_secs() < 10,
+            "connect kept running after stdin closed"
         );
         std::thread::sleep(std::time::Duration::from_millis(100));
     };
     let mut err = String::new();
     std::io::Read::read_to_string(child.stderr.as_mut().unwrap(), &mut err).unwrap();
-    let mut out = String::new();
-    std::io::Read::read_to_string(child.stdout.as_mut().unwrap(), &mut out).unwrap();
-    assert_eq!(status.code(), Some(4), "{err}");
+    // Closed before `initialize`, so it may end with an error, but never
+    // with the old "wrong bot" exit 4.
+    assert_ne!(status.code(), Some(4), "{err}");
+    assert!(!err.contains("not starting"), "{err}");
     assert!(
         err.contains(
-            "this home belongs to bot \"Atlas\"; you asked for \"QA Test 2\". Use --home DIR for a separate bot."
+            "this home's bot is \"Atlas 2\", but the connector was started with --bot-name \"Atlas\"; serving as \"Atlas 2\"."
         ),
         "{err}"
     );
     assert!(
-        !err.contains("login") && out.is_empty(),
-        "no signed-out server, no login hint: {err}{out}"
+        err.contains("--bot-name \"Atlas 2\"") && err.contains("/account"),
+        "the fix is named: {err}"
     );
     let _ = std::fs::remove_dir_all(&h);
 }

@@ -278,6 +278,8 @@ struct Inner {
     /// tool call both seeing an expired link) would find this very
     /// process holding the bot's home lock and report CONNECTOR_BUSY.
     resume_gate: Mutex<()>,
+    /// `--bot-name` differs from the home's bot: the warning (never fatal).
+    name_warning: StdMutex<Option<String>>,
 }
 
 /// The stdio MCP server of `botwhisper connect`. Cheap to clone.
@@ -596,6 +598,7 @@ impl Gateway {
                 upgrade: StdMutex::new(Arc::new(UpgradeWatch::for_current_exe())),
                 stopped: std::sync::atomic::AtomicBool::new(false),
                 resume_gate: Mutex::new(()),
+                name_warning: StdMutex::new(None),
             }),
         }
     }
@@ -629,6 +632,12 @@ impl Gateway {
             }
             other => other,
         }
+    }
+
+    /// The `--bot-name` mismatch warning, if the home's bot has another
+    /// name (the connector serves the home's bot anyway).
+    pub fn name_warning(&self) -> Option<String> {
+        self.inner.name_warning.lock().expect("lock").clone()
     }
 
     pub fn is_signed_in(&self) -> bool {
@@ -727,21 +736,27 @@ impl Gateway {
         if std::fs::metadata(store.dir.join("home.json")).is_err() {
             let _ = store.record_home();
         }
-        // A saved name that differs: refuse before the relay is called.
-        if let (Some(want), Some(have)) = (expect, store.load_bot_name()) {
-            if want.trim() != have.trim() {
-                let e = super::server::WrongBot {
+        // A saved name that differs from --bot-name: warn, never refuse
+        // (the home's bot is the bot; the relay may have named it "Atlas 2"
+        // because "Atlas" was taken). Said now, before the relay answers,
+        // so it shows up even when the relay cannot be reached.
+        *i.name_warning.lock().expect("lock") = match (expect, store.load_bot_name()) {
+            (Some(want), Some(have)) if want.trim() != have.trim() => {
+                let w = super::server::WrongBot {
                     home: i.config.display().to_string(),
                     home_bot: have,
                     wanted: want.to_string(),
                 };
-                *i.resume_note.lock().expect("lock") = Some(e.to_string());
-                return Err(e.into());
+                tracing::warn!("botwhisper connect: warning: {w}");
+                Some(w.to_string())
             }
-        }
+            _ => None,
+        };
         let client = RelayClient::new(&i.relay, tokens, Some(store.clone()));
         match Connector::new_for(client, Some(store), Some(&i.config), expect).await {
             Ok(c) => {
+                // The relay's name is the authority (bot.json may be older).
+                *i.name_warning.lock().expect("lock") = c.name_mismatch().map(ToString::to_string);
                 *i.connector.write().expect("lock") = Some(c);
                 // Signed in: an earlier expired link is history.
                 let _ = std::fs::remove_file(expired_link_path(&i.config, &i.relay));
@@ -757,8 +772,6 @@ impl Gateway {
                     // Not a sign-in problem: say only who is in the way.
                     *i.busy.lock().expect("lock") = Some(held.to_string());
                     *i.resume_note.lock().expect("lock") = None;
-                } else if let Some(w) = e.downcast_ref::<super::server::WrongBot>() {
-                    *i.resume_note.lock().expect("lock") = Some(w.to_string());
                 } else if let Some(so) = super::relay::signed_out(&e) {
                     *i.resume_note.lock().expect("lock") = None;
                     *i.signed_out.lock().expect("lock") = Some(so.0.clone());
@@ -1339,12 +1352,17 @@ impl Gateway {
         if let Some(c) = self.connector() {
             match c.whoami().await {
                 Ok(who) => {
-                    return respond(Ok(json!({
+                    let mut v = json!({
                         "signed_in": true,
                         "relay": relay,
                         "bot_name": who["bot_name"],
                         "agent_id": who["agent_id"],
-                    })))
+                    });
+                    if let Some(w) = self.name_warning() {
+                        v["requested_bot_name"] = json!(self.inner.bot_name);
+                        v["warning"] = json!(w);
+                    }
+                    return respond(Ok(v));
                 }
                 // Refused (revoked, retired): signed out now, said below.
                 Err(e) if super::relay::signed_out(&e).is_some() => {
@@ -1394,6 +1412,9 @@ impl Gateway {
         }
         if let Some(at) = expired {
             merge(&mut v, expired_fields(at));
+        }
+        if let Some(w) = self.name_warning() {
+            v["warning"] = json!(w);
         }
         respond(Ok(v))
     }

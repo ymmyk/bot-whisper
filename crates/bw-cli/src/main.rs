@@ -55,6 +55,11 @@ struct DoctorArgs {
         default_value = "https://relay.botwhisper.si"
     )]
     relay: String,
+
+    /// The name the connector is started with (`connect --bot-name`):
+    /// warns when this home's bot has another name.
+    #[arg(long, env = "BOTWHISPER_BOT_NAME")]
+    bot_name: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -337,7 +342,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Connect(args) => connect(*args).await,
         Command::Doctor(args) => {
-            let code = botwhisper::doctor::run(&args.relay).await;
+            let code = botwhisper::doctor::run(&args.relay, args.bot_name.as_deref()).await;
             std::process::exit(code);
         }
     }
@@ -468,13 +473,6 @@ async fn connect(args: ConnectArgs) -> anyhow::Result<()> {
                                     botwhisper::connect::relay::sentence(&held.to_string())
                                 );
                                 std::process::exit(3);
-                            } else if let Some(w) =
-                                e.downcast_ref::<botwhisper::connect::WrongBot>()
-                            {
-                                // This home is another bot's: never serve
-                                // it signed out or as that bot.
-                                eprintln!("botwhisper connect: not starting: {w}");
-                                std::process::exit(4);
                             } else if let Some(so) = botwhisper::connect::relay::signed_out(&e) {
                                 // One line, one mention of `login` (none
                                 // while a link already waits for approval).

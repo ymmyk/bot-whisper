@@ -140,13 +140,39 @@ pub fn signed_in_line(config: &std::path::Path, relay: &str) -> String {
     }
 }
 
+/// A warning when `--bot-name` (`BOTWHISPER_BOT_NAME`) is not the name of
+/// the bot the connector would serve from this home (the connector starts
+/// anyway, as the home's bot). `None` when they match or nothing is known.
+pub fn bot_name_line(
+    config: &std::path::Path,
+    relay: &str,
+    wanted: Option<&str>,
+) -> Option<String> {
+    use crate::connect::store::BotStore;
+    let want = wanted.map(str::trim).filter(|w| !w.is_empty())?;
+    if BotStore::find_by_name(config, relay, want).is_some() {
+        return None;
+    }
+    let have = BotStore::current(config, relay)?.load_bot_name()?;
+    let w = crate::connect::WrongBot {
+        home: config.display().to_string(),
+        home_bot: have,
+        wanted: want.to_string(),
+    };
+    Some(format!("WARN bot name: {w}"))
+}
+
 /// The CLI entry point. Returns the exit code.
-pub async fn run(relay: &str) -> i32 {
+pub async fn run(relay: &str, bot_name: Option<&str>) -> i32 {
     let r = check(relay, &tls::CaSources::from_env()).await;
     for l in &r.lines {
         println!("{l}");
     }
-    println!("{}", signed_in_line(&crate::paths::config_dir(), relay));
+    let config = crate::paths::config_dir();
+    println!("{}", signed_in_line(&config, relay));
+    if let Some(l) = bot_name_line(&config, relay, bot_name) {
+        println!("{l}");
+    }
     if r.ok {
         println!("all checks passed");
         0
@@ -162,5 +188,32 @@ mod tests {
         let d = std::env::temp_dir().join(format!("bw-doc-{}", std::process::id()));
         let line = super::signed_in_line(&d, "https://relay.example");
         assert!(line.contains("not signed in"), "{line}");
+    }
+
+    /// A relay-assigned name ("Atlas 2") that differs from --bot-name
+    /// ("Atlas") is a warning with the fix, not a failure.
+    #[test]
+    fn doctor_warns_when_bot_name_differs() {
+        use crate::connect::store::BotStore;
+        let d = std::env::temp_dir().join(format!("bw-doc-name-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let relay = "https://relay.example";
+        let s = BotStore::new(&d, relay, "bot_atlas");
+        std::fs::create_dir_all(&s.dir).unwrap();
+        s.save_bot_name("Atlas 2").unwrap();
+        s.set_current().unwrap();
+        let l = super::bot_name_line(&d, relay, Some("Atlas")).expect("warning");
+        assert!(l.starts_with("WARN bot name: "), "{l}");
+        assert!(
+            l.contains("\"Atlas 2\"") && l.contains("--bot-name \"Atlas\""),
+            "{l}"
+        );
+        assert!(
+            l.contains("--bot-name \"Atlas 2\"") && l.contains("rename"),
+            "{l}"
+        );
+        assert_eq!(super::bot_name_line(&d, relay, Some("Atlas 2")), None);
+        assert_eq!(super::bot_name_line(&d, relay, None), None);
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

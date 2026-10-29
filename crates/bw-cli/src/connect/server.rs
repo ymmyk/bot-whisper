@@ -248,6 +248,8 @@ pub struct Connector {
     agent_id: String,
     /// Held while this process serves the bot (see `lock.rs`).
     _lock: Option<Arc<ConfigLock>>,
+    /// Set when `--bot-name` differs from the signed-in bot's name.
+    name_mismatch: Option<WrongBot>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -647,9 +649,11 @@ struct Inner {
     file: Option<FileRef>,
 }
 
-/// This home's saved sign-in belongs to a different bot than the one the
-/// connector was started for (`--bot-name`).
-#[derive(Debug)]
+/// This home's saved sign-in belongs to a bot whose name differs from the
+/// `--bot-name` the connector was started with (for example the relay
+/// named it "Atlas 2" because "Atlas" was taken). Not fatal: the connector
+/// serves the home's bot and says so (stderr, `whoami`, `doctor`).
+#[derive(Debug, Clone)]
 pub struct WrongBot {
     pub home: String,
     pub home_bot: String,
@@ -660,8 +664,9 @@ impl std::fmt::Display for WrongBot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "this home belongs to bot \"{}\"; you asked for \"{}\". Use --home DIR for a separate bot.",
-            self.home_bot, self.wanted
+            "this home's bot is \"{h}\", but the connector was started with --bot-name \"{w}\"; serving as \"{h}\". To match, start it with --bot-name \"{h}\" (or BOTWHISPER_BOT_NAME), or rename the bot to \"{w}\" on /account if that name is free (rename_seat only changes how one room shows you). For a separate bot, use --home DIR.",
+            h = self.home_bot,
+            w = self.wanted
         )
     }
 }
@@ -679,8 +684,11 @@ impl Connector {
         Self::new_for(relay, store, config_dir_identity, None).await
     }
 
-    /// Like [`Connector::new`], refusing ([`WrongBot`]) when the home's bot
-    /// is not `expect_bot` (the `--bot-name` the app started us with).
+    /// Like [`Connector::new`], noting ([`Connector::name_mismatch`], a
+    /// warning on stderr) when the home's bot is not named `expect_bot`
+    /// (the `--bot-name` the app started us with). Never refuses for that:
+    /// the home's bot is the bot (0.2.18 refused, which took a working bot
+    /// whose relay-assigned name differed from its `--bot-name` offline).
     pub async fn new_for(
         relay: RelayClient,
         store: Option<BotStore>,
@@ -724,21 +732,23 @@ impl Connector {
             .as_str()
             .filter(|n| !n.trim().is_empty())
             .map(str::to_string);
-        if let (Some(want), Some(have)) = (expect_bot, bot_name.as_deref()) {
-            if want.trim() != have.trim() {
+        let name_mismatch = match (expect_bot, bot_name.as_deref()) {
+            (Some(want), Some(have)) if want.trim() != have.trim() => {
                 let home = store
                     .as_ref()
                     .and_then(|s| s.dir.parent().and_then(|p| p.parent()))
                     .map(|p| p.display().to_string())
                     .unwrap_or_default();
-                return Err(WrongBot {
+                let w = WrongBot {
                     home,
                     home_bot: have.to_string(),
                     wanted: want.to_string(),
-                }
-                .into());
+                };
+                tracing::warn!("botwhisper connect: warning: {w}");
+                Some(w)
             }
-        }
+            _ => None,
+        };
         if let (Some(s), Some(n)) = (&store, bot_name.as_deref()) {
             let _ = s.save_bot_name(n);
         }
@@ -770,6 +780,7 @@ impl Connector {
             trust: Arc::new(Mutex::new(trust)),
             agent_id,
             _lock: lock,
+            name_mismatch,
         };
         // Reload the rooms this bot was in before the restart.
         {
@@ -790,6 +801,11 @@ impl Connector {
 
     pub fn agent_id(&self) -> &str {
         &self.agent_id
+    }
+
+    /// The `--bot-name` mismatch this connector started with, if any.
+    pub fn name_mismatch(&self) -> Option<&WrongBot> {
+        self.name_mismatch.as_ref()
     }
 
     /// Give up this bot's home lock now (the connector is being dropped
