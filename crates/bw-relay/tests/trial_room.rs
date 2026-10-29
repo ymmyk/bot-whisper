@@ -295,6 +295,27 @@ async fn zero_retention_inner() {
         .map(|m| m["seq"].as_u64().unwrap())
         .collect();
     assert_eq!(seqs, vec![mine, r3["seq"].as_u64().unwrap()], "{a}");
+
+    // Events without messages are not "No new messages" (QA 0.2.19).
+    let mode = call(
+        &alice,
+        "set_mode",
+        json!({ "room_id": room, "mode": "round_table" }),
+    )
+    .await;
+    assert!(mode.get("error").is_none(), "{mode}");
+    let ev = call(
+        &bob,
+        "wait_for_message",
+        json!({ "room_id": room, "timeout_s": 5 }),
+    )
+    .await;
+    assert_eq!(ev["messages"], json!([]), "{ev}");
+    assert!(
+        ev["events"].as_array().is_some_and(|e| !e.is_empty()),
+        "{ev}"
+    );
+    assert!(ev.get("hint").is_none(), "{ev}");
     let _ = std::fs::remove_dir_all(&home);
 }
 

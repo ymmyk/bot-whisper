@@ -3,8 +3,8 @@
 //! person can believe they run the new botwhisper while still on the old one.
 //!
 //! The check is a `stat` of the executable path at most every few seconds.
-//! When its modification time differs from the one recorded at start, the
-//! new binary is asked for its `--version` (once) and every tool result then
+//! When its modification time (or, on Unix, its inode) differs from the one
+//! recorded at start, the new binary is asked for its `--version` (once) and every tool result then
 //! carries one line: "botwhisper was upgraded; restart your AI app to use vX".
 
 use std::{
@@ -26,7 +26,7 @@ struct State {
 
 pub struct UpgradeWatch {
     exe: Option<PathBuf>,
-    started_mtime: Option<SystemTime>,
+    started_mtime: Option<Stamp>,
     running: String,
     state: Mutex<State>,
 }
@@ -40,8 +40,28 @@ fn clean(p: PathBuf) -> PathBuf {
     }
 }
 
-fn mtime(p: &Path) -> Option<SystemTime> {
-    std::fs::metadata(p).and_then(|m| m.modified()).ok()
+/// What identifies the file at `p`: its modification time and, on Unix,
+/// its inode, so an installer that keeps the archive's mtime is still seen
+/// replacing the file.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Stamp {
+    modified: SystemTime,
+    inode: Option<(u64, u64)>,
+}
+
+fn mtime(p: &Path) -> Option<Stamp> {
+    let m = std::fs::metadata(p).ok()?;
+    #[cfg(unix)]
+    let inode = {
+        use std::os::unix::fs::MetadataExt;
+        Some((m.dev(), m.ino()))
+    };
+    #[cfg(not(unix))]
+    let inode = None;
+    Some(Stamp {
+        modified: m.modified().ok()?,
+        inode,
+    })
 }
 
 /// `botwhisper 0.2.5-alpha` -> `0.2.5-alpha`.
@@ -209,6 +229,34 @@ mod tests {
             .set_modified(SystemTime::now() + Duration::from_secs(60))
             .unwrap();
         assert_eq!(w.warning(), None);
+    }
+
+    #[test]
+    fn a_replacement_that_keeps_the_old_mtime_is_still_seen() {
+        let dir = tmp("t4");
+        let exe = dir.join("botwhisper");
+        script(&exe, "0.2.18-alpha");
+        let when = SystemTime::now() - Duration::from_secs(3600);
+        let stamp = |p: &Path| {
+            std::fs::File::options()
+                .write(true)
+                .open(p)
+                .unwrap()
+                .set_modified(when)
+                .unwrap()
+        };
+        stamp(&exe);
+        let w = UpgradeWatch::for_path(Some(exe.clone()), "0.2.18-alpha");
+        // An installer renames a new file over it, keeping the archive's
+        // modification time: a new inode, the same mtime.
+        let new = dir.join("botwhisper.new");
+        script(&new, "0.2.19-alpha");
+        stamp(&new);
+        std::fs::rename(&new, &exe).unwrap();
+        assert_eq!(
+            w.warning().as_deref(),
+            Some("botwhisper was upgraded; restart your AI app to use v0.2.19-alpha")
+        );
     }
 
     #[test]

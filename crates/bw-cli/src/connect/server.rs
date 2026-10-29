@@ -503,10 +503,16 @@ pub(crate) fn respond(result: anyhow::Result<Value>) -> Result<CallToolResult, E
         Ok(mut v) => {
             // Times the connector adds itself get their `_utc` too.
             bw_proto::time::add_utc_siblings(&mut v);
+            // ...and every UTC time its local one (QA 0.2.19).
+            super::gateway::add_local_times(&mut v);
             CallToolResult::structured(v)
         }
         Err(e) => match e.downcast_ref::<super::relay::ToolError>() {
-            Some(t) => CallToolResult::structured_error(t.0.clone()),
+            Some(t) => {
+                let mut v = t.0.clone();
+                super::gateway::add_local_times(&mut v);
+                CallToolResult::structured_error(v)
+            }
             // Signed out (401/403, a refused refresh) is never "unreachable".
             None if super::relay::signed_out(&e).is_some() => {
                 super::gateway::signed_out_result(super::relay::signed_out(&e).map(|s| s.0.clone()))
@@ -1916,7 +1922,7 @@ impl Connector {
 
     #[tool(
         name = "join_room",
-        description = "Redeem an invite URL (pass it whole, with its #f= part), publish a key package and wait (up to 50 s) for a member's connector to add you to the encrypted group. `name` is YOUR OWN display name in the room (how others see you; default: your signed-in bot name), not the room's name; change it later with rename_seat. The result has `max_members` and `room_expires_at` / `room_expires_at_utc` (null if the room never expires). If the link needs approval you get `state: awaiting_approval` (\"waiting for a member to let you in\") with `request_expires_at_utc` (the request stays open until the invite expires or the room closes); call wait_for_message or join_room again before then. If nobody is online you stay pending: call wait_for_message later."
+        description = "Redeem an invite URL (pass it whole, with its #f= part), publish a key package and wait (up to 50 s) for a member's connector to add you to the encrypted group. `name` is YOUR OWN display name in the room (how others see you; default: your signed-in bot name), not the room's name; change it later with rename_seat. The result has `max_members` and `room_expires_at` / `room_expires_at_utc` / `room_expires_at_local` (null if the room never expires). If the link needs approval you get `state: awaiting_approval` (\"waiting for a member to let you in\") at once with `request_expires_at_utc` (the request stays open until the invite expires or the room closes); call wait_for_message or join_room again before then. If nobody is online you stay pending: call wait_for_message later."
     )]
     async fn join_room(
         &self,
@@ -1928,11 +1934,8 @@ impl Connector {
                 self.top_up_key_packages(false).await?;
                 let deadline = Instant::now() + Duration::from_secs(50);
                 let mut joined = self.relay_join(&invite_url, a.name.as_deref()).await?;
-                // Waiting for approval: ask again every few seconds.
-                while joined["state"] == "awaiting_approval" && Instant::now() < deadline {
-                    tokio::time::sleep(Duration::from_secs(4)).await;
-                    joined = self.relay_join(&invite_url, a.name.as_deref()).await?;
-                }
+                // Waiting for approval: say so right away (QA 0.2.19 waited
+                // ~54 s here); wait_for_message or join_room completes it.
                 let room_id = joined["room_id"].as_str().unwrap_or_default().to_string();
                 if joined["state"] == "awaiting_approval" {
                     self.state.lock().await.awaiting.insert(
@@ -2289,7 +2292,9 @@ impl Connector {
                     json!({ "rooms": out })
                 };
                 v["timed_out"] = json!(!any);
-                if no_messages {
+                // Only when nothing at all came back: events (member_joined,
+                // room_closed, ...) are not "no new messages" (QA 0.2.19).
+                if no_messages && !any && added_all.is_empty() {
                     v["hint"] = json!(NO_MESSAGES_HINT);
                 }
                 if !added_all.is_empty() {
@@ -2432,7 +2437,7 @@ impl Connector {
 
     #[tool(
         name = "list_rooms",
-        description = "Rooms this bot belongs to, with your member id. Each room has `room_expires_at` / `room_expires_at_utc` (when the room itself closes, null if never) and `oldest_pending_message_expires_at` / `_utc` (when the oldest message waiting for you is deleted if you do not fetch it; null when none waits). A seat not yet added to the encrypted group also has `seat_expires_at` / `_utc` (it lasts as long as the room). A request still waiting for approval is listed with `state: awaiting_approval` and `request_expires_at` / `request_expires_at_utc`, the same fields join_room returns; `message_retention` says how long the relay holds undelivered messages."
+        description = "Rooms this bot belongs to, with your member id. Every `*_utc` time also has a `*_local` one (this machine's time zone). Each room has `room_expires_at` / `room_expires_at_utc` / `_local` (when the room itself closes, null if never) and `oldest_pending_message_expires_at` / `_utc` / `_local` (when the oldest message waiting for you is deleted if you do not fetch it; null when none waits). A seat not yet added to the encrypted group also has `seat_expires_at` / `_utc` / `_local` (it lasts as long as the room). A request still waiting for approval is listed with `state: awaiting_approval` and `request_expires_at` / `request_expires_at_utc`, the same fields join_room returns; `message_retention` says how long the relay holds undelivered messages."
     )]
     async fn list_rooms(&self) -> Result<CallToolResult, ErrorData> {
         respond_read(
@@ -3062,7 +3067,10 @@ mod invite_link_tests {
         assert_eq!(v["error"], "SIGNED_OUT");
         let m = v["message"].as_str().unwrap();
         assert!(m.starts_with("SIGNED_OUT: the relay no longer accepts this bot's sign-in"));
-        assert!(m.contains("returns a link and a short code"), "{m}");
+        // The step is next_step's alone (QA 0.2.19: no repetition).
+        assert!(m.ends_with("See next_step."), "{m}");
+        let step = v["next_step"].as_str().unwrap();
+        assert!(step.contains("returns a link and a short code"), "{step}");
         assert!(
             !m.to_lowercase().contains("email"),
             "link-based sign-in, no emailed code: {m}"
@@ -3099,8 +3107,9 @@ mod invite_link_tests {
             m.starts_with("SIGNED_OUT: BotWhisper updated how bots are identified; this bot needs to sign in once more. Its old rooms will need a new invite."),
             "{m}"
         );
-        assert!(m.contains("Call `login` (force=true)"), "{m}");
-        assert_eq!(m.matches("login").count(), 1, "{m}");
+        assert!(!m.contains("login"), "{m}");
+        let step = v["next_step"].as_str().unwrap();
+        assert!(step.contains("Call `login` (force=true)"), "{step}");
         let r = v["reason"].as_str().unwrap();
         assert!(
             r.starts_with("BOT_RETIRED: ") && !r.contains("BotWhisper updated"),

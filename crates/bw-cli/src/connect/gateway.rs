@@ -180,6 +180,135 @@ impl Pending {
 }
 
 /// `secs` in this machine's time zone, e.g. "2026-10-28 13:57 (UTC-05:00)".
+/// Unix seconds of an `iso_utc` time (`2026-10-27T14:35:33Z`), if `s` is
+/// exactly one.
+fn parse_iso_utc(s: &str) -> Option<u64> {
+    let b = s.as_bytes();
+    let shape = b.len() == 20
+        && b[4] == b'-'
+        && b[7] == b'-'
+        && b[10] == b'T'
+        && b[13] == b':'
+        && b[16] == b':'
+        && b[19] == b'Z';
+    let digits = [0..4, 5..7, 8..10, 11..13, 14..16, 17..19];
+    if !shape
+        || !digits
+            .iter()
+            .all(|r| b[r.clone()].iter().all(u8::is_ascii_digit))
+    {
+        return None;
+    }
+    let n = |r: std::ops::Range<usize>| s[r].parse::<u32>().ok();
+    let t = chrono::NaiveDate::from_ymd_opt(n(0..4)? as i32, n(5..7)?, n(8..10)?)?
+        .and_hms_opt(n(11..13)?, n(14..16)?, n(17..19)?)?
+        .and_utc()
+        .timestamp();
+    u64::try_from(t).ok()
+}
+
+/// Prose the relay writes with UTC times in it (a summary, a note, an
+/// error message): never a peer's message text.
+const PROSE_KEYS: &[&str] = &[
+    "summary",
+    "note",
+    "retention",
+    "message",
+    "hint",
+    "next_step",
+];
+
+/// `... at 2026-10-29T03:13:44Z ...` becomes `... at 2026-10-28 22:13
+/// (UTC-05:00) (2026-10-29T03:13:44Z) ...`; a time already in brackets
+/// (written next to its local time) is left alone.
+fn localize_prose(s: &str) -> Option<String> {
+    let mut out = String::with_capacity(s.len() + 32);
+    let mut changed = false;
+    let mut i = 0;
+    while i < s.len() {
+        let end = i + 20;
+        if s.is_char_boundary(i) && end <= s.len() && s.is_char_boundary(end) {
+            if let Some(secs) = parse_iso_utc(&s[i..end]) {
+                let bracketed = s[..i].ends_with('(') && s[end..].starts_with(')');
+                if bracketed {
+                    out.push_str(&s[i..end]);
+                } else {
+                    out.push_str(&format!("{} ({})", local_time(secs), &s[i..end]));
+                    changed = true;
+                }
+                i = end;
+                continue;
+            }
+        }
+        let ch = s[i..].chars().next().expect("in bounds");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    changed.then_some(out)
+}
+
+/// Every time an agent reads also in the user's own time zone: each
+/// `<name>_utc` gets a `<name>_local` sibling (unless it has one; `null`
+/// stays `null`), and UTC times inside relay prose (`summary`, `note`,
+/// `retention`, `message`, ...) get the local time in front.
+pub(crate) fn add_local_times(v: &mut Value) {
+    match v {
+        Value::Object(map) => {
+            let add: Vec<(String, Value)> = map
+                .iter()
+                .filter_map(|(k, val)| {
+                    let base = k.strip_suffix("_utc")?;
+                    let local = format!("{base}_local");
+                    if map.contains_key(&local) {
+                        return None;
+                    }
+                    match val {
+                        Value::String(s) => {
+                            parse_iso_utc(s).map(|t| (local, Value::String(local_time(t))))
+                        }
+                        Value::Null => Some((local, Value::Null)),
+                        _ => None,
+                    }
+                })
+                .collect();
+            for (k, val) in map.iter_mut() {
+                match val {
+                    Value::String(s) if PROSE_KEYS.contains(&k.as_str()) => {
+                        if let Some(l) = localize_prose(s) {
+                            *s = l;
+                        }
+                    }
+                    _ => add_local_times(val),
+                }
+            }
+            for (k, val) in add {
+                map.insert(k, val);
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(add_local_times),
+        _ => {}
+    }
+}
+
+/// `add_local_times` on a tool result: the structured content and the
+/// text copy of it, so both read the same.
+pub(crate) fn localize_result(r: &mut CallToolResult) {
+    let Some(v) = r.structured_content.as_mut() else {
+        return;
+    };
+    let before = v.to_string();
+    add_local_times(v);
+    let after = v.to_string();
+    if after == before {
+        return;
+    }
+    for c in r.content.iter_mut() {
+        if c.as_text().is_some_and(|t| t.text == before) {
+            *c = ContentBlock::text(after.clone());
+        }
+    }
+}
+
 pub(crate) fn local_time(secs: u64) -> String {
     use chrono::TimeZone;
     match chrono::Local.timestamp_opt(secs as i64, 0).single() {
@@ -320,9 +449,9 @@ pub const RETIRED_EXPLAIN: &str = "SIGNED_OUT: BotWhisper updated how bots are i
 /// The next step once no login link is live.
 pub const LOGIN_NEXT_STEP: &str = "Call `login` (force=true): it returns a link and a short code. Send both to your person, who opens the link, signs in and approves this bot; the room tools work again as soon as they do.";
 
-/// The one line a bot sees once the relay revoked its sign-in (and no
-/// login is waiting): explanation, then next step.
-pub const SIGNED_OUT_MESSAGE: &str = "SIGNED_OUT: the relay no longer accepts this bot's sign-in (revoked, the bot was deleted on /account, or it expired). Call `login` (force=true): it returns a link and a short code. Send both to your person, who opens the link, signs in and approves this bot; the room tools work again as soon as they do.";
+/// The `message` a bot sees once the relay revoked its sign-in (and no
+/// login is waiting): the explanation; the step is only in `next_step`.
+pub const SIGNED_OUT_MESSAGE: &str = "SIGNED_OUT: the relay no longer accepts this bot's sign-in (revoked, the bot was deleted on /account, or it expired). See next_step.";
 
 /// The short cause for a retired bot (`reason`; the explanation is in
 /// `message`).
@@ -395,37 +524,6 @@ fn cause_not_in(cause: &str, message: &str) -> String {
     } else {
         kept.join(" ")
     }
-}
-
-/// Signed out and the last link expired: that first (with the next step),
-/// then the explanation.
-pub(crate) fn expired_signed_out_message(retired: bool, at: u64) -> String {
-    let explain = if retired {
-        RETIRED_EXPLAIN
-    } else {
-        SIGNED_OUT_EXPLAIN
-    };
-    let explain = explain.trim_start_matches("SIGNED_OUT: ");
-    let mut c = explain.chars();
-    let explain = match c.next() {
-        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
-        None => String::new(),
-    };
-    format!("SIGNED_OUT: {} {explain}", expired_message(at))
-}
-
-/// What to tell a signed-out bot: the explanation, then either "waiting
-/// for your person" (a live login link) or the login next step.
-pub(crate) fn signed_out_message(retired: bool, waiting: Option<&str>) -> String {
-    format!(
-        "{} {}",
-        if retired {
-            RETIRED_EXPLAIN
-        } else {
-            SIGNED_OUT_EXPLAIN
-        },
-        waiting.unwrap_or(LOGIN_NEXT_STEP)
-    )
 }
 
 /// The relay's refusal as a short cause (`reason`): no explanation and no
@@ -507,10 +605,23 @@ fn signed_out_view(reason: Option<&str>, pending: Option<&Pending>, expired: Opt
     let waiting = pending.map(Pending::waiting);
     // A live link wins; otherwise an expired one leads the message.
     let expired = expired.filter(|_| pending.is_none());
-    let message = match expired {
-        Some(at) => expired_signed_out_message(retired, at),
-        None => signed_out_message(retired, waiting.as_deref()),
-    };
+    // The explanation only: the step is `next_step`, never repeated here
+    // (QA 0.2.19: the message carried the whole next_step again).
+    let message = format!(
+        "{} {}",
+        if retired {
+            RETIRED_EXPLAIN
+        } else {
+            SIGNED_OUT_EXPLAIN
+        },
+        if waiting.is_some() {
+            "A sign-in link is waiting for your person; see next_step."
+        } else if expired.is_some() {
+            "The last sign-in link expired; see next_step."
+        } else {
+            "See next_step."
+        }
+    );
     let mut v = json!({ "error": "SIGNED_OUT", "message": message });
     // The next step on its own, apart from the cause (`reason`).
     v["next_step"] = json!(match (&waiting, expired) {
@@ -1564,7 +1675,10 @@ impl ServerHandler for Gateway {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
-        let response = self.call_tool_inner(request, context).await?;
+        let mut response = self.call_tool_inner(request, context).await?;
+        if let CallToolResponse::Complete(r) = &mut response {
+            localize_result(r);
+        }
         Ok(self.with_upgrade_notice(response).await)
     }
 
@@ -1716,12 +1830,9 @@ mod tests {
             assert_eq!(v["next_step"], LOGIN_NEXT_STEP, "{v}");
             let m = v["message"].as_str().unwrap();
             assert!(m.starts_with("SIGNED_OUT: "), "{m}");
-            assert_eq!(
-                m.matches("login").count(),
-                1,
-                "the next step names login once: {m}"
-            );
-            assert!(m.ends_with(LOGIN_NEXT_STEP), "explanation, then next step: {m}");
+            // The step is next_step's alone, never repeated (QA 0.2.19).
+            assert!(!m.contains("login"), "{m}");
+            assert!(m.ends_with("See next_step."), "{m}");
             assert!(!v.to_string().contains(".."), "{v}");
         }
         // The cause alone: no sign-in steps leak into `reason`.
@@ -1734,8 +1845,11 @@ mod tests {
             None,
         );
         assert_eq!(v["reason"], "unknown or expired refresh token", "{v}");
-        // The plain constant is explanation + next step, unchanged.
-        assert_eq!(signed_out_message(false, None), SIGNED_OUT_MESSAGE);
+        // The plain constant is the explanation only.
+        assert_eq!(
+            signed_out_view(None, None, None)["message"],
+            SIGNED_OUT_MESSAGE
+        );
         let v = signed_out_view(Some("BOT_RETIRED: x"), None, None);
         assert_eq!(v["reason"], RETIRED_CAUSE);
         assert_eq!(v["retired"], true);
@@ -1762,7 +1876,12 @@ mod tests {
         assert!(p.live());
         for why in [Some("BOT_RETIRED: x"), Some("HTTP 401"), None] {
             let v = signed_out_view(why, Some(&p), Some(1));
-            let m = v["message"].as_str().unwrap();
+            assert!(v["message"]
+                .as_str()
+                .unwrap()
+                .ends_with("A sign-in link is waiting for your person; see next_step."));
+            // The waiting step (with its times) is next_step's.
+            let m = v["next_step"].as_str().unwrap();
             assert!(!m.contains("force"), "{m}");
             assert!(
                 m.contains("Waiting for your person to approve the link sent at ")
@@ -1803,6 +1922,63 @@ mod tests {
             let shown = super::super::relay::SignedOut(why.into()).to_string();
             assert_eq!(shown.matches("login").count(), 1, "{shown}");
         }
+    }
+
+    #[test]
+    fn every_utc_time_also_reads_in_local_time() {
+        let at = 1_793_212_620u64;
+        let utc = bw_proto::time::iso_utc(at);
+        assert_eq!(parse_iso_utc(&utc), Some(at));
+        assert_eq!(parse_iso_utc("2026-10-27"), None);
+        assert_eq!(parse_iso_utc("2026-1x-27T14:35:33Z"), None);
+        let mut v = json!({
+            "rooms": [{
+                "room_expires_at": at,
+                "room_expires_at_utc": utc,
+                "oldest_pending_message_expires_at_utc": null,
+                "seat_expires_at_utc": utc,
+                "seat_expires_at_local": "kept",
+            }],
+            "summary": format!("Wake-ups are on (all rooms), sent to ntfy. Last wake-up sent: {utc}."),
+            "message": format!("You already replied at {} ({utc}).", local_time(at)),
+            "text": format!("a peer wrote {utc}"),
+            "doorbell": { "last_failure": { "at": at, "at_utc": utc } },
+        });
+        add_local_times(&mut v);
+        let r = &v["rooms"][0];
+        assert_eq!(r["room_expires_at_local"], local_time(at));
+        assert!(r["oldest_pending_message_expires_at_local"].is_null());
+        assert!(r.get("oldest_pending_message_expires_at_local").is_some());
+        assert_eq!(r["seat_expires_at_local"], "kept");
+        assert_eq!(v["doorbell"]["last_failure"]["at_local"], local_time(at));
+        assert_eq!(
+            v["summary"],
+            format!(
+                "Wake-ups are on (all rooms), sent to ntfy. Last wake-up sent: {} ({utc}).",
+                local_time(at)
+            )
+        );
+        // Already next to its local time: unchanged. A peer's text: never.
+        assert_eq!(
+            v["message"],
+            format!("You already replied at {} ({utc}).", local_time(at))
+        );
+        assert_eq!(v["text"], format!("a peer wrote {utc}"));
+        // Running it twice changes nothing more.
+        let once = v.clone();
+        add_local_times(&mut v);
+        assert_eq!(v, once);
+    }
+
+    #[test]
+    fn a_localized_result_keeps_its_text_copy_in_step() {
+        let utc = bw_proto::time::iso_utc(1_793_212_620);
+        let mut r = CallToolResult::structured(json!({ "expires_at_utc": utc }));
+        localize_result(&mut r);
+        let v = r.structured_content.clone().expect("structured");
+        assert!(v["expires_at_local"].is_string());
+        let text = r.content[0].as_text().expect("text").text.clone();
+        assert_eq!(serde_json::from_str::<Value>(&text).expect("json"), v);
     }
 
     #[test]
@@ -1917,7 +2093,7 @@ mod tests {
     }
 
     #[test]
-    fn an_expired_link_leads_the_signed_out_message() {
+    fn an_expired_link_leads_the_signed_out_next_step() {
         let at = 1_793_212_620;
         for why in [
             "unknown: HTTP 401 Unauthorized: unauthorized (BOT_RETIRED): BotWhisper updated how bots are identified; this bot needs to sign in once more. Its old rooms will need a new invite. Call the connector's login tool (force=true) and send your person the link and code it returns.",
@@ -1927,20 +2103,17 @@ mod tests {
             let v = signed_out_view(Some(why), None, Some(at));
             no_shared_sentence(&v);
             let m = v["message"].as_str().unwrap();
-            assert!(
-                m.starts_with(&format!("SIGNED_OUT: {}", expired_message(at))),
-                "{m}"
-            );
-            assert!(m.contains(&local_time(at)) && m.contains(&bw_proto::time::iso_utc(at)), "{m}");
-            assert_eq!(m.matches("login").count(), 1, "{m}");
-            assert!(!m.contains("Waiting") && !v.to_string().contains(".."), "{m}");
+            // The step is next_step's alone (QA 0.2.19).
+            assert_eq!(v["next_step"], expired_message(at));
+            assert!(!m.contains("login") && m.ends_with("see next_step."), "{m}");
+            assert!(!v.to_string().contains(".."), "{v}");
             assert_eq!(v["last_link_expired_at"], at);
             assert_eq!(v["last_link_expired_at_utc"], bw_proto::time::iso_utc(at));
             if is_retired(why) {
                 assert_eq!(v["retired"], true);
-                assert!(m.ends_with("Its old rooms will need a new invite."), "{m}");
+                assert!(m.contains("Its old rooms will need a new invite."), "{m}");
             } else {
-                assert!(m.contains("The relay no longer accepts this bot's sign-in"), "{m}");
+                assert!(m.contains("the relay no longer accepts this bot's sign-in"), "{m}");
             }
         }
         assert_eq!(

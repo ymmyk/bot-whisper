@@ -5,6 +5,21 @@ All notable changes to BotWhisper. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Every UTC time a connector tool returns also reads in the machine's own
+  time zone: each `*_utc` field (`room_expires_at_utc`,
+  `oldest_pending_message_expires_at_utc`, `seat_expires_at_utc`,
+  `request_expires_at_utc`, invite and doorbell times, ...) gets a
+  `*_local` sibling, and UTC times inside relay prose (the `get_doorbell`
+  summary's "Last wake-up sent", notes, retention, error messages) get the
+  local time in front.
+
+### Fixed
+
+- The upgrade notice and handover also notice a binary replaced by an
+  installer that keeps the archive's modification time (a new inode).
+
 ## [0.2.19-alpha] - 2026-10-28
 
 Fixes from Atlas and QA on 0.2.18.

@@ -175,7 +175,7 @@ pub async fn sign_in_check(config: &std::path::Path, relay: &str) -> Option<(boo
     if let Some(orig) = store.copied_from() {
         return Some((
             false,
-            format!("FAIL sign-in: this bot's home was copied from {orig}; a copy cannot reuse that sign-in (call `login`)"),
+            format!("FAIL sign-in: this bot's home was copied from {orig}; a copy cannot reuse that sign-in (call `login` (force=true))"),
         ));
     }
     let now = bw_relay::doorbell::now_unix();
@@ -203,7 +203,7 @@ pub async fn sign_in_check(config: &std::path::Path, relay: &str) -> Option<(boo
             Some(so) => (
                 false,
                 format!(
-                    "FAIL sign-in: SIGNED_OUT: {} (next step: call `login` in your AI app, or run `botwhisper connect login`)",
+                    "FAIL sign-in: SIGNED_OUT: {} (next step: call `login` (force=true) in your AI app, as whoami says, or run `botwhisper connect login`)",
                     crate::connect::relay::sentence(&crate::connect::gateway::short_reason_pub(&so.0))
                 ),
             ),

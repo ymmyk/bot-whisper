@@ -372,6 +372,10 @@ async fn two_connectors_inner() {
         created["room_expires_at_utc"]
     );
     assert!(joined["room_expires_at_utc"].is_string());
+    // Every UTC time also reads in this machine's own time zone.
+    let local = joined["room_expires_at_local"].as_str().unwrap_or_default();
+    assert!(local.contains(" (UTC"), "{joined}");
+    assert!(created["room_expires_at_local"].is_string(), "{created}");
     // Single-use: one join. Reusable: keep waiting, one event per joiner.
     assert_eq!(
         inv["expires_at_utc"].as_str().map(|s| s.ends_with('Z')),
@@ -1627,6 +1631,39 @@ async fn approve_next(
     panic!("no join request showed up");
 }
 
+/// join_room on an approval link answers at once (QA 0.2.19 waited
+/// ~54 s); once a member lets the bot in, join_room again completes it.
+async fn join_after_approval(
+    joiner: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    approver: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    url: &str,
+    room: &str,
+    name: &str,
+) -> (Value, Value) {
+    let started = std::time::Instant::now();
+    let waiting = call(
+        joiner,
+        "join_room",
+        json!({ "invite_url": url, "name": name }),
+    )
+    .await;
+    assert_eq!(waiting["state"], "awaiting_approval", "{waiting}");
+    assert_eq!(waiting["joined"], false, "{waiting}");
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "returned right away, not after polling: {:?}",
+        started.elapsed()
+    );
+    let approved = approve_next(approver, room).await;
+    let joined = call(
+        joiner,
+        "join_room",
+        json!({ "invite_url": url, "name": name }),
+    )
+    .await;
+    (joined, approved)
+}
+
 async fn approval_inner() {
     let relay = TestRelay::start().await;
     let mut svcs = Vec::new();
@@ -1655,28 +1692,14 @@ async fn approval_inner() {
     );
 
     // Bob waits; the owner lets him in and adds him to the group.
-    let (joined, approved) = tokio::join!(
-        call(
-            bob,
-            "join_room",
-            json!({ "invite_url": url, "name": "Bob" })
-        ),
-        approve_next(alice, &room)
-    );
+    let (joined, approved) = join_after_approval(bob, alice, &url, &room, "Bob").await;
     assert_eq!(approved["added_to_group"], true, "{approved}");
     assert_eq!(joined["joined"], true, "{joined}");
 
     // Carol waits on the same link; Bob (a member, not the owner) lets her
     // in, so her Welcome comes from Bob; it still checks out because the
     // inviter's key (f=) is in the group she joins.
-    let (joined, approved) = tokio::join!(
-        call(
-            carol,
-            "join_room",
-            json!({ "invite_url": url, "name": "Carol" })
-        ),
-        approve_next(bob, &room)
-    );
+    let (joined, approved) = join_after_approval(carol, bob, &url, &room, "Carol").await;
     assert_eq!(approved["added_to_group"], true, "{approved}");
     assert_eq!(joined["joined"], true, "{joined}");
     assert_eq!(joined["room_title"], "Club", "the joiner gets the title");
