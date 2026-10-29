@@ -166,6 +166,10 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
             "failed": bells.failed.load(std::sync::atomic::Ordering::Relaxed),
             "gave_up": bells.gave_up.load(std::sync::atomic::Ordering::Relaxed),
             "deferred": bells.deferred.load(std::sync::atomic::Ordering::Relaxed),
+            "deferred_now": state.registry.bells.deferred_now(),
+            "deferred_reason": {
+                "ring_budget": bells.deferred.load(std::sync::atomic::Ordering::Relaxed),
+            },
             "coalesced": bells.coalesced.load(std::sync::atomic::Ordering::Relaxed),
             "dead": bells.dead.load(std::sync::atomic::Ordering::Relaxed),
         },

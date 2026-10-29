@@ -387,8 +387,12 @@ lists every event type it stands for; `event` stays `message`, with that
 message's `turn`, whenever a message is among them), spaced per ntfy topic,
 back off on `429` (`Retry-After`), and budgeted at 120 rings per member per
 room per hour (rings over the budget wait, merged, and are never dropped).
-`/health` counts `delivered`, `failed` (every failed attempt), `gave_up` and
-`deferred` (waited for the budget). Reject webhook signatures older than 5 minutes. Secrets (webhook
+`/health` counts `delivered`, `failed` (every failed attempt), `gave_up`,
+`deferred` (waited for the budget, also as `deferred_reason.ring_budget`)
+and `deferred_now` (members waiting right now). `get_doorbell` shows a
+waiting ring as `deferred` (`count`, `since_utc`, `next_ring_at_utc`,
+`reason: "ring_budget"`, a plain `note`) with `deferred_total`, so a
+throttled room does not look like a quiet one. Reject webhook signatures older than 5 minutes. Secrets (webhook
 secret, tokens, topics, Web Push keys) are never logged and never echoed
 back; `/account` shows the destination host, `token set`, a masked topic
 (reveal toggle) and the delivery status (`ok`, `failing`, `dead`).

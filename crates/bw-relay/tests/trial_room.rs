@@ -545,6 +545,112 @@ async fn rings_over_the_budget_wait_instead_of_being_dropped() {
         2,
         "the third waits for a token"
     );
+
+    // QA 0.2.20: get_doorbell shows the held-back ring, so a throttled room
+    // does not look like a quiet one.
+    let d = b.ok("get_doorbell", json!({ "room_id": room })).await;
+    let w = &d["deferred"];
+    assert_eq!(w["count"], 1, "{d}");
+    assert_eq!(w["reason"], "ring_budget", "{d}");
+    assert_eq!(d["deferred_total"], 1, "{d}");
+    let next = w["next_ring_at"].as_u64().unwrap();
+    let since = w["since"].as_u64().unwrap();
+    // 2 per hour: the next token is about half an hour away.
+    assert!(next >= since + 1700 && next <= since + 1801, "{d}");
+    assert_eq!(w["next_ring_at_utc"], bw_proto::time::iso_utc(next), "{d}");
+    assert_eq!(w["since_utc"], bw_proto::time::iso_utc(since), "{d}");
+    let note = w["note"].as_str().unwrap();
+    assert!(
+        note.starts_with("A ring is waiting: this room hit its ring budget (2 rings")
+            && note.contains(&format!("next ring at {}", bw_proto::time::iso_utc(next))),
+        "{note}"
+    );
+    assert!(d["summary"].as_str().unwrap().contains(note), "{d}");
+
+    // More rings merge into the waiting one; the count says so.
+    a.send(&room, "four").await;
+    let mut d = Value::Null;
+    for _ in 0..50 {
+        d = b.ok("get_doorbell", json!({ "room_id": room })).await;
+        if d["deferred"]["count"] == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(d["deferred"]["count"], 2, "{d}");
+    assert!(
+        d["deferred"]["note"]
+            .as_str()
+            .unwrap()
+            .starts_with("2 rings are waiting (they go out as one)"),
+        "{d}"
+    );
+    assert_eq!(d["deferred_total"], 1, "still one wait: {d}");
+    assert_eq!(hook.hits.lock().await.len(), 2);
+
+    // The bot-wide view (no room) is about the default doorbell: none here.
+    let all = b.ok("get_doorbell", json!({})).await;
+    assert!(all["deferred"].is_null(), "{all}");
+
+    // /health: a gauge and the reason counts.
+    let health: Value = reqwest::get(format!("{}/health", relay.base()))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let bells = &health["doorbells"];
+    assert_eq!(bells["deferred_now"], 1, "{health}");
+    assert_eq!(bells["deferred"], 1, "{health}");
+    assert_eq!(bells["deferred_reason"]["ring_budget"], 1, "{health}");
+
+    // A quiet room: nothing deferred.
+    let quiet = make_room(&a, &[&b], json!({})).await;
+    let q = b.ok("get_doorbell", json!({ "room_id": quiet })).await;
+    assert!(q["deferred"].is_null(), "{q}");
+    assert_eq!(q["deferred_total"], 0, "{q}");
+    assert!(!q["summary"].as_str().unwrap().contains("waiting"), "{q}");
+}
+
+/// A bot-wide doorbell over budget shows the waiting ring without a room.
+#[tokio::test]
+async fn a_default_doorbell_shows_its_waiting_rooms() {
+    let mut cfg = test_config();
+    cfg.limits.doorbells_per_member_per_hour = 1;
+    let relay = TestRelay::start_with(cfg).await;
+    let a = relay.bot(TOKENS[0]).await;
+    let b = relay.bot(TOKENS[1]).await;
+    let (url, hook) = start_hook(StatusCode::OK).await;
+    b.ok(
+        "set_doorbell",
+        json!({ "webhook_url": url, "secret": "trial-secret-1", "events": ["message"] }),
+    )
+    .await;
+    let room = make_room(&a, &[&b], json!({})).await;
+    a.send(&room, "one").await;
+    hits_after(&hook, 1, Duration::from_secs(5)).await;
+    a.send(&room, "two").await;
+    let mut d = Value::Null;
+    for _ in 0..100 {
+        d = b.ok("get_doorbell", json!({})).await;
+        if d["deferred"].is_object() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(d["scope"], "bot_default", "{d}");
+    assert_eq!(d["deferred"]["room_id"], room, "{d}");
+    assert_eq!(d["deferred"]["rooms_waiting"], 1, "{d}");
+    assert_eq!(d["deferred_total"], 1, "{d}");
+    assert!(
+        d["deferred"]["note"].as_str().unwrap().contains(&format!(
+            "room {room} hit its ring budget (1 ring per member per hour)"
+        )),
+        "{d}"
+    );
+    // The room view agrees.
+    let r = b.ok("get_doorbell", json!({ "room_id": room })).await;
+    assert_eq!(r["deferred"]["count"], 1, "{r}");
 }
 
 #[tokio::test]

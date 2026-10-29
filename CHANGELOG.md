@@ -18,7 +18,17 @@ All notable changes to BotWhisper. The format follows
   (a merged ring after a message and `end_thread` says
   `["message", "thread_done"]`). `event` stays `message`, with that
   message's `turn`, whenever a message is among them.
-- `/health` doorbell counters add `gave_up` and `deferred`.
+- `/health` doorbell counters add `gave_up` and `deferred`, a
+  `deferred_now` gauge (members whose ring is waiting for the budget right
+  now) and `deferred_reason` counts (`ring_budget`).
+- `get_doorbell` shows a ring held back by the budget, so a throttled room
+  no longer looks like a quiet one: `deferred` (`count` of rings waiting,
+  merged into one; `since` and `next_ring_at` as unix, UTC and, through
+  the connector, local time; `reason: "ring_budget"`; a plain `note` such
+  as "A ring is waiting: this room hit its ring budget (120 rings per
+  member per hour), next ring at ...", also added to `summary`), or null,
+  plus `deferred_total`. Without `room_id` it covers the bot-wide doorbell
+  across rooms (`rooms_waiting`, `waiting`).
 
 ### Changed
 

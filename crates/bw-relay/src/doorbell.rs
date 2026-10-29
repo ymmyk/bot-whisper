@@ -553,6 +553,62 @@ pub fn ntfy_recipes(server: &str, topic: &str, token: bool) -> Value {
     })
 }
 
+/// A ring held back right now (QA 0.2.20: a throttled room must not look
+/// like a quiet one). Times are unix seconds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Deferral {
+    /// Rings waiting, merged into the one that goes out next.
+    pub count: u64,
+    /// When the first of them was held back.
+    pub since: u64,
+    /// When the budget next allows a ring.
+    pub next_ring_at: u64,
+    /// Why: `ring_budget` (the only reason so far).
+    pub reason: &'static str,
+    /// Which configuration the waiting ring goes to.
+    pub via: DoorbellKey,
+}
+
+impl Deferral {
+    /// The tool view (`*_utc` times; the connector adds `*_local`), with
+    /// a plain line for people.
+    pub fn view(&self, per_hour: u32, room_id: Option<&str>) -> serde_json::Value {
+        let next = crate::config::iso_utc(self.next_ring_at);
+        let rings = if self.count == 1 {
+            "A ring is waiting".to_string()
+        } else {
+            format!("{} rings are waiting (they go out as one)", self.count)
+        };
+        let unit = if per_hour == 1 { "ring" } else { "rings" };
+        let room = match room_id {
+            Some(id) => format!("room {id}"),
+            None => "this room".to_string(),
+        };
+        serde_json::json!({
+            "count": self.count,
+            "since": self.since,
+            "since_utc": crate::config::iso_utc(self.since),
+            "next_ring_at": self.next_ring_at,
+            "next_ring_at_utc": next,
+            "reason": self.reason,
+            "room_id": room_id,
+            "note": format!(
+                "{rings}: {room} hit its ring budget ({per_hour} {unit} per member per hour), next ring at {next}. Nothing is dropped; the room is throttled, not quiet."
+            ),
+        })
+    }
+}
+
+/// Deferral history of one (room, member).
+#[derive(Debug, Clone, Default)]
+struct DeferInfo {
+    /// Times a ring had to wait for the budget.
+    total: u64,
+    /// The configuration the last deferred ring went to.
+    via: Option<DoorbellKey>,
+    now: Option<Deferral>,
+}
+
 /// Dispatcher statistics (aggregate counters only, for `/health`).
 #[derive(Debug, Default)]
 pub struct DoorbellStats {
@@ -657,6 +713,9 @@ struct Shared {
     generations: RwLock<HashMap<DoorbellKey, u64>>,
     /// Ring budget per (room, member): tokens left and when last refilled.
     budget: std::sync::Mutex<HashMap<(String, String), (f64, Instant)>>,
+    /// Rings waiting for the budget, per (room, member) (for
+    /// `get_doorbell` and `/health`).
+    deferrals: std::sync::Mutex<HashMap<(String, String), DeferInfo>>,
     opts: DoorbellOptions,
 }
 
@@ -668,6 +727,51 @@ impl Shared {
             .get(key)
             .copied()
             .unwrap_or(0)
+    }
+
+    fn deferrals(&self) -> std::sync::MutexGuard<'_, HashMap<(String, String), DeferInfo>> {
+        self.deferrals.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A ring for `key` has to wait `wait` for the budget: start (or move
+    /// on) its deferral.
+    fn defer(&self, key: &(String, String), via: &DoorbellKey, wait: Duration, first: bool) {
+        let now = now_unix();
+        let next_ring_at = now + wait.as_secs() + u64::from(wait.subsec_nanos() > 0);
+        let mut map = self.deferrals();
+        if map.len() > 4096 {
+            map.retain(|_, d| d.now.is_some());
+        }
+        let d = map.entry(key.clone()).or_default();
+        d.via = Some(via.clone());
+        match (&mut d.now, first) {
+            (Some(cur), false) => cur.next_ring_at = next_ring_at,
+            _ => {
+                d.total += 1;
+                d.now = Some(Deferral {
+                    count: 1,
+                    since: now,
+                    next_ring_at,
+                    reason: "ring_budget",
+                    via: via.clone(),
+                });
+            }
+        }
+    }
+
+    /// The waiting ring for `key` got its token (or was dropped with its
+    /// configuration).
+    fn undefer(&self, key: &(String, String)) {
+        if let Some(d) = self.deferrals().get_mut(key) {
+            d.now = None;
+        }
+    }
+
+    /// Another ring merged into one that is waiting.
+    fn defer_merged(&self, key: &(String, String)) {
+        if let Some(cur) = self.deferrals().get_mut(key).and_then(|d| d.now.as_mut()) {
+            cur.count += 1;
+        }
     }
 
     /// Take one delivery token for (room, member), or say how long until
@@ -740,6 +844,7 @@ impl Doorbells {
             failures: RwLock::new(HashMap::new()),
             generations: RwLock::new(HashMap::new()),
             budget: std::sync::Mutex::new(HashMap::new()),
+            deferrals: std::sync::Mutex::new(HashMap::new()),
             opts,
         });
         tokio::spawn(dispatcher(rx, client, shared.clone()));
@@ -759,6 +864,7 @@ impl Doorbells {
                 failures: RwLock::new(HashMap::new()),
                 generations: RwLock::new(HashMap::new()),
                 budget: std::sync::Mutex::new(HashMap::new()),
+                deferrals: std::sync::Mutex::new(HashMap::new()),
                 opts: DoorbellOptions::default(),
             }),
         }
@@ -833,6 +939,43 @@ impl Doorbells {
 
     /// The last failed delivery to this destination, if any since the
     /// relay started.
+    /// (times deferred, the ring waiting now) for one member of one room.
+    pub fn deferral(&self, room_id: &str, member_id: &str) -> (u64, Option<Deferral>) {
+        self.shared
+            .deferrals()
+            .get(&(room_id.to_string(), member_id.to_string()))
+            .map(|d| (d.total, d.now.clone()))
+            .unwrap_or((0, None))
+    }
+
+    /// Every ring waiting now that goes to `via`, with its room, plus the
+    /// times rings to `via` were deferred.
+    pub fn deferrals_via(&self, via: &DoorbellKey) -> (u64, Vec<(String, Deferral)>) {
+        let map = self.shared.deferrals();
+        let mut total = 0;
+        let mut now = Vec::new();
+        for ((room, _), d) in map.iter() {
+            if d.via.as_ref() != Some(via) {
+                continue;
+            }
+            total += d.total;
+            if let Some(cur) = &d.now {
+                now.push((room.clone(), cur.clone()));
+            }
+        }
+        now.sort_by_key(|(_, d)| d.next_ring_at);
+        (total, now)
+    }
+
+    /// Members whose ring is waiting for the budget right now.
+    pub fn deferred_now(&self) -> usize {
+        self.shared
+            .deferrals()
+            .values()
+            .filter(|d| d.now.is_some())
+            .count()
+    }
+
     pub fn last_failure(&self, key: &DoorbellKey) -> Option<DeliveryFailure> {
         self.shared
             .failures
@@ -922,6 +1065,7 @@ async fn dispatcher(
         if let Some((slot, taken)) = map.get(&key) {
             if slot.receiver_count() > 0 {
                 shared.stats.coalesced.fetch_add(1, Ordering::Relaxed);
+                shared.defer_merged(&key);
                 let taken = taken.load(Ordering::SeqCst);
                 slot.send_modify(|cur| {
                     let merged = match cur.as_ref().filter(|q| q.id > taken) {
@@ -1013,13 +1157,23 @@ async fn worker(
             let mut counted = false;
             loop {
                 match shared.take_token(slot_key, Instant::now()) {
-                    Ok(()) => break,
+                    Ok(()) => {
+                        if counted {
+                            shared.undefer(slot_key);
+                        }
+                        break;
+                    }
                     Err(wait) => {
+                        let via = slot_rx.borrow().as_ref().map(|q| q.ring.key.clone());
+                        if let Some(via) = via {
+                            shared.defer(slot_key, &via, wait, !counted);
+                        }
                         if !counted {
                             shared.stats.deferred.fetch_add(1, Ordering::Relaxed);
                             counted = true;
                         }
                         if !pause(slot_rx, wait).await {
+                            shared.undefer(slot_key);
                             return;
                         }
                     }
@@ -1376,6 +1530,7 @@ mod tests {
             failures: Default::default(),
             generations: Default::default(),
             budget: Default::default(),
+            deferrals: Default::default(),
             opts: DoorbellOptions {
                 per_member_per_hour: 2,
                 ..DoorbellOptions::default()
@@ -1396,6 +1551,43 @@ mod tests {
         assert!(shared
             .take_token(&key, t0 + Duration::from_secs(1800))
             .is_ok());
+    }
+
+    #[test]
+    fn a_deferral_counts_merges_and_clears_when_the_ring_goes() {
+        let shared = Shared {
+            stats: DoorbellStats::default(),
+            dead: Default::default(),
+            defaults: Default::default(),
+            failures: Default::default(),
+            generations: Default::default(),
+            budget: Default::default(),
+            deferrals: Default::default(),
+            opts: DoorbellOptions::default(),
+        };
+        let key = ("r".to_string(), "m1".to_string());
+        let via = DoorbellKey::Room {
+            room_id: "r".into(),
+            member_id: "m1".into(),
+        };
+        shared.defer(&key, &via, Duration::from_millis(29_500), true);
+        shared.defer_merged(&key);
+        shared.defer(&key, &via, Duration::from_secs(10), false);
+        let d = shared.deferrals().get(&key).cloned().unwrap();
+        let now = d.now.clone().unwrap();
+        assert_eq!((d.total, now.count, now.reason), (1, 2, "ring_budget"));
+        assert!(now.next_ring_at >= now.since + 10 && now.next_ring_at <= now.since + 11);
+        let v = now.view(120, None);
+        assert!(v["note"].as_str().unwrap().starts_with(
+            "2 rings are waiting (they go out as one): this room hit its ring budget (120 rings per member per hour), next ring at "
+        ));
+        shared.undefer(&key);
+        let d = shared.deferrals().get(&key).cloned().unwrap();
+        assert!(d.now.is_none());
+        assert_eq!(d.total, 1, "the history stays");
+        // A merge with nothing waiting counts nowhere.
+        shared.defer_merged(&key);
+        assert!(shared.deferrals().get(&key).unwrap().now.is_none());
     }
 
     #[test]

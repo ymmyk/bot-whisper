@@ -1407,7 +1407,7 @@ impl BotWhisperServer {
         } else {
             "all rooms"
         };
-        let key = match (scope, &room_id, my_member) {
+        let key = match (scope, &room_id, my_member.clone()) {
             ("room", Some(id), Some(m)) => Some(doorbell::DoorbellKey::Room {
                 room_id: id.clone(),
                 member_id: m,
@@ -1417,7 +1417,34 @@ impl BotWhisperServer {
             }),
             _ => None,
         };
-        let failure = key.and_then(|k| self.registry.bells.last_failure(&k));
+        // QA 0.2.20: a ring held back by the budget, so a throttled room
+        // does not look like a quiet one.
+        let per_hour = self.registry.bells.options().per_member_per_hour;
+        let (deferred_total, deferred) = match (&room_id, &my_member) {
+            (Some(id), Some(m)) => {
+                let (total, now) = self.registry.bells.deferral(id, m);
+                (total, now.map(|d| d.view(per_hour, None)))
+            }
+            _ => match &key {
+                Some(k) => {
+                    let (total, now) = self.registry.bells.deferrals_via(k);
+                    let waiting: Vec<Value> = now
+                        .iter()
+                        .map(|(room, d)| d.view(per_hour, Some(room)))
+                        .collect();
+                    let first = waiting.first().cloned().map(|mut v| {
+                        v["rooms_waiting"] = json!(waiting.len());
+                        v["waiting"] = json!(waiting);
+                        v
+                    });
+                    (total, first)
+                }
+                None => (0, None),
+            },
+        };
+        let failure = key
+            .clone()
+            .and_then(|k| self.registry.bells.last_failure(&k));
         let details = cfg.as_ref().map(|c| {
             let mut d = self.describe_doorbell(c, status.as_ref());
             // The last failed attempt (HTTP status when the destination
@@ -1431,7 +1458,15 @@ impl BotWhisperServer {
             "state": if on { "on" } else { "off" },
             "origin": cfg.as_ref().map(|c| if c.is_automatic() { "automatic" } else { "manual" }),
             "auto": cfg.as_ref().is_some_and(|c| c.is_automatic()),
-            "summary": crate::doorbell::wakeups_summary(cfg.as_ref(), status.as_ref(), where_, &last),
+            "summary": match deferred.as_ref().and_then(|d| d["note"].as_str()) {
+                Some(note) => format!(
+                    "{} {note}",
+                    crate::doorbell::wakeups_summary(cfg.as_ref(), status.as_ref(), where_, &last)
+                ),
+                None => crate::doorbell::wakeups_summary(cfg.as_ref(), status.as_ref(), where_, &last),
+            },
+            "deferred": deferred,
+            "deferred_total": deferred_total,
             "doorbell": Value::Null,
             "hint": if on { None } else { Some("wake-ups are off; call set_doorbell (no arguments) to turn them on with a private ntfy topic") },
         });

@@ -1925,6 +1925,33 @@ mod tests {
     }
 
     #[test]
+    fn a_deferred_ring_reads_in_local_time() {
+        let at = 1_793_212_620u64;
+        let utc = bw_proto::time::iso_utc(at);
+        let mut v = json!({
+            "deferred": {
+                "count": 2,
+                "since_utc": utc,
+                "next_ring_at_utc": utc,
+                "reason": "ring_budget",
+                "note": format!("2 rings are waiting (they go out as one): this room hit its ring budget (120 rings per member per hour), next ring at {utc}."),
+            },
+            "deferred_total": 3,
+        });
+        add_local_times(&mut v);
+        let d = &v["deferred"];
+        assert_eq!(d["since_local"], local_time(at));
+        assert_eq!(d["next_ring_at_local"], local_time(at));
+        assert!(
+            d["note"]
+                .as_str()
+                .unwrap()
+                .ends_with(&format!("next ring at {} ({utc}).", local_time(at))),
+            "{d}"
+        );
+    }
+
+    #[test]
     fn every_utc_time_also_reads_in_local_time() {
         let at = 1_793_212_620u64;
         let utc = bw_proto::time::iso_utc(at);
