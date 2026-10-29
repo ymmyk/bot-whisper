@@ -190,11 +190,18 @@ async fn an_invite_never_outlives_its_room() {
     let a = relay.bot(TOKENS[0]).await;
     let created = a.ok("create_room", json!({ "expires": "7d" })).await;
     let room = created["room_id"].as_str().unwrap().to_string();
+    // A ttl past the room's close is clamped to it, with a note (QA 0.2.19).
     let e = a
-        .call("create_invite", json!({ "room_id": room, "ttl": "400d" }))
+        .ok("create_invite", json!({ "room_id": room, "ttl": "30d" }))
         .await;
-    assert_eq!(e["error"], "INVALID_ARGUMENT", "{e}");
-    assert!(e.to_string().contains("longer than the room"), "{e}");
+    assert_eq!(e["expires_at"], created["room_expires_at"], "{e}");
+    assert_eq!(e["ttl_capped"], true, "{e}");
+    let note = e["note"].as_str().unwrap();
+    assert!(
+        note.starts_with("ttl shortened to the room's remaining time")
+            && note.contains(created["room_expires_at_utc"].as_str().unwrap()),
+        "{e}"
+    );
     let ok = a
         .ok("create_invite", json!({ "room_id": room, "ttl": "1d" }))
         .await;

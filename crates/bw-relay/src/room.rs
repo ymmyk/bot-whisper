@@ -768,21 +768,24 @@ impl Room {
         let id = uuid::Uuid::new_v4().simple().to_string();
         let asked = o.ttl.is_some();
         let mut ttl = o.ttl.unwrap_or(self.cfg.default_invite_ttl);
-        let mut capped = false;
-        // An invite never outlives its room: an explicit ttl past the room's
-        // close is refused, the default is shortened to it.
+        let mut capped = None;
+        // An invite never outlives its room: a ttl past the room's close
+        // (asked for or the default) is shortened to it, with a note
+        // (QA 0.2.19: clamp, don't refuse).
         if let Some(close) = self.expires_at {
             let left = close.saturating_sub(now);
             if ttl.as_secs() > left {
-                if asked {
-                    return Err(RelayError::invalid(format!(
-                        "ttl is longer than the room: it closes at {} (in {}), so an invite can last at most that long; give a shorter ttl or leave it out to use the room's remaining time",
+                capped = Some(if asked {
+                    format!(
+                        "ttl shortened to the room's remaining time: an invite never outlives its room, which closes at {} (in {})",
                         crate::config::iso_utc(close),
                         crate::config::ttl_words(std::time::Duration::from_secs(left)),
-                    )));
-                }
+                    )
+                } else {
+                    "expires when the room closes (the default ttl is longer than the room has left)"
+                        .to_string()
+                });
                 ttl = std::time::Duration::from_secs(left);
-                capped = true;
             }
         }
         let row = InviteRow {
@@ -801,10 +804,9 @@ impl Room {
         };
         self.db.insert_invite(&row)?;
         let mut v = row.public_json(now);
-        if capped {
-            v["note"] = json!(
-                "expires when the room closes (the default ttl is longer than the room has left)"
-            );
+        if let Some(note) = capped {
+            v["ttl_capped"] = json!(true);
+            v["note"] = json!(note);
         }
         v["invite_url"] = json!(format!("{}/i/{id}.{secret}", self.cfg.public_url()));
         Ok(v)

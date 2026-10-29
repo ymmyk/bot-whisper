@@ -314,7 +314,8 @@ pub struct CreateInviteArgs {
     /// Label the owner sees when it is redeemed, e.g. "Sam's bot".
     #[serde(default)]
     pub label: Option<String>,
-    /// Invite lifetime such as `1h`, `7d`. Default `7d`.
+    /// Invite lifetime such as `1h`, `7d`. Default `7d`. Never past the
+    /// room's own close: a longer ttl is shortened to it (with a `note`).
     #[serde(default)]
     pub ttl: Option<String>,
     /// One link many bots can join with, each under its own name. Default
