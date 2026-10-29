@@ -81,6 +81,7 @@ pub fn safe_segment(s: &str) -> String {
 
 /// Create a directory (and parents) owner-only.
 pub fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
     let existed = dir.is_dir();
     std::fs::create_dir_all(dir)?;
     #[cfg(unix)]
